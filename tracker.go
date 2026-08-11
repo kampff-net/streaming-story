@@ -3,13 +3,16 @@ package story
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"go.kvsh.ch/streaming-story/internal/dist"
 )
 
 // Tracker ingests a stream of signals and groups them into evolving stories
@@ -95,14 +98,79 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, erro
 	if t.applyInProgress.Load() {
 		select {
 		case t.ingestBuffer <- sig:
-			// buffered; will be drained by the batch goroutine after Apply commits
-			return uuid.Nil, nil // TODO: return draft assignment from in-memory centroid lookup
+			return uuid.Nil, nil
 		case <-ctx.Done():
 			return uuid.Nil, ctx.Err()
 		}
 	}
 
-	panic("not implemented: draft-phase centroid lookup and store write")
+	var assignedID uuid.UUID
+	err := t.cfg.Store.Update(func(tx Tx) error {
+		bestStory, d, found, err := t.findNearestStory(tx, sig.Embedding)
+		if err != nil {
+			return err
+		}
+
+		encoded, err := t.cfg.Codec.Encode(sig)
+		if err != nil {
+			return fmt.Errorf("encode signal: %w", err)
+		}
+
+		if found {
+			thresh := t.calcThreshold(bestStory)
+			if d <= thresh {
+				assignedID = bestStory.ID
+				if err := tx.Put(keySignal(bestStory.ID, sig.ID), encoded); err != nil {
+					return err
+				}
+				bestStory.LastSignalAt = sig.At
+				if bestStory.State == StoryStateDormant {
+					bestStory.State = StoryStateActive
+					bestStory.FrozenMeanDistance = 0
+					bestStory.FrozenSigma = 0
+				}
+				rec := storyRecord{
+					State:              bestStory.State,
+					Centroid:           bestStory.Centroid,
+					Radius:             bestStory.Radius,
+					CreatedAt:          bestStory.CreatedAt,
+					LastSignalAt:       bestStory.LastSignalAt,
+					FrozenMeanDistance: bestStory.FrozenMeanDistance,
+					FrozenSigma:        bestStory.FrozenSigma,
+				}
+				recBytes, err := json.Marshal(rec)
+				if err != nil {
+					return err
+				}
+				if err := tx.Put(keyStoryMeta(bestStory.ID), recBytes); err != nil {
+					return err
+				}
+				if err := tx.Put(keyTimeIndex(sig.At.Unix(), bestStory.ID), nil); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
+
+		// No story matched or within threshold -> write to outlier bucket
+		assignedID = uuid.Nil
+		return tx.Put(keyOutlier(sig.ID), encoded)
+	})
+
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	if assignedID != uuid.Nil {
+		t.emit(StoryEvent[T]{
+			Kind:     EventDraftAssigned,
+			StoryID:  assignedID,
+			SignalID: sig.ID,
+			At:       time.Now(),
+		})
+	}
+
+	return assignedID, nil
 }
 
 // Subscribe returns a channel of real-time and batch-refined events.
@@ -150,14 +218,131 @@ func (t *Tracker[T]) Story(id uuid.UUID) (StoryMeta, error) {
 // Stories returns an iterator over stories in the given state.
 // Pass StoryStateAny to iterate all stories.
 func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta] {
-	panic("not implemented")
+	return func(yield func(StoryMeta) bool) {
+		_ = t.cfg.Store.View(func(tx Tx) error {
+			return tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
+				if len(key) <= 2 || string(key[len(key)-2:]) != ":m" {
+					return nil
+				}
+				var rec storyRecord
+				if err := json.Unmarshal(val, &rec); err != nil {
+					return nil
+				}
+				if state != StoryStateAny && rec.State != state {
+					return nil
+				}
+				idStr := string(key[2 : len(key)-2])
+				id, err := uuid.Parse(idStr)
+				if err != nil {
+					return nil
+				}
+				meta := StoryMeta{
+					ID:                 id,
+					State:              rec.State,
+					Centroid:           rec.Centroid,
+					Radius:             rec.Radius,
+					CreatedAt:          rec.CreatedAt,
+					LastSignalAt:       rec.LastSignalAt,
+					FrozenMeanDistance: rec.FrozenMeanDistance,
+					FrozenSigma:        rec.FrozenSigma,
+				}
+				if !yield(meta) {
+					return errors.New("stop iteration")
+				}
+				return nil
+			})
+		})
+	}
 }
 
 // SignalsOf returns an iterator over all signals belonging to storyID.
 // Signal data is retained through archival, so Archived stories are
 // fully iterable.
 func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error] {
-	panic("not implemented")
+	return func(yield func(Signal[T], error) bool) {
+		prefix := keySignalPrefix(storyID)
+		_ = t.cfg.Store.View(func(tx Tx) error {
+			return tx.ScanPrefix(prefix, func(key, val []byte) error {
+				sig, err := t.cfg.Codec.Decode(val)
+				if err != nil {
+					if !yield(Signal[T]{}, err) {
+						return errors.New("stop iteration")
+					}
+					return nil
+				}
+				if !yield(sig, nil) {
+					return errors.New("stop iteration")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+// calcThreshold calculates the dynamic distance threshold T_assign(story).
+func (t *Tracker[T]) calcThreshold(story StoryMeta) float64 {
+	t.calibMu.RLock()
+	sigmaGlobal := t.sigmaGlobal
+	t.calibMu.RUnlock()
+
+	if sigmaGlobal == 0 {
+		sigmaGlobal = 0.25
+	}
+
+	sigma := story.FrozenSigma
+	if sigma == 0 {
+		sigma = sigmaGlobal
+	}
+
+	floor := t.cfg.SigmaFloor * sigmaGlobal
+	if sigma < floor {
+		sigma = floor
+	}
+
+	meanDist := story.FrozenMeanDistance
+	return meanDist + t.cfg.AssignmentK*sigma
+}
+
+// findNearestStory finds the nearest active or dormant story centroid for emb.
+func (t *Tracker[T]) findNearestStory(tx Tx, emb []float32) (StoryMeta, float64, bool, error) {
+	var bestStory StoryMeta
+	bestDist := math.MaxFloat64
+	found := false
+
+	err := tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
+		if len(key) <= 2 || string(key[len(key)-2:]) != ":m" {
+			return nil
+		}
+		var rec storyRecord
+		if err := json.Unmarshal(val, &rec); err != nil {
+			return nil
+		}
+		if rec.State == StoryStateArchived || len(rec.Centroid) == 0 {
+			return nil
+		}
+		d := dist.CosineDistance(emb, rec.Centroid)
+		if d < bestDist {
+			bestDist = d
+			idStr := string(key[2 : len(key)-2])
+			id, err := uuid.Parse(idStr)
+			if err == nil {
+				bestStory = StoryMeta{
+					ID:                 id,
+					State:              rec.State,
+					Centroid:           rec.Centroid,
+					Radius:             rec.Radius,
+					CreatedAt:          rec.CreatedAt,
+					LastSignalAt:       rec.LastSignalAt,
+					FrozenMeanDistance: rec.FrozenMeanDistance,
+					FrozenSigma:        rec.FrozenSigma,
+				}
+				found = true
+			}
+		}
+		return nil
+	})
+
+	return bestStory, bestDist, found, err
 }
 
 // emit delivers ev to all current subscribers. If a subscriber's buffer is
@@ -271,5 +456,24 @@ func (t *Tracker[T]) batchLoop() {
 
 // runBatch executes one full batch re-clustering cycle.
 func (t *Tracker[T]) runBatch() {
-	panic("not implemented")
+	t.applyInProgress.Store(true)
+	defer func() {
+		// Drain ingest buffer
+		for {
+			select {
+			case sig := <-t.ingestBuffer:
+				_, _ = t.Ingest(context.Background(), sig)
+			default:
+				t.applyInProgress.Store(false)
+				t.emit(StoryEvent[T]{
+					Kind: EventBatchComplete,
+					At:   time.Now(),
+					BatchSummary: &BatchSummary{
+						StoriesCreated: 0,
+					},
+				})
+				return
+			}
+		}
+	}()
 }
