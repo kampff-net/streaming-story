@@ -85,6 +85,7 @@ Outlier ──► Active ──► Dormant ──► Archived (terminal)
 ### 1. Real-time Ingestion (Draft Phase)
 
 When a signal arrives:
+0.  **Locate any existing copy**: Consult the `l:{signalID}` location index. If the signal already belongs to a story — including one a batch run moved it to — the ingest is a strict no-op returning that story ID (see [Signal Location Index](#key-schema)).
 1.  **Centroid Match**: Find the nearest **Active** or **Dormant** story centroid via Cosine Similarity.
 2.  **Assignment**: Assign the signal to that story if the distance is within the per-story adaptive threshold:
 
@@ -190,9 +191,12 @@ The library interacts with a minimal `Store` interface.
 | Story Metadata | `s:{storyID}:m` | JSON: centroid, radius, state, timestamps, frozen_mean_distance, frozen_sigma |
 | Signal Data | `s:{storyID}:s:{signalID}` | Encoded `Signal[T]` |
 | Outlier Signal | `o:{signalID}` | Encoded `Signal[T]` |
+| Signal Location Index | `l:{signalID}` | `s:{storyID}` (story member) or `o` (outlier) |
 | Story Time Index | `t:{unix_sec}:{storyID}` | empty |
 
 **Story Time Index**: Written/updated on every story metadata write. Deleted and re-inserted on each update so the timestamp stays current. A range scan from `t:{cutoff}:` to `t:{now}:` efficiently retrieves all recently active stories for Tier 3 without a full metadata scan.
+
+**Signal Location Index**: Written when a signal is stored and updated by every batch move (including merge migrations), and deleted on outlier eviction. `Ingest` consults it before the centroid match: a copy that lives in *any* story is a strict no-op, returning the stored story ID. This closes a duplicate-creation window where a signal ingested once, then re-moved to a different story by a batch run, would be re-ingested into a second copy under the nearest story.
 
 **Signal retention**: Signal data is retained for all story states, including Archived. No signal keys are deleted on archival; only the metadata state field changes.
 

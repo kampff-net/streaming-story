@@ -13,8 +13,7 @@ import (
 )
 
 // newTestTracker creates a Tracker backed by an in-memory store.
-// BatchInterval is set to 1 hour so the ticker never fires during a unit test,
-// preventing calls to the unimplemented runBatch.
+// BatchInterval is set to 1 hour so the ticker never fires during a unit test.
 func newTestTracker(t *testing.T) *Tracker[string] {
 	t.Helper()
 	tr, err := NewTracker[string](Config[string]{

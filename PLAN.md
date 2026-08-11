@@ -10,76 +10,77 @@ This plan outlines the steps required to finalize the `go.kvsh.ch/streaming-stor
 - [x] **Key Schema**: KV key generation helpers for all prefixes implemented.
 - [x] **Persistence Models**: Internal `storyRecord` and `calibState` defined.
 - [x] **Store Interface**: Generic `Store` and `Tx` interfaces defined.
-- [x] **In-memory Mock Store**: `memStore` implemented for testing.
+- [x] **In-memory Mock Store**: `MemStore` implemented for testing.
 - [x] **Algorithms**: `hdbscan` and `hungarian` algorithms implemented with tests.
 - [x] **Tracker Lifecycle**: `NewTracker`, `Close`, and subscriber management implemented.
-- [ ] **Optimized Vector Math**: Integrate `gonum.org/v1/gonum` for SIMD-accelerated `float32` operations (via `blas32`).
+- [x] **Optimized Vector Math**: `gonum.org/v1/gonum` integrated for SIMD-accelerated `float32` operations (via `blas32`) in `internal/dist`.
 
 ## Phase 2: Draft Phase (Real-time Ingestion)
 
-- [ ] **Distance Metrics**: Implement `cosineSimilarity(a, b []float32) float64`. (To be optimized with `gonum`)
-- [ ] **Story Selection**: Implement `findNearestStory(sig Signal[T]) (StoryMeta, float64, error)`.
-  - [ ] Use `t:{unix_sec}:{storyID}` index to find "Active Context" (Tier 3) stories (default 30 days).
-  - [ ] Calculate distances to all Active/Dormant story centroids.
-- [ ] **Thresholding**: Implement `calcThreshold(story StoryMeta) float64`.
-  - [ ] Use $T_{assign}(story) = mean\_distance(story) + AssignmentK \times \sigma(story)$.
-  - [ ] Handle **Cold Start**: Use `AssignmentK * sigmaGlobal` if story signals < `ColdStartMinSignals`.
-  - [ ] Handle **Sigma Floor**: Floor $\sigma(story)$ at `SigmaFloor * sigmaGlobal`.
-  - [ ] Handle **Dormant Stories**: Use `FrozenMeanDistance` and `FrozenSigma`.
-- [ ] **Ingest Logic**:
+- [x] **Distance Metrics**: `internal/dist` provides `CosineDistance`/`CosineSimilarity` via optimized BLAS.
+- [x] **Story Selection**: `findNearestStory` implemented.
+  - [x] Uses the `t:{unix_sec}:{storyID}` index to find Tier 3 Active Context stories (bounded by `ActiveContextWindow`).
+  - [x] Calculates distances to all Active/Dormant story centroids within the context window.
+- [x] **Thresholding**: `calcThreshold(story StoryMeta) float64` implemented.
+  - [x] Uses $T_{assign}(story) = mean\_distance(story) + AssignmentK \times \sigma(story)$.
+  - [x] Handles **Cold Start**: uses `AssignmentK * sigmaGlobal` if story signals < `ColdStartMinSignals`.
+  - [x] Handles **Sigma Floor**: floors $\sigma(story)$ at `SigmaFloor * sigmaGlobal`.
+  - [x] Handles **Dormant Stories**: uses `FrozenMeanDistance` and `FrozenSigma`.
+- [x] **Ingest Logic**:
   - [x] Establish/validate dimensionality.
-  - [ ] Perform nearest story lookup.
+  - [x] Perform nearest story lookup.
   - [x] If `applyInProgress`, write to `ingestBuffer`.
-  - [ ] Else, write to store (signal and updated story metadata).
-  - [ ] Emit `EventDraftAssigned`.
+  - [x] Else, write to store (signal and updated story metadata).
+  - [x] Emit `EventDraftAssigned`.
+  - [x] Idempotent re-ingestion: no duplicate emit or storage for re-delivered signals.
 
 ## Phase 3: Refinement Phase (Batch Processing)
 
-- [ ] **Batch Loop**: Complete `batchLoop` and `runBatch` skeleton.
-- [ ] **Collection & Sampling**:
-  - [ ] Collect signals from `BatchWindow`.
-  - [ ] Collect outliers within `OutlierTTL`.
-  - [ ] Implement two-pass stratified reservoir sampling down to `BatchSampleCap`.
-- [ ] **HDBSCAN Run**: Integrate `internal/hdbscan` with collected signals.
-- [ ] **Cluster Mapping (Phase 1)**:
-  - [ ] Build Jaccard cost matrix (cost = 1 - Jaccard).
-  - [ ] Restrict to signals within `BatchWindow`.
-  - [ ] Run Hungarian algorithm (`internal/hungarian`).
-- [ ] **Cluster Mapping (Phase 2)**:
-  - [ ] Detect splits (N-way) for unmatched batch clusters.
-  - [ ] Detect merges (N-way) for unmatched persistent stories.
-  - [ ] Rule: Oldest `StoryID` survives.
-- [ ] **Apply Phase**:
+- [x] **Batch Loop**: `batchLoop` and `runBatch` implemented.
+- [x] **Collection & Sampling**:
+  - [x] Collect signals from `BatchWindow`.
+  - [x] Collect outliers within `OutlierTTL` (anchored to `lastBatch`).
+  - [x] Implement two-pass stratified sampling down to `BatchSampleCap`.
+- [x] **HDBSCAN Run**: `internal/hdbscan` integrated with collected signals.
+- [x] **Cluster Mapping (Phase 1)**:
+  - [x] Build Jaccard cost matrix (cost = 1 - Jaccard), restricted to `BatchWindow` signals.
+  - [x] Run Hungarian algorithm (`internal/hungarian`).
+- [x] **Cluster Mapping (Phase 2)**:
+  - [x] Detect splits (N-way) for unmatched batch clusters.
+  - [x] Detect merges (N-way) for unmatched persistent stories.
+  - [x] Rule: Oldest `StoryID` survives.
+- [x] **Apply Phase**:
   - [x] Set `applyInProgress` flag during Apply.
-  - [ ] Persist all updates in a single `Update` transaction.
-    - [ ] Update story centroids and radii.
-    - [ ] Migrate re-assigned signals (within `BatchWindow`).
-    - [ ] Migrate merged story signals (key-space migration).
-    - [ ] Create new stories for unmatched clusters.
-    - [ ] Promote outliers to stories.
-    - [ ] Evict stale outliers.
-    - [ ] Transition stories to Dormant/Archived based on `SilenceWindow`/`ArchiveWindow`.
-  - [ ] Update `sigmaGlobal` using EMA.
+  - [x] Persist all updates in a single `Update` transaction.
+    - [x] Update story centroids and radii.
+    - [x] Migrate re-assigned signals (within `BatchWindow`).
+    - [x] Migrate merged story signals (key-space migration).
+    - [x] Create new stories for unmatched clusters.
+    - [x] Promote outliers to stories.
+    - [x] Evict stale outliers.
+    - [x] Transition stories to Dormant/Archived based on `SilenceWindow`/`ArchiveWindow`.
+  - [x] Update `sigmaGlobal` using EMA.
   - [x] Clear `applyInProgress` and drain `ingestBuffer`.
-  - [ ] Emit `EventBatchComplete` and all change events.
+  - [x] Emit `EventBatchComplete` and all change events.
 
 ## Phase 4: Iterators & Public API
 
-- [ ] **Go 1.22 Iterators**:
-  - [ ] Implement `Stories(state StoryState) iter.Seq[StoryMeta]`.
-  - [ ] Implement `SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error]`.
-- [ ] **Story Lookup**: Complete `Story(id uuid.UUID)` implementation.
+- [x] **Go 1.22 Iterators**:
+  - [x] Implement `Stories(state StoryState) iter.Seq[StoryMeta]`.
+  - [x] Implement `SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error]`.
+- [x] **Story Lookup**: `Story(id uuid.UUID)` implemented.
 
 ## Phase 5: Verification & Testing
 
-- [ ] **Unit Tests**:
-  - [ ] Test distance metrics.
-  - [ ] Test sampling logic.
-  - [ ] Test cluster mapping (Hungarian + Phase 2 splits/merges).
-- [ ] **Integration Tests**:
-  - [ ] Full Ingest -> Batch cycle.
-  - [ ] Story lifecycle transitions.
-  - [ ] Signal re-assignment validation.
+- [x] **Unit Tests**:
+  - [x] Test distance metrics.
+  - [x] Test sampling logic.
+  - [x] Test cluster mapping (Hungarian + Phase 2 splits/merges).
+- [x] **Integration Tests**:
+  - [x] Full Ingest -> Batch cycle.
+  - [x] Story lifecycle transitions.
+  - [x] Signal re-assignment validation.
+  - [x] Outlier TTL eviction.
 - [ ] **Benchmarks**:
   - [ ] Ingest latency during Batch Apply (buffer behavior).
   - [ ] Batch performance with `BatchSampleCap` signals.

@@ -34,9 +34,10 @@ type Tracker[T any] struct {
 	lastBatch   time.Time
 
 	// event subscribers
-	subMu  sync.RWMutex
-	subs   []chan StoryEvent[T]
-	closed atomic.Bool // set before subscriber channels are closed
+	subMu     sync.RWMutex
+	subs      []chan StoryEvent[T]
+	closed    atomic.Bool // set before subscriber channels are closed
+	closeOnce sync.Once   // makes Close idempotent
 
 	// batch-apply concurrency: while applyInProgress is set, Ingest writes
 	// to ingestBuffer instead of directly to the store.
@@ -77,6 +78,10 @@ func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 //
 // Returns ErrDimensionMismatch if the signal's embedding length differs from
 // the dimensionality established by the first ingested signal.
+//
+// While a batch Apply is in progress the signal is buffered in memory and
+// uuid.Nil is returned; the batch goroutine drains the buffer into the store
+// once the Apply transaction commits.
 func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, error) {
 	if t.closed.Load() {
 		return uuid.Nil, fmt.Errorf("story: tracker is closed")
@@ -105,63 +110,113 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, erro
 	}
 
 	var assignedID uuid.UUID
+	emitted := false
 	err := t.cfg.Store.Update(func(tx Tx) error {
-		bestStory, d, found, err := t.findNearestStory(tx, sig.Embedding)
+		// Locate any existing copy first. Re-ingestion of a signal that
+		// already lives in a story is a strict no-op: batch placements are
+		// authoritative, and a duplicate delivery must neither duplicate nor
+		// move the stored copy.
+		curStory, isOutlier, hasIndex, err := readSignalLoc(tx, sig.ID)
 		if err != nil {
 			return err
 		}
+		if hasIndex && !isOutlier {
+			assignedID = curStory
+			return nil
+		}
 
-		encoded, err := t.cfg.Codec.Encode(sig)
+		bestStory, d, found, err := t.findNearestStory(tx, sig.Embedding)
 		if err != nil {
-			return fmt.Errorf("encode signal: %w", err)
+			return err
 		}
 
 		if found {
 			thresh := t.calcThreshold(bestStory)
 			if d <= thresh {
 				assignedID = bestStory.ID
-				if err := tx.Put(keySignal(bestStory.ID, sig.ID), encoded); err != nil {
-					return err
-				}
-				bestStory.LastSignalAt = sig.At
-				if bestStory.State == StoryStateDormant {
-					bestStory.State = StoryStateActive
-					bestStory.FrozenMeanDistance = 0
-					bestStory.FrozenSigma = 0
-				}
 				rec := storyRecord{
 					State:              bestStory.State,
 					Centroid:           bestStory.Centroid,
 					Radius:             bestStory.Radius,
 					CreatedAt:          bestStory.CreatedAt,
 					LastSignalAt:       bestStory.LastSignalAt,
+					MeanDistance:       bestStory.MeanDistance,
+					Sigma:              bestStory.Sigma,
+					SignalCount:        bestStory.SignalCount,
 					FrozenMeanDistance: bestStory.FrozenMeanDistance,
 					FrozenSigma:        bestStory.FrozenSigma,
 				}
-				recBytes, err := json.Marshal(rec)
+
+				sigKey := keySignal(bestStory.ID, sig.ID)
+				existing, err := tx.Get(sigKey)
 				if err != nil {
 					return err
 				}
-				if err := tx.Put(keyStoryMeta(bestStory.ID), recBytes); err != nil {
-					return err
+				if existing == nil {
+					encoded, err := t.cfg.Codec.Encode(sig)
+					if err != nil {
+						return fmt.Errorf("encode signal: %w", err)
+					}
+					if err := tx.Put(sigKey, encoded); err != nil {
+						return err
+					}
+					// A promoted signal leaves the outlier bucket; drop any
+					// stale outlier copy. This is a no-op for signals never
+					// stored there.
+					if err := tx.Delete(keyOutlier(sig.ID)); err != nil {
+						return err
+					}
+					if err := writeSignalLoc(tx, sig.ID, bestStory.ID, false); err != nil {
+						return err
+					}
+					emitted = true
+				} else if !hasIndex {
+					// A copy exists under this story without an index entry
+					// (for example a pre-seeded store). Backfill the index.
+					if err := writeSignalLoc(tx, sig.ID, bestStory.ID, false); err != nil {
+						return err
+					}
 				}
-				if err := tx.Put(keyTimeIndex(sig.At.Unix(), bestStory.ID), nil); err != nil {
-					return err
+
+				// LastSignalAt advances monotonically; out-of-order signals
+				// do not regress it.
+				if sig.At.After(rec.LastSignalAt) {
+					rec.LastSignalAt = sig.At
 				}
-				return nil
+
+				// Reactivation clears the frozen and live statistics: the
+				// story re-enters cold-start until the next batch run
+				// recomputes live statistics.
+				if rec.State == StoryStateDormant {
+					rec.State = StoryStateActive
+					rec.MeanDistance = 0
+					rec.Sigma = 0
+					rec.SignalCount = 0
+					rec.FrozenMeanDistance = 0
+					rec.FrozenSigma = 0
+				}
+
+				return t.writeStoryMeta(tx, bestStory.ID, bestStory.LastSignalAt, rec)
 			}
 		}
 
-		// No story matched or within threshold -> write to outlier bucket
+		// No story matched or within threshold -> write to outlier bucket.
 		assignedID = uuid.Nil
-		return tx.Put(keyOutlier(sig.ID), encoded)
+		encoded, err := t.cfg.Codec.Encode(sig)
+		if err != nil {
+			return fmt.Errorf("encode signal: %w", err)
+		}
+		if err := tx.Put(keyOutlier(sig.ID), encoded); err != nil {
+			return err
+		}
+		return writeSignalLoc(tx, sig.ID, uuid.Nil, true)
 	})
 
 	if err != nil {
 		return uuid.Nil, err
 	}
 
-	if assignedID != uuid.Nil {
+	if emitted && assignedID != uuid.Nil {
 		t.emit(StoryEvent[T]{
 			Kind:     EventDraftAssigned,
 			StoryID:  assignedID,
@@ -176,32 +231,41 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, erro
 // Subscribe returns a channel of real-time and batch-refined events.
 // Events are dropped (and EventBufferOverflow emitted to the channel) if
 // the buffer fills. Each call returns an independent channel. The channel
-// is closed when the Tracker is closed.
+// is closed when the Tracker is closed. Calling Subscribe after Close
+// returns an already-closed channel.
 func (t *Tracker[T]) Subscribe() <-chan StoryEvent[T] {
 	ch := make(chan StoryEvent[T], t.cfg.EventBufferSize)
 	t.subMu.Lock()
-	t.subs = append(t.subs, ch)
+	if t.closed.Load() {
+		close(ch)
+	} else {
+		t.subs = append(t.subs, ch)
+	}
 	t.subMu.Unlock()
 	return ch
 }
 
 // Close stops the background batch goroutine, waits for the current batch
 // run (if any) to complete, closes all subscriber channels, and closes the
-// store.
+// store. It is safe to call more than once; subsequent calls return nil.
 func (t *Tracker[T]) Close() error {
-	close(t.stopCh)
-	<-t.stopped
+	var closeErr error
+	t.closeOnce.Do(func() {
+		close(t.stopCh)
+		<-t.stopped
 
-	t.subMu.Lock()
-	t.closed.Store(true)
-	subs := t.subs
-	t.subs = nil
-	for _, ch := range subs {
-		close(ch)
-	}
-	t.subMu.Unlock()
+		t.subMu.Lock()
+		t.closed.Store(true)
+		subs := t.subs
+		t.subs = nil
+		for _, ch := range subs {
+			close(ch)
+		}
+		t.subMu.Unlock()
 
-	return t.cfg.Store.Close()
+		closeErr = t.cfg.Store.Close()
+	})
+	return closeErr
 }
 
 // Story returns current metadata for a single story.
@@ -221,7 +285,8 @@ func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta] {
 	return func(yield func(StoryMeta) bool) {
 		_ = t.cfg.Store.View(func(tx Tx) error {
 			return tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
-				if len(key) <= 2 || string(key[len(key)-2:]) != ":m" {
+				id, ok := parseStoryMetaKey(key)
+				if !ok {
 					return nil
 				}
 				var rec storyRecord
@@ -231,22 +296,7 @@ func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta] {
 				if state != StoryStateAny && rec.State != state {
 					return nil
 				}
-				idStr := string(key[2 : len(key)-2])
-				id, err := uuid.Parse(idStr)
-				if err != nil {
-					return nil
-				}
-				meta := StoryMeta{
-					ID:                 id,
-					State:              rec.State,
-					Centroid:           rec.Centroid,
-					Radius:             rec.Radius,
-					CreatedAt:          rec.CreatedAt,
-					LastSignalAt:       rec.LastSignalAt,
-					FrozenMeanDistance: rec.FrozenMeanDistance,
-					FrozenSigma:        rec.FrozenSigma,
-				}
-				if !yield(meta) {
+				if !yield(storyMetaFromRecord(id, rec)) {
 					return errors.New("stop iteration")
 				}
 				return nil
@@ -280,6 +330,15 @@ func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error] {
 }
 
 // calcThreshold calculates the dynamic distance threshold T_assign(story).
+//
+// T_assign(story) = mean_distance(story) + AssignmentK × σ(story).
+//
+// Dormant stories use the statistics frozen at the Dormant transition.
+// Active stories use live per-story statistics once the story has reached
+// ColdStartMinSignals window signals; below that the story is in cold-start
+// and falls back to AssignmentK × σ_global. σ is floored at
+// SigmaFloor × σ_global to prevent the threshold collapsing on near-identical
+// first signals.
 func (t *Tracker[T]) calcThreshold(story StoryMeta) float64 {
 	t.calibMu.RLock()
 	sigmaGlobal := t.sigmaGlobal
@@ -288,33 +347,56 @@ func (t *Tracker[T]) calcThreshold(story StoryMeta) float64 {
 	if sigmaGlobal == 0 {
 		sigmaGlobal = 0.25
 	}
-
-	sigma := story.FrozenSigma
-	if sigma == 0 {
-		sigma = sigmaGlobal
-	}
-
 	floor := t.cfg.SigmaFloor * sigmaGlobal
-	if sigma < floor {
-		sigma = floor
+
+	if story.State == StoryStateDormant {
+		sigma := story.FrozenSigma
+		if sigma == 0 {
+			sigma = sigmaGlobal
+		}
+		if sigma < floor {
+			sigma = floor
+		}
+		return story.FrozenMeanDistance + t.cfg.AssignmentK*sigma
 	}
 
-	meanDist := story.FrozenMeanDistance
-	return meanDist + t.cfg.AssignmentK*sigma
+	if story.SignalCount >= t.cfg.ColdStartMinSignals {
+		sigma := story.Sigma
+		if sigma < floor {
+			sigma = floor
+		}
+		return story.MeanDistance + t.cfg.AssignmentK*sigma
+	}
+
+	return t.cfg.AssignmentK * sigmaGlobal
 }
 
 // findNearestStory finds the nearest active or dormant story centroid for emb.
+// Candidates come from the Tier 3 Active Context: stories whose last signal is
+// at least ActiveContextWindow old are not anchors. The t: time index is
+// scanned rather than the full s: prefix, so the cost is proportional to the
+// number of candidate stories rather than the number of stored signals.
 func (t *Tracker[T]) findNearestStory(tx Tx, emb []float32) (StoryMeta, float64, bool, error) {
 	var bestStory StoryMeta
 	bestDist := math.MaxFloat64
 	found := false
 
-	err := tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
-		if len(key) <= 2 || string(key[len(key)-2:]) != ":m" {
+	cutoff := keyTimeIndexFrom(time.Now().Add(-t.cfg.ActiveContextWindow).Unix())
+
+	err := tx.ScanRange(cutoff, []byte("u:"), func(key, val []byte) error {
+		id, ok := parseTimeIndexKey(key)
+		if !ok {
 			return nil
 		}
 		var rec storyRecord
-		if err := json.Unmarshal(val, &rec); err != nil {
+		b, err := tx.Get(keyStoryMeta(id))
+		if err != nil {
+			return err
+		}
+		if b == nil {
+			return nil
+		}
+		if err := json.Unmarshal(b, &rec); err != nil {
 			return nil
 		}
 		if rec.State == StoryStateArchived || len(rec.Centroid) == 0 {
@@ -323,21 +405,8 @@ func (t *Tracker[T]) findNearestStory(tx Tx, emb []float32) (StoryMeta, float64,
 		d := dist.CosineDistance(emb, rec.Centroid)
 		if d < bestDist {
 			bestDist = d
-			idStr := string(key[2 : len(key)-2])
-			id, err := uuid.Parse(idStr)
-			if err == nil {
-				bestStory = StoryMeta{
-					ID:                 id,
-					State:              rec.State,
-					Centroid:           rec.Centroid,
-					Radius:             rec.Radius,
-					CreatedAt:          rec.CreatedAt,
-					LastSignalAt:       rec.LastSignalAt,
-					FrozenMeanDistance: rec.FrozenMeanDistance,
-					FrozenSigma:        rec.FrozenSigma,
-				}
-				found = true
-			}
+			bestStory = storyMetaFromRecord(id, rec)
+			found = true
 		}
 		return nil
 	})
@@ -425,6 +494,12 @@ func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
 	if err := json.Unmarshal(b, &rec); err != nil {
 		return StoryMeta{}, fmt.Errorf("decode story %s: %w", id, err)
 	}
+	return storyMetaFromRecord(id, rec), nil
+}
+
+// storyMetaFromRecord converts a persisted storyRecord into the public
+// StoryMeta value.
+func storyMetaFromRecord(id uuid.UUID, rec storyRecord) StoryMeta {
 	return StoryMeta{
 		ID:                 id,
 		State:              rec.State,
@@ -432,9 +507,102 @@ func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
 		Radius:             rec.Radius,
 		CreatedAt:          rec.CreatedAt,
 		LastSignalAt:       rec.LastSignalAt,
+		MeanDistance:       rec.MeanDistance,
+		Sigma:              rec.Sigma,
+		SignalCount:        rec.SignalCount,
 		FrozenMeanDistance: rec.FrozenMeanDistance,
 		FrozenSigma:        rec.FrozenSigma,
-	}, nil
+	}
+}
+
+// parseStoryMetaKey extracts the story ID from a "s:{storyID}:m" metadata key.
+// It returns ok=false for keys that do not match the metadata key shape
+// (for example signal keys, which share the "s:" prefix).
+func parseStoryMetaKey(key []byte) (uuid.UUID, bool) {
+	if len(key) < len("s::m") || string(key[len(key)-2:]) != ":m" {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(string(key[2 : len(key)-2]))
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+// writeStoryMeta persists rec for storyID and keeps the story's time-index
+// entry current. When LastSignalAt changes, the previous index entry (if
+// any) is removed and a fresh one is written so the index carries at most
+// one entry per story.
+func (t *Tracker[T]) writeStoryMeta(tx Tx, storyID uuid.UUID, oldLastSignalAt time.Time, rec storyRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := tx.Put(keyStoryMeta(storyID), b); err != nil {
+		return err
+	}
+	if rec.LastSignalAt.Equal(oldLastSignalAt) {
+		return nil
+	}
+	if !oldLastSignalAt.IsZero() {
+		if err := tx.Delete(keyTimeIndex(oldLastSignalAt.Unix(), storyID)); err != nil {
+			return err
+		}
+	}
+	if !rec.LastSignalAt.IsZero() {
+		// The time index carries no payload; a non-empty sentinel satisfies
+		// the Store contract that values must not be empty.
+		if err := tx.Put(keyTimeIndex(rec.LastSignalAt.Unix(), storyID), []byte{1}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readSignalLoc reads the location-index entry for a signal. It reports
+// whether an entry exists (hasIndex), whether the signal lives in the outlier
+// bucket (isOutlier), and, for story membership, the owning story ID.
+func readSignalLoc(tx Tx, signalID uuid.UUID) (storyID uuid.UUID, isOutlier, hasIndex bool, err error) {
+	b, err := tx.Get(keySignalLoc(signalID))
+	if err != nil {
+		return uuid.Nil, false, false, err
+	}
+	if b == nil {
+		return uuid.Nil, false, false, nil
+	}
+	storyID, isOutlier, ok := parseSignalLoc(b)
+	if !ok {
+		return uuid.Nil, false, false, nil
+	}
+	return storyID, isOutlier, true, nil
+}
+
+// writeSignalLoc upserts the location-index entry for a signal. Pass a nil
+// storyID with isOutlier=true to record the outlier bucket.
+func writeSignalLoc(tx Tx, signalID uuid.UUID, storyID uuid.UUID, isOutlier bool) error {
+	var val []byte
+	if isOutlier {
+		val = []byte("o")
+	} else {
+		val = fmt.Appendf(nil, "s:%s", storyID)
+	}
+	return tx.Put(keySignalLoc(signalID), val)
+}
+
+// parseSignalLoc decodes a location-index value: "s:{storyID}" for story
+// membership or "o" for the outlier bucket.
+func parseSignalLoc(val []byte) (storyID uuid.UUID, isOutlier, ok bool) {
+	if len(val) == 1 && val[0] == 'o' {
+		return uuid.Nil, true, true
+	}
+	if len(val) < len("s:") || val[0] != 's' || val[1] != ':' {
+		return uuid.Nil, false, false
+	}
+	id, err := uuid.Parse(string(val[2:]))
+	if err != nil {
+		return uuid.Nil, false, false
+	}
+	return id, false, true
 }
 
 // batchLoop runs the periodic batch re-clustering cycle until stopCh is closed.
@@ -452,28 +620,4 @@ func (t *Tracker[T]) batchLoop() {
 			t.runBatch()
 		}
 	}
-}
-
-// runBatch executes one full batch re-clustering cycle.
-func (t *Tracker[T]) runBatch() {
-	t.applyInProgress.Store(true)
-	defer func() {
-		// Drain ingest buffer
-		for {
-			select {
-			case sig := <-t.ingestBuffer:
-				_, _ = t.Ingest(context.Background(), sig)
-			default:
-				t.applyInProgress.Store(false)
-				t.emit(StoryEvent[T]{
-					Kind: EventBatchComplete,
-					At:   time.Now(),
-					BatchSummary: &BatchSummary{
-						StoriesCreated: 0,
-					},
-				})
-				return
-			}
-		}
-	}()
 }

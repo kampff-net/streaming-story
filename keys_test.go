@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -50,6 +51,82 @@ func TestKeyOutlier(t *testing.T) {
 		[]byte("o:11111111-2222-3333-4444-555555555555"),
 		keyOutlier(keysTestSignalID),
 	)
+}
+
+func TestKeySignalLoc(t *testing.T) {
+	assert.Equal(t,
+		[]byte("l:11111111-2222-3333-4444-555555555555"),
+		keySignalLoc(keysTestSignalID),
+	)
+}
+
+func TestParseSignalIDFromLocKey(t *testing.T) {
+	id, ok := parseSignalIDFromLocKey(keySignal(keysTestStoryID, keysTestSignalID))
+	require.True(t, ok)
+	assert.Equal(t, keysTestSignalID, id)
+
+	id, ok = parseSignalIDFromLocKey(keyOutlier(keysTestSignalID))
+	require.True(t, ok)
+	assert.Equal(t, keysTestSignalID, id)
+
+	_, ok = parseSignalIDFromLocKey([]byte("s:story:m"))
+	assert.False(t, ok)
+	_, ok = parseSignalIDFromLocKey([]byte("l:whatever"))
+	assert.False(t, ok)
+	_, ok = parseSignalIDFromLocKey(nil)
+	assert.False(t, ok)
+}
+
+func TestParseStoryIDFromSignalKey(t *testing.T) {
+	id, ok := parseStoryIDFromSignalKey(keySignal(keysTestStoryID, keysTestSignalID))
+	require.True(t, ok)
+	assert.Equal(t, keysTestStoryID, id)
+
+	_, ok = parseStoryIDFromSignalKey(keyOutlier(keysTestSignalID))
+	assert.False(t, ok)
+	_, ok = parseStoryIDFromSignalKey([]byte("s:story:m"))
+	assert.False(t, ok)
+}
+
+func TestIsOutlierKey(t *testing.T) {
+	assert.True(t, isOutlierKey(keyOutlier(keysTestSignalID)))
+	assert.False(t, isOutlierKey(keySignal(keysTestStoryID, keysTestSignalID)))
+	assert.False(t, isOutlierKey(nil))
+}
+
+func TestParseSignalLoc(t *testing.T) {
+	storyID := uuid.New()
+
+	id, isOutlier, ok := parseSignalLoc([]byte("s:" + storyID.String()))
+	require.True(t, ok)
+	assert.Equal(t, storyID, id)
+	assert.False(t, isOutlier)
+
+	_, isOutlier, ok = parseSignalLoc([]byte("o"))
+	require.True(t, ok)
+	assert.True(t, isOutlier)
+
+	_, _, ok = parseSignalLoc([]byte("s:not-a-uuid"))
+	assert.False(t, ok)
+	_, _, ok = parseSignalLoc([]byte("x"))
+	assert.False(t, ok)
+	_, _, ok = parseSignalLoc(nil)
+	assert.False(t, ok)
+}
+
+func TestParseTimeIndexKey(t *testing.T) {
+	id := uuid.New()
+	key := keyTimeIndex(1_700_000_000, id)
+	got, ok := parseTimeIndexKey(key)
+	require.True(t, ok)
+	assert.Equal(t, id, got)
+
+	_, ok = parseTimeIndexKey([]byte("s:story:m"))
+	assert.False(t, ok)
+	_, ok = parseTimeIndexKey([]byte("t:abc"))
+	assert.False(t, ok)
+	_, ok = parseTimeIndexKey([]byte("t:"))
+	assert.False(t, ok)
 }
 
 func TestKeyTimeIndex(t *testing.T) {

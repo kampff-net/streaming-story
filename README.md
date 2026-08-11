@@ -175,15 +175,25 @@ for meta := range tracker.Stories(story.StoryStateActive) {
 | `BatchInterval` | `30m` | Interval between background HDBSCAN re-clustering runs. |
 | `SilenceWindow` | `7d` | Inactivity threshold before an Active story transitions to `Dormant`. |
 | `ArchiveWindow` | `30d` | Inactivity threshold before a Dormant story transitions to `Archived`. |
+| `ActiveContextWindow` | `30d` | How far back the `t:` time index anchors Draft-phase story lookup. |
+| `OutlierTTL` | `2×BatchWindow` | Max outlier age relative to the last batch timestamp. |
 | `MinClusterSize` | `3` | Fixed HDBSCAN minimum cluster size constraint. |
-| `BatchSampleCap` | `50,000` | Maximum signals processed per batch run; excess is reservoir-sampled. |
+| `MinSamples` | `MinClusterSize` | HDBSCAN core-point density. |
+| `BatchSampleCap` | `50,000` | Maximum signals processed per batch run; excess is sampled. |
+| `SampleGuaranteeMaxFraction` | `0.5` | Max fraction of the sample cap reserved for per-story minimums. |
 | `AssignmentK` | `2.0` | $\sigma$-multiplier for draft distance threshold $T_{\text{assign}}(\text{story})$. |
+| `ColdStartMinSignals` | `5` | Signal count before a story's own $\sigma$ is trusted. |
+| `SigmaFloor` | `0.1` | Per-story $\sigma$ floor as a fraction of $\sigma_{global}$. |
+| `EMAAlpha` | `0.1` | EMA decay for $\sigma_{global}$ updates. |
+| `MappingMinJaccard` | `0.6` | Jaccard threshold for primary cluster continuation. |
+| `SplitMinJaccard` | `0.3` | Jaccard threshold for split/merge detection. |
 | `IngestBufferCap` | `10,000` | In-memory staging channel capacity during active batch persistence transactions. |
+| `EventBufferSize` | `512` | Per-subscriber event channel buffer depth. |
 
 ---
 
 ## Specifications & Development
 
 For deep architectural design and component specifications:
-- [Design Architecture (`DESIGN.md`)](file:///home/ksharlaimov/dev/go.kvsh.ch/go.kvsh.ch-streaming-story/DESIGN.md)
-- [Spec-Driven Development Specs (`spec/README.md`)](file:///home/ksharlaimov/dev/go.kvsh.ch/go.kvsh.ch-streaming-story/spec/README.md)
+- [Design Architecture (`DESIGN.md`)](DESIGN.md)
+- [Spec-Driven Development Specs (`spec/README.md`)](spec/README.md)

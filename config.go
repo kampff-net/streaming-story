@@ -33,6 +33,12 @@ type Config[T any] struct {
 	SilenceWindow time.Duration // Active → Dormant (default: 7d)
 	ArchiveWindow time.Duration // Dormant → Archived (default: 30d)
 
+	// ActiveContextWindow is how far back the t: time index is consulted for
+	// nearest-story lookup (Tier 3 Active Context). Stories whose last signal
+	// is older than this window are not considered as Draft-phase anchors.
+	// It defaults to ArchiveWindow.
+	ActiveContextWindow time.Duration
+
 	// Sampling.
 	BatchSampleCap             int           // max signals per HDBSCAN run (default: 50_000)
 	SampleGuaranteeMaxFraction float64       // max fraction of cap for per-story minimums (default: 0.5)
@@ -82,6 +88,9 @@ func (c *Config[T]) validate() error {
 	}
 	if c.ArchiveWindow == 0 {
 		c.ArchiveWindow = 30 * 24 * time.Hour
+	}
+	if c.ActiveContextWindow == 0 {
+		c.ActiveContextWindow = c.ArchiveWindow
 	}
 	if c.BatchSampleCap == 0 {
 		c.BatchSampleCap = 50_000

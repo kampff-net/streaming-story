@@ -78,6 +78,7 @@ During the Apply phase an `applyInProgress` flag redirects `Ingest` calls into a
 | `s:{storyID}:m` | Story metadata (centroid, radius, state, timestamps, frozen stats) |
 | `s:{storyID}:s:{signalID}` | Signal data |
 | `o:{signalID}` | Outlier signal |
+| `l:{signalID}` | Signal location index: `s:{storyID}` for story membership, `o` for outlier bucket. Lets `Ingest` find where a copy lives so re-ingestion after a batch move never duplicates it |
 | `t:{unix_sec}:{storyID}` | Time index for efficient Tier 3 range scans |
 
 ### Resolved Design Decisions

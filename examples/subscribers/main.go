@@ -31,9 +31,9 @@ func (c NewsCodec) Decode(b []byte) (story.Signal[NewsPayload], error) {
 func main() {
 	store := story.NewMemStore()
 	cfg := story.Config[NewsPayload]{
-		Store:         store,
-		Codec:         NewsCodec{},
-		BatchInterval: 500 * time.Millisecond,
+		Store:           store,
+		Codec:           NewsCodec{},
+		BatchInterval:   500 * time.Millisecond,
 		EventBufferSize: 128,
 	}
 

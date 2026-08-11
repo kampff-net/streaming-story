@@ -24,11 +24,11 @@ type StoryState uint8
 
 const (
 	// StoryStateAny is a sentinel for Stories() — iterates all states.
-	StoryStateAny StoryState = 0
+	StoryStateAny StoryState = iota
 
-	StoryStateActive   StoryState = iota // receiving signals or within SilenceWindow
-	StoryStateDormant                    // no signals for SilenceWindow; membership locked; can reactivate
-	StoryStateArchived                   // no signals for ArchiveWindow; terminal; signals retained
+	StoryStateActive   // receiving signals or within SilenceWindow
+	StoryStateDormant  // no signals for SilenceWindow; membership locked; can reactivate
+	StoryStateArchived // no signals for ArchiveWindow; terminal; signals retained
 )
 
 // Signal is the atomic unit of input.
@@ -47,6 +47,16 @@ type StoryMeta struct {
 	Radius       float64
 	CreatedAt    time.Time
 	LastSignalAt time.Time
+
+	// MeanDistance and Sigma are the live per-story statistics computed at
+	// the last batch run from the story's BatchWindow signals: the mean and
+	// population standard deviation of the distances from each window signal
+	// to the story centroid. They are meaningful only when SignalCount is at
+	// least ColdStartMinSignals; below that the Draft phase falls back to
+	// σ_global. They are cleared when the story goes Dormant.
+	MeanDistance float64
+	Sigma        float64
+	SignalCount  int
 
 	// FrozenMeanDistance and FrozenSigma are captured on the Dormant
 	// transition and used for Draft-phase threshold calculation until

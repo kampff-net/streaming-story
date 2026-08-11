@@ -263,7 +263,6 @@ type fallout struct {
 	pointIdx   int
 	clusterIdx int
 	lambda     float64
-	isNoise    bool
 }
 
 func condense(nodes []dendro, n, minClusterSize int) ([]cCluster, []fallout) {
@@ -290,7 +289,7 @@ func walkDendro(nodes []dendro, idx, clusterIdx int, clusters *[]cCluster, point
 	nd := nodes[idx]
 	if nd.left == -1 {
 		// This point reached a leaf in the hierarchy.
-		*pointFallout = append(*pointFallout, fallout{pointIdx: idx, clusterIdx: clusterIdx, lambda: math.Inf(1), isNoise: false})
+		*pointFallout = append(*pointFallout, fallout{pointIdx: idx, clusterIdx: clusterIdx, lambda: math.Inf(1)})
 		return
 	}
 
@@ -301,40 +300,40 @@ func walkDendro(nodes []dendro, idx, clusterIdx int, clusters *[]cCluster, point
 	if leftBig && rightBig {
 		// True split.
 		(*clusters)[clusterIdx].lambdaDeath = nd.lambda
-		
+
 		li := len(*clusters)
 		*clusters = append(*clusters, cCluster{lambdaBirth: nd.lambda, lambdaDeath: 0, size: left.size})
 		ri := len(*clusters)
 		*clusters = append(*clusters, cCluster{lambdaBirth: nd.lambda, lambdaDeath: 0, size: right.size})
-		
+
 		(*clusters)[clusterIdx].children = append((*clusters)[clusterIdx].children, li, ri)
-		
+
 		walkDendro(nodes, nd.left, li, clusters, pointFallout, mcs)
 		walkDendro(nodes, nd.right, ri, clusters, pointFallout, mcs)
 	} else if leftBig {
 		// Right is noise fallout.
-		collectFallout(nodes, nd.right, nd.lambda, clusterIdx, pointFallout, true)
+		collectFallout(nodes, nd.right, nd.lambda, clusterIdx, pointFallout)
 		walkDendro(nodes, nd.left, clusterIdx, clusters, pointFallout, mcs)
 	} else if rightBig {
 		// Left is noise fallout.
-		collectFallout(nodes, nd.left, nd.lambda, clusterIdx, pointFallout, true)
+		collectFallout(nodes, nd.left, nd.lambda, clusterIdx, pointFallout)
 		walkDendro(nodes, nd.right, clusterIdx, clusters, pointFallout, mcs)
 	} else {
 		// Both are small, cluster dies here.
 		(*clusters)[clusterIdx].lambdaDeath = nd.lambda
-		collectFallout(nodes, nd.left, math.Inf(1), clusterIdx, pointFallout, false)
-		collectFallout(nodes, nd.right, math.Inf(1), clusterIdx, pointFallout, false)
+		collectFallout(nodes, nd.left, math.Inf(1), clusterIdx, pointFallout)
+		collectFallout(nodes, nd.right, math.Inf(1), clusterIdx, pointFallout)
 	}
 }
 
-func collectFallout(nodes []dendro, idx int, lambda float64, clusterIdx int, pointFallout *[]fallout, isNoise bool) {
+func collectFallout(nodes []dendro, idx int, lambda float64, clusterIdx int, pointFallout *[]fallout) {
 	nd := nodes[idx]
 	if nd.left == -1 {
-		*pointFallout = append(*pointFallout, fallout{pointIdx: idx, clusterIdx: clusterIdx, lambda: lambda, isNoise: isNoise})
+		*pointFallout = append(*pointFallout, fallout{pointIdx: idx, clusterIdx: clusterIdx, lambda: lambda})
 		return
 	}
-	collectFallout(nodes, nd.left, lambda, clusterIdx, pointFallout, isNoise)
-	collectFallout(nodes, nd.right, lambda, clusterIdx, pointFallout, isNoise)
+	collectFallout(nodes, nd.left, lambda, clusterIdx, pointFallout)
+	collectFallout(nodes, nd.right, lambda, clusterIdx, pointFallout)
 }
 
 // ── Step 6: cluster stability ────────────────────────────────────────────────

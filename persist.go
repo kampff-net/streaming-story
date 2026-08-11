@@ -19,6 +19,9 @@ type storyRecord struct {
 	Radius             float64    `json:"radius"`
 	CreatedAt          time.Time  `json:"created_at"`
 	LastSignalAt       time.Time  `json:"last_signal_at"`
+	MeanDistance       float64    `json:"mean_distance,omitempty"`
+	Sigma              float64    `json:"sigma,omitempty"`
+	SignalCount        int        `json:"signal_count,omitempty"`
 	FrozenMeanDistance float64    `json:"frozen_mean_distance,omitempty"`
 	FrozenSigma        float64    `json:"frozen_sigma,omitempty"`
 }

@@ -1,11 +1,12 @@
 package story
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 )
 
-// MemStore is an thread-safe in-memory Store implementation suitable for tests and lightweight usage.
+// MemStore is a thread-safe in-memory Store implementation suitable for tests and lightweight usage.
 type MemStore struct {
 	mu   sync.RWMutex
 	data map[string][]byte
@@ -48,6 +49,9 @@ func (t *memTx) Get(key []byte) ([]byte, error) {
 }
 
 func (t *memTx) Put(key, value []byte) error {
+	if len(value) == 0 {
+		return fmt.Errorf("memstore: value for key %q must not be empty", key)
+	}
 	cp := make([]byte, len(value))
 	copy(cp, value)
 	t.store.data[string(key)] = cp
