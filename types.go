@@ -74,6 +74,7 @@ const (
 	EventStoryCreated                      // new story persisted after batch run
 	EventStorySplit                        // one story split into two
 	EventStoryMerged                       // two stories merged; StoryID2 is the retired ID
+	EventStoryRetired                      // batch emptied the story; its record was deleted
 	EventStoryDormant                      // story crossed SilenceWindow
 	EventStoryArchived                     // story crossed ArchiveWindow
 	EventBatchComplete                     // one per batch run; BatchSummary is populated
@@ -102,6 +103,7 @@ type BatchSummary struct {
 	StoriesCreated    int
 	StoriesMerged     int
 	StoriesSplit      int
+	StoriesRetired    int
 	SignalsReassigned int
 	OutliersEvicted   int
 	OutliersPromoted  int

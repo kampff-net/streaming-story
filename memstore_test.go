@@ -2,7 +2,6 @@ package story
 
 import (
 	"encoding/json"
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,9 +20,6 @@ func (jsonCodec[T]) Decode(b []byte) (Signal[T], error) {
 	var sig Signal[T]
 	return sig, json.Unmarshal(b, &sig)
 }
-
-// errStopIteration signals premature end of a scan callback.
-var errStopIteration = errors.New("stop iteration")
 
 func TestMemStore_PutGet(t *testing.T) {
 	ms := newMemStore()

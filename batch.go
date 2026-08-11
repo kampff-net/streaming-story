@@ -3,6 +3,7 @@ package story
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -26,6 +27,10 @@ const (
 	// above 1 is safe.
 	mappingInf = 1e6
 )
+
+// errStopIteration terminates a range scan early; the caller checks for it
+// with errors.Is to distinguish a requested stop from a real failure.
+var errStopIteration = errors.New("stop iteration")
 
 // batchSignal is one signal collected for a batch run.
 type batchSignal struct {
@@ -654,11 +659,52 @@ func (t *Tracker[T]) applyBatch(signals []batchSignal, stories map[uuid.UUID]sto
 			}
 		}
 
+		// Retire stories this batch emptied. A persistent story whose signals
+		// were all reassigned elsewhere (or demoted) is left with no data — an
+		// empty record is meaningless. Only stories with no remaining signal
+		// keys are retired; a story that keeps historical signals outside the
+		// batch window is untouched, per the re-assignment stability rule.
+		emptied := make(map[uuid.UUID]bool)
+		for sid, rec := range stories {
+			if _, ok := m.retired[sid]; ok {
+				continue
+			}
+			if len(finalMembers[sid]) > 0 {
+				continue
+			}
+			empty := true
+			err := tx.ScanPrefix(keySignalPrefix(sid), func(key, val []byte) error {
+				empty = false
+				return errStopIteration
+			})
+			if err != nil && !errors.Is(err, errStopIteration) {
+				return err
+			}
+			if !empty {
+				continue
+			}
+			if !rec.LastSignalAt.IsZero() {
+				if err := tx.Delete(keyTimeIndex(rec.LastSignalAt.Unix(), sid)); err != nil {
+					return err
+				}
+			}
+			if err := tx.Delete(keyStoryMeta(sid)); err != nil {
+				return err
+			}
+			emptied[sid] = true
+			summary.StoriesRetired++
+			events = append(events, StoryEvent[T]{Kind: EventStoryRetired, StoryID: sid, At: now})
+		}
+
 		// Persist surviving persistent stories and create new ones.
 		var ema emaAccum
 		handled := make(map[uuid.UUID]bool, len(stories)+len(finalMembers))
 		for sid := range stories {
 			if _, ok := m.retired[sid]; ok {
+				continue
+			}
+			if emptied[sid] {
+				handled[sid] = true
 				continue
 			}
 			if err := t.persistStory(tx, sid, stories[sid], finalMembers[sid], &ema, summary, &events, now); err != nil {

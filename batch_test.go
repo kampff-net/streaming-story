@@ -486,6 +486,96 @@ func TestApplyBatch_Merge(t *testing.T) {
 	}
 }
 
+func TestApplyBatch_RetiresEmptiedStory(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.dim.Store(3)
+
+	storyA := uuid.New()
+	newStory := uuid.New()
+	now := time.Now()
+
+	sig := Signal[string]{ID: uuid.New(), At: now, Embedding: []float32{1, 0, 0}, Data: "x"}
+	encoded, err := tr.cfg.Codec.Encode(sig)
+	require.NoError(t, err)
+	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+		if err := tx.Put(keySignal(storyA, sig.ID), encoded); err != nil {
+			return err
+		}
+		if err := writeSignalLoc(tx, sig.ID, storyA, false); err != nil {
+			return err
+		}
+		rec := storyRecord{State: StoryStateActive, CreatedAt: now.Add(-time.Hour), LastSignalAt: now}
+		return tr.writeStoryMeta(tx, storyA, time.Time{}, rec)
+	}))
+
+	m := clusterMapping{labelStory: map[int]uuid.UUID{0: newStory}}
+	signals := []batchSignal{{id: sig.ID, at: now, emb: sig.Embedding, storyID: storyA, kept: true, label: 0}}
+	summary, events, err := tr.applyBatch(signals, map[uuid.UUID]storyRecord{
+		storyA: {State: StoryStateActive, CreatedAt: now.Add(-time.Hour), LastSignalAt: now},
+	}, m, nil, now)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, summary.StoriesRetired)
+
+	var retired bool
+	for _, ev := range events {
+		if ev.Kind == EventStoryRetired && ev.StoryID == storyA {
+			retired = true
+		}
+	}
+	assert.True(t, retired, "EventStoryRetired must be emitted")
+
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		assert.Nil(t, mustGet(t, tx, keyStoryMeta(storyA)), "emptied story metadata must be deleted")
+		assert.Nil(t, mustGet(t, tx, keyTimeIndex(now.Unix(), storyA)), "emptied story time index must be deleted")
+		return nil
+	}))
+}
+
+func TestApplyBatch_KeepsMatureStoryWithHistoricalSignals(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.dim.Store(3)
+
+	storyA := uuid.New()
+	newStory := uuid.New()
+	now := time.Now()
+
+	histID := uuid.New()
+	histEnc, err := tr.cfg.Codec.Encode(Signal[string]{ID: histID, At: now.Add(-48 * time.Hour), Embedding: []float32{1, 0, 0}})
+	require.NoError(t, err)
+	winSig := Signal[string]{ID: uuid.New(), At: now, Embedding: []float32{1, 0, 0}}
+	winEnc, err := tr.cfg.Codec.Encode(winSig)
+	require.NoError(t, err)
+
+	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+		if err := tx.Put(keySignal(storyA, histID), histEnc); err != nil {
+			return err
+		}
+		if err := tx.Put(keySignal(storyA, winSig.ID), winEnc); err != nil {
+			return err
+		}
+		rec := storyRecord{State: StoryStateActive, CreatedAt: now.Add(-72 * time.Hour), LastSignalAt: now}
+		return tr.writeStoryMeta(tx, storyA, time.Time{}, rec)
+	}))
+
+	// The window signal is reassigned away, but the story keeps a historical
+	// signal outside the batch window: it must survive the retirement scan.
+	m := clusterMapping{labelStory: map[int]uuid.UUID{0: newStory}}
+	signals := []batchSignal{{id: winSig.ID, at: now, emb: winSig.Embedding, storyID: storyA, kept: true, label: 0}}
+	summary, _, err := tr.applyBatch(signals, map[uuid.UUID]storyRecord{
+		storyA: {State: StoryStateActive, CreatedAt: now.Add(-72 * time.Hour), LastSignalAt: now},
+	}, m, nil, now)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, summary.StoriesRetired, "mature story with historical signals must survive")
+
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		assert.NotNil(t, mustGet(t, tx, keyStoryMeta(storyA)), "mature story metadata must remain")
+		assert.NotNil(t, mustGet(t, tx, keySignal(storyA, histID)), "historical signal must remain")
+		return nil
+	}))
+}
+
 func TestRunBatch_StoryCreationFromOutliers(t *testing.T) {
 	tr := newTestTracker(t)
 	tr.dim.Store(3)

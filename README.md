@@ -134,11 +134,13 @@ go func() {
 			fmt.Printf("[Real-time] Signal %s provisionally assigned to Story %s\n", ev.SignalID, ev.StoryID)
 		case story.EventStoryMerged:
 			fmt.Printf("[Batch] Story %s merged into surviving Story %s\n", ev.StoryID2, ev.StoryID)
+		case story.EventStoryRetired:
+			fmt.Printf("[Batch] Story %s retired (emptied by re-clustering)\n", ev.StoryID)
 		case story.EventStorySplit:
 			fmt.Printf("[Batch] Story %s split into child Story %s\n", ev.StoryID, ev.StoryID2)
 		case story.EventBatchComplete:
-			fmt.Printf("[Batch] Re-clustering complete: %d created, %d merged, %d split\n",
-				ev.BatchSummary.StoriesCreated, ev.BatchSummary.StoriesMerged, ev.BatchSummary.StoriesSplit)
+			fmt.Printf("[Batch] Re-clustering complete: %d created, %d merged, %d split, %d retired\n",
+				ev.BatchSummary.StoriesCreated, ev.BatchSummary.StoriesMerged, ev.BatchSummary.StoriesSplit, ev.BatchSummary.StoriesRetired)
 		}
 	}
 }()

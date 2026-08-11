@@ -171,6 +171,8 @@ If a batch run determines that a signal previously assigned to Story A belongs i
 
 The `StabilityWindow` config field is **removed**; `BatchWindow` is the authoritative and consistent scope for re-assignment.
 
+**Emptied stories are retired.** When a batch run reassigns (or demotes) every signal of a persistent story — for example a story created from a premature partial merge whose signals are later reclustered into separate stories — the story is left with no data under its `s:{storyID}:` prefix. The Apply phase deletes such a story's metadata and time-index entry, increments `StoriesRetired`, and emits `EventStoryRetired`. A story that retains any historical signals outside `BatchWindow` is untouched: those signals were never part of the clustering input, so the retirement scan sees them and the story survives.
+
 ### Lifecycle Rules
 
 - A **Dormant** story may be the *target* of a merge (absorbing an active story reactivates it) but may not be *split*. If a split is detected on a Dormant story, the split is suppressed: the story remains intact and the diverging signals are promoted as a new story instead.
@@ -290,6 +292,7 @@ const (
     EventStoryCreated                      // new story persisted after batch run
     EventStorySplit                        // one story became two
     EventStoryMerged                       // two stories became one (StoryID2 is the retired ID)
+    EventStoryRetired                      // batch emptied the story; its record was deleted
     EventStoryDormant                      // story crossed SilenceWindow
     EventStoryArchived                     // story crossed ArchiveWindow; membership locked, signals retained
     EventBatchComplete                     // one per batch run; Count fields summarise the run (see StoryEvent)
@@ -316,12 +319,13 @@ type StoryEvent[T any] struct {
 // EventBufferOverflow on slow subscribers. Sizing EventBufferSize to at least
 // BatchSampleCap / average_signals_per_story avoids overflow under normal conditions.
 type BatchSummary struct {
-    StoriesCreated   int
-    StoriesMerged    int
-    StoriesSplit     int
+    StoriesCreated    int
+    StoriesMerged     int
+    StoriesSplit      int
+    StoriesRetired    int
     SignalsReassigned int
-    OutliersEvicted  int
-    OutliersPromoted int
+    OutliersEvicted   int
+    OutliersPromoted  int
 }
 ```
 
