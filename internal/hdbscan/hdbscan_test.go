@@ -189,3 +189,10 @@ func TestCluster_labels_are_zero_indexed_and_contiguous(t *testing.T) {
 	_, has1 := counts[1]
 	assert.True(t, has0 && has1, "cluster labels must be 0-indexed: got %v", counts)
 }
+
+func TestCluster_single_point_minClusterSize_1(t *testing.T) {
+	pts := [][]float32{{1, 0}}
+	labels, err := hdbscan.Cluster(pts, 1, 1)
+	require.NoError(t, err)
+	require.Len(t, labels, 1)
+}

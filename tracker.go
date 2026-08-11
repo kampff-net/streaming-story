@@ -31,7 +31,7 @@ type Tracker[T any] struct {
 	lastBatch   time.Time
 
 	// event subscribers
-	subMu  sync.Mutex
+	subMu  sync.RWMutex
 	subs   []chan StoryEvent[T]
 	closed atomic.Bool // set before subscriber channels are closed
 
@@ -124,16 +124,14 @@ func (t *Tracker[T]) Close() error {
 	close(t.stopCh)
 	<-t.stopped
 
-	t.closed.Store(true)
-
 	t.subMu.Lock()
+	t.closed.Store(true)
 	subs := t.subs
 	t.subs = nil
-	t.subMu.Unlock()
-
 	for _, ch := range subs {
 		close(ch)
 	}
+	t.subMu.Unlock()
 
 	return t.cfg.Store.Close()
 }
@@ -166,17 +164,21 @@ func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error] {
 // full, an EventBufferOverflow event is sent instead; if that also fails the
 // event is silently dropped.
 func (t *Tracker[T]) emit(ev StoryEvent[T]) {
+	t.subMu.RLock()
+	defer t.subMu.RUnlock()
+
 	if t.closed.Load() {
 		return
 	}
-	t.subMu.Lock()
-	subs := t.subs
-	t.subMu.Unlock()
 
-	for _, ch := range subs {
+	for _, ch := range t.subs {
 		select {
 		case ch <- ev:
 		default:
+			select {
+			case <-ch:
+			default:
+			}
 			overflow := StoryEvent[T]{Kind: EventBufferOverflow, At: time.Now()}
 			select {
 			case ch <- overflow:

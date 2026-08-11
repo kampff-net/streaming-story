@@ -150,7 +150,7 @@ func coreDistances(dist [][]float64, n, minSamples int) []float64 {
 }
 
 func kthSmallest(a []float64, k int) float64 {
-	if k < 0 {
+	if len(a) == 0 || k < 0 {
 		return 0
 	}
 	if k >= len(a) {

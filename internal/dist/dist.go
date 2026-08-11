@@ -23,7 +23,13 @@ func CosineSimilarity(a, b []float32) float32 {
 	if normA <= 0 || normB <= 0 {
 		return 0
 	}
-	return dot / (normA * normB)
+	sim := dot / (normA * normB)
+	if sim > 1 {
+		return 1
+	} else if sim < -1 {
+		return -1
+	}
+	return sim
 }
 
 // CosineDistance returns the cosine distance (1 - similarity) between vectors.

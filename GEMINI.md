@@ -1,1 +1,0 @@
-See CLAUDE.md for full project guidance, architecture, and implementation status.
