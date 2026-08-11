@@ -10,7 +10,7 @@ It implements a **Hybrid Clustering** approach:
 
 ## Installation
 
-Requires **Go 1.22+** (uses Go 1.22 range-over-func iterators `iter.Seq` / `iter.Seq2`).
+Requires **Go 1.26.5+** (uses standard library range-over-func iterators `iter.Seq` / `iter.Seq2`).
 
 ```bash
 go get go.kvsh.ch/streaming-story

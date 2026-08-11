@@ -6,7 +6,7 @@ This document provides consolidated guidance for AI coding agents (Gemini Coder,
 
 This is a **Go library** for real-time streaming story clustering.
 Module: `go.kvsh.ch/streaming-story`  
-Go version: 1.22 (uses `iter.Seq` / `iter.Seq2` standard library range-over-func patterns).
+Go version: 1.26.5 (uses `iter.Seq` / `iter.Seq2` standard library range-over-func patterns).
 
 Refer to `DESIGN.md` for full architectural specifications before implementing core algorithms.
 
