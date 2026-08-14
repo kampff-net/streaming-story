@@ -14,13 +14,13 @@ import (
 func minimalConfig() Config[string] {
 	return Config[string]{
 		Store: newMemStore(),
-		Codec: jsonCodec[string]{},
+		Codec: JSONCodec[string]{},
 	}
 }
 
 func TestConfig_validate(t *testing.T) {
 	t.Run("nil_store_returns_error", func(t *testing.T) {
-		cfg := Config[string]{Codec: jsonCodec[string]{}}
+		cfg := Config[string]{Codec: JSONCodec[string]{}}
 		require.Error(t, cfg.validate())
 	})
 

@@ -18,11 +18,11 @@ func newTestTracker(t *testing.T) *Tracker[string] {
 	t.Helper()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         jsonCodec[string]{},
+		Codec:         JSONCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { tr.Close() })
+	t.Cleanup(func() { _ = tr.Close() })
 	return tr
 }
 
@@ -33,7 +33,7 @@ func TestNewTracker(t *testing.T) {
 	})
 
 	t.Run("nil_store_returns_error", func(t *testing.T) {
-		_, err := NewTracker[string](Config[string]{Codec: jsonCodec[string]{}})
+		_, err := NewTracker[string](Config[string]{Codec: JSONCodec[string]{}})
 		require.Error(t, err)
 	})
 
@@ -53,11 +53,11 @@ func TestNewTracker(t *testing.T) {
 
 		tr, err := NewTracker[string](Config[string]{
 			Store:         ms,
-			Codec:         jsonCodec[string]{},
+			Codec:         JSONCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
-		t.Cleanup(func() { tr.Close() })
+		t.Cleanup(func() { _ = tr.Close() })
 
 		assert.EqualValues(t, 64, tr.dim.Load())
 		assert.Equal(t, 0.42, tr.sigmaGlobal)
@@ -84,7 +84,7 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("returns_without_blocking", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         jsonCodec[string]{},
+			Codec:         JSONCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -102,7 +102,7 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("closes_subscriber_channels", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         jsonCodec[string]{},
+			Codec:         JSONCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -144,12 +144,12 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("does_not_block_on_full_channel", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:           newMemStore(),
-			Codec:           jsonCodec[string]{},
+			Codec:           JSONCodec[string]{},
 			BatchInterval:   time.Hour,
 			EventBufferSize: 1,
 		})
 		require.NoError(t, err)
-		t.Cleanup(func() { tr.Close() })
+		t.Cleanup(func() { _ = tr.Close() })
 
 		ch := tr.Subscribe()
 		// Subscribe returns a receive-only channel; access the internal
@@ -174,7 +174,7 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("no_op_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         jsonCodec[string]{},
+			Codec:         JSONCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -341,7 +341,7 @@ func TestTracker_Ingest(t *testing.T) {
 	t.Run("returns_error_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         jsonCodec[string]{},
+			Codec:         JSONCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)

@@ -51,7 +51,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create tracker: %v", err)
 	}
-	defer tracker.Close()
+	defer func() { _ = tracker.Close() }()
 
 	// Subscribe to event stream
 	eventCh := tracker.Subscribe()

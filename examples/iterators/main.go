@@ -35,7 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create tracker: %v", err)
 	}
-	defer tracker.Close()
+	defer func() { _ = tracker.Close() }()
 
 	fmt.Println("Iterating over all active stories (Go 1.22 range-over-func)...")
 

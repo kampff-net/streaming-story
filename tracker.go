@@ -39,6 +39,10 @@ type Tracker[T any] struct {
 	closed    atomic.Bool // set before subscriber channels are closed
 	closeOnce sync.Once   // makes Close idempotent
 
+	// closeMu excludes in-flight Ingest calls from Close, so no store write
+	// can start after the store has been closed.
+	closeMu sync.RWMutex
+
 	// batch-apply concurrency: while applyInProgress is set, Ingest writes
 	// to ingestBuffer instead of directly to the store.
 	applyInProgress atomic.Bool
@@ -83,6 +87,10 @@ func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 // uuid.Nil is returned; the batch goroutine drains the buffer into the store
 // once the Apply transaction commits.
 func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, error) {
+	// Held for the whole call: Close must not shut the store down underneath
+	// a transaction this call has already started.
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
 	if t.closed.Load() {
 		return uuid.Nil, fmt.Errorf("story: tracker is closed")
 	}
@@ -254,6 +262,11 @@ func (t *Tracker[T]) Close() error {
 		close(t.stopCh)
 		<-t.stopped
 
+		// Wait for in-flight Ingest calls to finish, then bar new ones before
+		// the store goes away.
+		t.closeMu.Lock()
+		defer t.closeMu.Unlock()
+
 		t.subMu.Lock()
 		t.closed.Store(true)
 		subs := t.subs
@@ -266,6 +279,16 @@ func (t *Tracker[T]) Close() error {
 		closeErr = t.cfg.Store.Close()
 	})
 	return closeErr
+}
+
+// SignalID derives the UUID v5 signal ID for a domain key under this
+// Tracker's namespace (Config.Namespace, or TrackerNamespace when unset).
+//
+// Deriving IDs this way makes re-ingesting the same source item a no-op
+// rather than a duplicate signal. Prefer it over calling uuid.NewSHA1 with
+// TrackerNamespace directly, which ignores a configured namespace.
+func (t *Tracker[T]) SignalID(domainKey string) uuid.UUID {
+	return uuid.NewSHA1(t.cfg.Namespace, []byte(domainKey))
 }
 
 // Story returns current metadata for a single story.

@@ -47,7 +47,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create tracker: %v", err)
 	}
-	defer tracker.Close()
+	defer func() { _ = tracker.Close() }()
 
 	// Derive a stable UUID v5 signal ID using TrackerNamespace
 	domainKey := "article-tech-2026-001"

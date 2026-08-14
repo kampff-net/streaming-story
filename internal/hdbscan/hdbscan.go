@@ -417,9 +417,7 @@ func selectClusters(clusters []cCluster) []bool {
 		if clusters[curr].stability >= childSum {
 			selected[curr] = true
 		} else {
-			for _, childIdx := range clusters[curr].children {
-				bfs = append(bfs, childIdx)
-			}
+			bfs = append(bfs, clusters[curr].children...)
 		}
 	}
 	return selected

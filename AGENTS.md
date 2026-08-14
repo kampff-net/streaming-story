@@ -81,6 +81,12 @@ During the Apply phase an `applyInProgress` flag redirects `Ingest` calls into a
 | `l:{signalID}` | Signal location index: `s:{storyID}` for story membership, `o` for outlier bucket. Lets `Ingest` find where a copy lives so re-ingestion after a batch move never duplicates it |
 | `t:{unix_sec}:{storyID}` | Time index for efficient Tier 3 range scans |
 
+### Library Conveniences
+
+- `story.JSONCodec[T]` is the shipped default `Codec`; supply a custom one only for binary encodings.
+- `Tracker.SignalID(domainKey)` derives the UUID v5 signal ID under `Config.Namespace`. Prefer it over calling `uuid.NewSHA1(story.TrackerNamespace, ...)` directly, which ignores a configured namespace.
+- `Config.OnBatchError` is the only way to observe a failed batch run: a failure leaves the store untouched, returns an empty summary, and the next tick retries.
+
 ### Resolved Design Decisions
 
 - `MinClusterSize` is a **fixed config constant** — not derived from window population.

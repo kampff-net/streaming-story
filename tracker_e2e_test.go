@@ -43,7 +43,7 @@ func TestE2E_StoryClustering(t *testing.T) {
 
 	tracker, err := story.NewTracker(cfg)
 	require.NoError(t, err)
-	defer tracker.Close()
+	defer func() { _ = tracker.Close() }()
 
 	// 4 tight cluster signals
 	embeddings := [][]float32{

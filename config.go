@@ -64,6 +64,12 @@ type Config[T any] struct {
 
 	// Codec encodes and decodes Signal[T] for persistence. Required.
 	Codec Codec[T]
+
+	// OnBatchError, if set, is called with any error that aborts a batch run.
+	// A failed run leaves the store untouched and the next tick retries, so
+	// this is the only way to observe batch failures. It is called from the
+	// batch goroutine and must not block.
+	OnBatchError func(error)
 }
 
 // validate checks required fields and applies defaults for zero-value fields.

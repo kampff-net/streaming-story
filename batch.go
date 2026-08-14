@@ -80,6 +80,7 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 		return err
 	})
 	if err != nil {
+		t.reportBatchError(fmt.Errorf("story: batch collect: %w", err))
 		return &BatchSummary{}
 	}
 
@@ -100,6 +101,7 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 
 	summary, events, err := t.applyBatch(signals, stories, mapping, evict, now)
 	if err != nil {
+		t.reportBatchError(fmt.Errorf("story: batch apply: %w", err))
 		return &BatchSummary{}
 	}
 
@@ -109,6 +111,15 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 	return summary
 }
 
+// reportBatchError hands err to Config.OnBatchError when one is configured.
+// A batch failure is otherwise invisible: the run returns an empty summary and
+// the store is left untouched until the next tick.
+func (t *Tracker[T]) reportBatchError(err error) {
+	if t.cfg.OnBatchError != nil {
+		t.cfg.OnBatchError(err)
+	}
+}
+
 // drainBuffer ingests any signals that arrived while applyInProgress was set.
 // It must be called after applyInProgress is cleared so the signals reach the
 // store instead of being re-buffered.
@@ -116,7 +127,9 @@ func (t *Tracker[T]) drainBuffer() {
 	for {
 		select {
 		case sig := <-t.ingestBuffer:
-			_, _ = t.Ingest(context.Background(), sig)
+			if _, err := t.Ingest(context.Background(), sig); err != nil {
+				t.reportBatchError(fmt.Errorf("story: drain ingest buffer: %w", err))
+			}
 		default:
 			return
 		}
@@ -375,6 +388,7 @@ func (t *Tracker[T]) clusterSignals(signals []batchSignal) {
 	}
 	labels, err := hdbscan.Cluster(pts, t.cfg.MinClusterSize, t.cfg.MinSamples)
 	if err != nil {
+		t.reportBatchError(fmt.Errorf("story: batch cluster: %w", err))
 		return
 	}
 	for k, i := range kept {

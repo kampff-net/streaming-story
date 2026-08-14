@@ -46,7 +46,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize tracker: %v", err)
 	}
-	defer tracker.Close()
+	defer func() { _ = tracker.Close() }()
 
 	// Define 4 distinct semantic topics across 4 orthogonal vector dimensions:
 	// Topic 1 (AI Hardware):    [1.0, 0.0, 0.0, 0.0]

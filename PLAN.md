@@ -81,6 +81,7 @@ This plan outlines the steps required to finalize the `go.kvsh.ch/streaming-stor
   - [x] Story lifecycle transitions.
   - [x] Signal re-assignment validation.
   - [x] Outlier TTL eviction.
-- [ ] **Benchmarks**:
-  - [ ] Ingest latency during Batch Apply (buffer behavior).
-  - [ ] Batch performance with `BatchSampleCap` signals.
+- [x] **Benchmarks** (`bench_test.go`):
+  - [x] Ingest latency during Batch Apply (buffer behavior).
+  - [x] Batch performance with `BatchSampleCap` signals.
+  - [x] Steady-state Draft-phase Ingest latency.

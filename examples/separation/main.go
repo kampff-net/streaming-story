@@ -47,7 +47,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize tracker: %v", err)
 	}
-	defer tracker.Close()
+	defer func() { _ = tracker.Close() }()
 
 	now := time.Now()
 
