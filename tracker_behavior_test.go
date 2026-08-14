@@ -58,10 +58,32 @@ func TestCalcThreshold(t *testing.T) {
 		assert.InDelta(t, 1.2, tr.calcThreshold(meta), 1e-9)
 	})
 
-	t.Run("zero_sigma_global_falls_back_to_025", func(t *testing.T) {
-		tr := &Tracker[string]{cfg: Config[string]{AssignmentK: 2.0, SigmaFloor: 0.1, ColdStartMinSignals: 5}}
+	t.Run("unmeasured_sigma_global_uses_InitialSigmaGlobal", func(t *testing.T) {
+		tr := &Tracker[string]{cfg: Config[string]{
+			AssignmentK: 2.0, SigmaFloor: 0.1, ColdStartMinSignals: 5,
+			InitialSigmaGlobal: 0.25,
+		}}
 		meta := mk(StoryStateActive, 0, 3, 0, 0, 0, 0)
 		assert.InDelta(t, 0.5, tr.calcThreshold(meta), 1e-9)
+	})
+
+	t.Run("InitialSigmaGlobal_is_configurable", func(t *testing.T) {
+		tr := &Tracker[string]{cfg: Config[string]{
+			AssignmentK: 2.0, SigmaFloor: 0.1, ColdStartMinSignals: 5,
+			InitialSigmaGlobal: 0.6,
+		}}
+		meta := mk(StoryStateActive, 0, 3, 0, 0, 0, 0)
+		assert.InDelta(t, 1.2, tr.calcThreshold(meta), 1e-9)
+	})
+
+	t.Run("measured_sigma_global_ignores_InitialSigmaGlobal", func(t *testing.T) {
+		tr := &Tracker[string]{cfg: Config[string]{
+			AssignmentK: 2.0, SigmaFloor: 0.1, ColdStartMinSignals: 5,
+			InitialSigmaGlobal: 9,
+		}}
+		tr.sigmaGlobal = 0.5
+		meta := mk(StoryStateActive, 0, 3, 0, 0, 0, 0)
+		assert.InDelta(t, 1.0, tr.calcThreshold(meta), 1e-9)
 	})
 }
 

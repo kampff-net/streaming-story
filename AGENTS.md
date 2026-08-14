@@ -70,6 +70,10 @@ Outliers are evicted when `At < lastBatchTimestamp − OutlierTTL`. The referenc
 The underlying KV store is assumed to be single-writer/multi-reader (like `bbolt` or `LevelDB`).
 During the Apply phase an `applyInProgress` flag redirects `Ingest` calls into an in-memory `ingestBuffer` (bounded channel). The batch goroutine drains the buffer in a follow-up transaction. This is **at-most-once**: a crash between Apply commit and drain loses buffered signals.
 
+The flag covers **only the write transaction** — collection is read-only and clustering touches no store, so writers are not stalled for those phases.
+
+A buffered `Ingest` still returns a provisional story ID. It is computed from `draftSnapshot`, an immutable copy of the story metadata the batch already collected, published for the Apply window. The lookup **must not touch the store**: the `Store` contract does not promise `View` may run concurrently with `Update`, and single-lock backends (`MemStore` included) would block the caller for the whole Apply — the exact stall the buffer exists to prevent. The drain re-ingests each buffered signal for real; that placement is authoritative.
+
 ### KV Key Schema
 
 | Prefix | Content |
@@ -86,6 +90,7 @@ During the Apply phase an `applyInProgress` flag redirects `Ingest` calls into a
 - `story.JSONCodec[T]` is the shipped default `Codec`; supply a custom one only for binary encodings.
 - `Tracker.SignalID(domainKey)` derives the UUID v5 signal ID under `Config.Namespace`. Prefer it over calling `uuid.NewSHA1(story.TrackerNamespace, ...)` directly, which ignores a configured namespace.
 - `Config.OnBatchError` is the only way to observe a failed batch run: a failure leaves the store untouched, returns an empty summary, and the next tick retries.
+- `Config.InitialSigmaGlobal` (default 0.25) is the σ_global stand-in before the first batch measures one. Until then every story is in cold-start, so this single value decides the Draft assignment radius.
 
 ### Resolved Design Decisions
 

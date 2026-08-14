@@ -95,6 +95,8 @@ When a signal arrives:
 
     where distances are from each signal in the active window to its story centroid.
 
+    Before the first batch run completes there is no measured σ_global; `InitialSigmaGlobal` (default: 0.25) stands in until one is seeded. Every story is in cold-start at that point, so this single value determines whether early signals join a story or are held as outliers for the first batch to resolve.
+
     **σ_global** is the exponential moving average of per-signal centroid distances across all Active stories, updated at the end of each batch run:
     ```
     σ_global ← EMAAlpha × σ_global_prev + (1 − EMAAlpha) × mean_distance_all_active_stories
@@ -215,7 +217,7 @@ The underlying KV store is assumed to permit only one write transaction at a tim
 **Strategy — In-memory Ingest Buffer during Apply**
 
 1. When the Batch goroutine begins its `Apply` phase it sets an atomic `applyInProgress` flag.
-2. `Ingest` calls that arrive while `applyInProgress` is set write their signals to an in-memory staging channel (`ingestBuffer`, bounded to `IngestBufferCap` signals, default: 10,000) instead of directly to the KV store.
+2. `Ingest` calls that arrive while `applyInProgress` is set write their signals to an in-memory staging channel (`ingestBuffer`, bounded to `IngestBufferCap` signals, default: 10,000) instead of directly to the KV store. The caller still receives a provisional story ID, computed against an in-memory snapshot of the story metadata the batch collected. The lookup deliberately does not read the KV store: the `Store` interface does not require `View` to run concurrently with `Update`, so on a single-lock backend a store read here would block the caller for the whole Apply.
 3. Once the `Apply` transaction commits, the batch goroutine drains `ingestBuffer` into the store in a follow-up write transaction before clearing `applyInProgress`.
 4. If `ingestBuffer` is full, `Ingest` blocks until space is available (or `ctx` is cancelled). This provides natural back-pressure without data loss.
 
@@ -244,6 +246,7 @@ type Config[T any] struct {
     MinClusterSize   int           // HDBSCAN min points to form a cluster; fixed constant (default: 3)
     MinSamples       int           // HDBSCAN core-point density (default: MinClusterSize)
     AssignmentK      float64       // σ multiplier for per-story assignment radius (default: 2.0)
+    InitialSigmaGlobal float64     // σ_global stand-in before the first batch run measures one (default: 0.25)
     ColdStartMinSignals int        // Signals needed before per-story σ is trusted; uses σ_global below (default: 5)
     SigmaFloor       float64       // Floor for per-story σ as a fraction of σ_global (default: 0.1)
     EMAAlpha         float64       // EMA decay for σ_global updates (default: 0.1)

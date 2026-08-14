@@ -26,7 +26,8 @@ Implement a low-latency real-time ingestion pipeline (`Ingest`) that evaluates i
   * Cold-start fallback using $\sigma_{\text{global}}$ when signal count $< \text{ColdStartMinSignals}$.
   * Floor enforcement $\sigma(\text{story}) \ge \text{SigmaFloor} \times \sigma_{\text{global}}$.
   * Dormant story frozen metric reuse and threshold clearing upon reactivation.
-  * Staging in `ingestBuffer` while `applyInProgress` is set during batch updates.
+  * Staging in `ingestBuffer` while `applyInProgress` is set during batch updates, answering the caller with a provisional story ID computed from the batch's in-memory story snapshot rather than from the store.
+  * `InitialSigmaGlobal` as the $\sigma_{\text{global}}$ stand-in before the first batch run measures one.
   * Emission of `EventDraftAssigned` events.
 * **Out of Scope:**
   * Distributed stream partitioning.

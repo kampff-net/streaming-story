@@ -49,7 +49,16 @@ type Config[T any] struct {
 	MinSamples     int // core-point density; defaults to MinClusterSize
 
 	// Draft-phase assignment.
-	AssignmentK         float64 // σ multiplier for per-story assignment radius (default: 2.0)
+	AssignmentK float64 // σ multiplier for per-story assignment radius (default: 2.0)
+
+	// InitialSigmaGlobal is the σ_global stand-in used before the first batch
+	// run measures one (default: 0.25). Until then every story is in
+	// cold-start, so this value alone decides the assignment radius: raise it
+	// to make the first signals cluster together more readily, lower it to
+	// make the Draft phase hold them as outliers until the first batch run
+	// resolves the structure. It is ignored once σ_global is seeded.
+	InitialSigmaGlobal float64
+
 	ColdStartMinSignals int     // signals before per-story σ is trusted (default: 5)
 	SigmaFloor          float64 // per-story σ floor as fraction of σ_global (default: 0.1)
 	EMAAlpha            float64 // EMA decay for σ_global updates (default: 0.1)
@@ -115,6 +124,9 @@ func (c *Config[T]) validate() error {
 	}
 	if c.AssignmentK == 0 {
 		c.AssignmentK = 2.0
+	}
+	if c.InitialSigmaGlobal == 0 {
+		c.InitialSigmaGlobal = 0.25
 	}
 	if c.ColdStartMinSignals == 0 {
 		c.ColdStartMinSignals = 5

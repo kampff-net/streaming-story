@@ -45,13 +45,9 @@ type batchSignal struct {
 
 // runBatch executes one full batch re-clustering cycle.
 func (t *Tracker[T]) runBatch() {
-	t.applyInProgress.Store(true)
-
-	defer func() {
-		// Always unblock the ingest path, even if the batch core panics.
-		t.applyInProgress.Store(false)
-		t.drainBuffer()
-	}()
+	// Safety net: a panic inside the batch core must not leave Ingest
+	// permanently redirected to the staging buffer.
+	defer t.endApplyWindow()
 
 	summary := t.runBatchCore()
 
@@ -62,10 +58,27 @@ func (t *Tracker[T]) runBatch() {
 	})
 }
 
+// beginApplyWindow redirects Ingest into the staging buffer and publishes the
+// story snapshot that Draft lookups answer from while the write transaction
+// holds the store.
+func (t *Tracker[T]) beginApplyWindow(stories map[uuid.UUID]storyRecord) {
+	t.publishDraftSnapshot(stories)
+	t.applyInProgress.Store(true)
+}
+
+// endApplyWindow reopens the direct ingest path and flushes whatever was
+// staged. The snapshot outlives the flag until the drain completes, so an
+// Ingest that observed the flag just before it cleared still gets an answer.
+// It is idempotent.
+func (t *Tracker[T]) endApplyWindow() {
+	t.applyInProgress.Store(false)
+	t.drainBuffer()
+	t.clearDraftSnapshot()
+}
+
 // runBatchCore performs collection, sampling, HDBSCAN clustering, cluster
-// mapping, and the apply transaction. It must be called with applyInProgress
-// set. It returns a summary of the run; on internal failure it returns an
-// all-zero summary so the lifecycle continues.
+// mapping, and the apply transaction. It returns a summary of the run; on
+// internal failure it returns an all-zero summary so the lifecycle continues.
 func (t *Tracker[T]) runBatchCore() *BatchSummary {
 	now := time.Now()
 
@@ -99,7 +112,12 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 	t.clusterSignals(signals)
 	mapping := t.mapClusters(signals, stories)
 
+	// Only the write transaction needs the ingest path redirected: collection
+	// is read-only and clustering touches no store at all, so writers are not
+	// stalled for those phases.
+	t.beginApplyWindow(stories)
 	summary, events, err := t.applyBatch(signals, stories, mapping, evict, now)
+	t.endApplyWindow()
 	if err != nil {
 		t.reportBatchError(fmt.Errorf("story: batch apply: %w", err))
 		return &BatchSummary{}

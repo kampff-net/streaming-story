@@ -44,9 +44,11 @@ type Tracker[T any] struct {
 	closeMu sync.RWMutex
 
 	// batch-apply concurrency: while applyInProgress is set, Ingest writes
-	// to ingestBuffer instead of directly to the store.
+	// to ingestBuffer instead of directly to the store, and answers from
+	// draftSnapshot instead of reading the store.
 	applyInProgress atomic.Bool
 	ingestBuffer    chan Signal[T]
+	draftSnapshot   atomic.Pointer[draftSnapshot]
 
 	// lifecycle
 	stopCh  chan struct{}
@@ -83,9 +85,11 @@ func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 // Returns ErrDimensionMismatch if the signal's embedding length differs from
 // the dimensionality established by the first ingested signal.
 //
-// While a batch Apply is in progress the signal is buffered in memory and
-// uuid.Nil is returned; the batch goroutine drains the buffer into the store
-// once the Apply transaction commits.
+// While a batch Apply is in progress the signal is buffered in memory and the
+// returned ID is computed from the story snapshot the batch published, so a
+// caller never has to distinguish "no match" from "ask again later". The
+// batch goroutine drains the buffer into the store once the Apply transaction
+// commits, and that placement — not this one — is authoritative.
 func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, error) {
 	// Held for the whole call: Close must not shut the store down underneath
 	// a transaction this call has already started.
@@ -107,11 +111,14 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, erro
 	}
 
 	// If a batch Apply is in progress, buffer the signal instead of writing
-	// directly to the store.
+	// directly to the store, and answer the caller from the snapshot the
+	// batch published. The store is not touched: the Store contract does not
+	// promise that View may run concurrently with Update.
 	if t.applyInProgress.Load() {
+		provisional := t.provisionalStory(sig.Embedding, time.Now())
 		select {
 		case t.ingestBuffer <- sig:
-			return uuid.Nil, nil
+			return provisional, nil
 		case <-ctx.Done():
 			return uuid.Nil, ctx.Err()
 		}
@@ -368,7 +375,9 @@ func (t *Tracker[T]) calcThreshold(story StoryMeta) float64 {
 	t.calibMu.RUnlock()
 
 	if sigmaGlobal == 0 {
-		sigmaGlobal = 0.25
+		// No batch has completed yet, so σ_global has never been measured.
+		// InitialSigmaGlobal stands in until the first run seeds it.
+		sigmaGlobal = t.cfg.InitialSigmaGlobal
 	}
 	floor := t.cfg.SigmaFloor * sigmaGlobal
 
