@@ -4,7 +4,7 @@
 
 `go.kvsh.ch/streaming-story` is a Go library for ingesting a continuous stream of signals and grouping them into evolving stories. It uses a **Hybrid Clustering** approach:
 1.  **Real-time Ingestion**: Immediate assignment to the nearest story for low-latency feedback (the "Draft" assignment).
-2.  **Periodic Batch Re-clustering**: A background process that uses HDBSCAN to refine the story structure, identifying splits and merges based on statistical density rather than hardcoded distance thresholds.
+2.  **Periodic Maintenance**: A background process that refines the existing story structure — promoting outlier groups, splitting diverged stories, merging converged ones — without re-deriving stories from scratch. See [Maintenance Pass](#maintenance-pass).
 
 `Ingest` is goroutine-safe. `Subscribe` channels are per-caller and independently buffered.
 
@@ -60,10 +60,10 @@ The system maintains three temporal tiers to balance performance and semantic ac
 | Tier | Name | Size (Default) | Role |
 |---|---|---|---|
 | **Tier 1** | Ingestion | 1 Signal | Immediate "best-guess" assignment to the nearest existing story centroid. |
-| **Tier 2** | Batch Window | Last `BatchWindow` (default: 24h) | Periodic re-clustering (HDBSCAN) on all signals received within the window to discover the "true" structure of the recent stream. |
+| **Tier 2** | Batch Window | Last `BatchWindow` (default: 24h) | Periodic maintenance over existing stories: promote, split, merge, recentre. See [Maintenance Pass](#maintenance-pass). |
 | **Tier 3** | Active Context | Last 30 Days | All Active/Dormant story centroids used as anchors for mapping batch results. |
 
-The batch window is time-bounded. The number of signals it contains varies with ingestion rate, which is taken into account when choosing HDBSCAN parameters (see [Batch Re-clustering](#2-batch-re-clustering-refinement-phase)).
+The batch window bounds outlier retention and lifecycle transitions. Story membership itself is read in full each run, because the lifetime centroid is the mean of every member.
 
 ---
 
@@ -120,23 +120,7 @@ Triggered when either condition fires first:
 
 Steps:
 1.  **Collect**: Gather all signals with `At ≥ now − BatchWindow`, plus all outlier signals with `At ≥ lastBatchTimestamp − OutlierTTL`. Outlier signals older than that threshold are evicted (deleted from the `o:` prefix) and dropped — they have failed to cluster across enough successive batch runs that retaining them would only grow the outlier bucket indefinitely. Using `lastBatchTimestamp` rather than wall-clock `now` as the reference point prevents mass eviction after a maintenance pause: if the system is offline for an extended period, `lastBatchTimestamp` does not advance, so outliers are not penalised for time the batch goroutine was not running.
-2.  **Parameterise HDBSCAN**:
-    - Use the configured `MinClusterSize` (default: 3) directly. It is a **fixed constant**, not derived from window population. A dynamic formula risks blinding the algorithm to small-but-distinct stories that may have few but high-value signals.
-    - `MinSamples = MinClusterSize` (configurable).
-    - **Cluster extraction**: `ClusterSelection` chooses how clusters are read out of the condensed cluster tree.
-      - `ClusterSelectionEOM` (default) is excess of mass, the method in Campello et al.: a node is selected when its own stability is at least the summed stability of its descendants.
-      - `ClusterSelectionLeaf` selects every leaf of the condensed tree instead.
-
-      EOM favours breadth, and that is a hazard for story tracking. A large, diffuse, long-lived region accumulates stability across the whole λ range it survives, which can exceed the summed stability of the tighter clusters nested inside it. The parent is then selected and every distinct story within it is labelled as one cluster — the apply phase subsequently moves each of those stories' window signals into the single winning story and retires the ones left empty. Raising `MinClusterSize` does **not** counteract this: density pruning happens earlier, during condensation, and a broad region that is genuinely dense only becomes more stable.
-
-      Leaf extraction yields more, smaller, more homogeneous clusters and never collapses nested clusters into their parent. The cost is that a genuinely broad story may be split across several stories, which Phase 2 merge detection can reunite on a later run. Unlike EOM, leaf extraction applies no stability floor: a leaf with zero stability is one whose points all fall out at its own birth λ, which is precisely the tightest grouping in the data.
-    - **`MaxClusterSize`** (default: 0, unlimited) rejects any candidate cluster holding more points, forcing extraction to descend into its children. It applies to EOM only — leaf extraction has no larger candidate to fall back from. An over-sized leaf under EOM has no children to descend into, so its points become noise: the cap trades coverage for cohesion.
-    - **Sampling**: If `len(signals) > BatchSampleCap` (default: 50,000), apply stratified reservoir sampling down to `BatchSampleCap` using the following two-pass allocation:
-      1. **Guaranteed minimum pass**: Compute `totalGuarantee = numActiveStories × MinClusterSize`. If `totalGuarantee ≤ SampleGuaranteeMaxFraction × BatchSampleCap` (default `SampleGuaranteeMaxFraction = 0.5`), reserve exactly `MinClusterSize` signals per Active story (drawn in reverse-chronological order). If the budget is exceeded, scale the per-story reservation down proportionally to `floor(BatchSampleCap × SampleGuaranteeMaxFraction / numActiveStories)`, with a minimum of 1 per story that has any signals in the window. This ensures the guarantee never consumes more than half of `BatchSampleCap`, leaving room for new signal discovery.
-      2. **Proportional pass**: Fill the remaining capacity (`BatchSampleCap − guaranteed slots used`) proportionally across all stories by their signal count, topping up stories that received fewer than their proportional share in pass 1.
-      This prevents small but active stories from falling below the viable cluster density while also preserving capacity for emerging signals. It bounds HDBSCAN's $O(N \log N)$ cost and prevents a run from exceeding `BatchInterval`, which would cause a backlog.
-3.  **Re-cluster**: Run HDBSCAN on the collected signals.
-4.  **Map**: Match new batch clusters ($C_B$) to persistent stories ($S_P$) using Jaccard overlap and the Hungarian algorithm (see [Cluster Mapping](#cluster-mapping)).
+2.  **Maintain**: run the maintenance operations over existing stories. See [Maintenance Pass](#maintenance-pass).
 5.  **Apply**: Persist the resulting updates (1-to-1, merge, split, new story) and emit events.
 6.  **Promote outliers**: Any outlier signal that ended up in a batch cluster is migrated from `o:{signalID}` to `s:{storyID}:s:{signalID}`.
 
@@ -150,7 +134,9 @@ For each pair $(C_B, S_P)$ compute:
 Jaccard(C_B, S_P) = |signals(C_B) ∩ signals(S_P)| / |signals(C_B) ∪ signals(S_P)|
 ```
 
-Both sets are **restricted to signals within the `BatchWindow`** — the same signal population fed into HDBSCAN. Using `S_P`'s full lifetime signal set would make `|C_B ∪ S_P|` very large for mature stories (thousands of signals vs. a handful in the current window), driving Jaccard near zero and causing valid continuity links to fail the `MappingMinJaccard` check. Concretely, `signals(S_P)` is the set of signals whose key is `s:{storyID}:s:*` **and** whose `At ≥ now − BatchWindow`, including Draft-assigned signals from the current window. A brand-new story created by a Draft assignment just before the batch run will therefore have its current-window signals included in the Jaccard calculation, giving it a fair chance at a continuity match.
+> **Superseded by spec 006.** The Jaccard/Hungarian mapping engine described in
+> this section no longer exists. Stories are maintained rather than re-derived;
+> see [Maintenance Pass](#maintenance-pass).
 
 **Phase 1 — Primary Continuity (Hungarian assignment)**
 
@@ -177,7 +163,7 @@ Phase 2 operates over the **full unmatched set**, not just individual pairs, ena
 
 ### 3. Stability & Re-assignment
 
-If a batch run determines that a signal previously assigned to Story A belongs in Story B, the `Tracker` updates the persistence layer and emits `EventSignalReassigned`. Re-assignment is limited to signals within the current **`BatchWindow`**: only signals that were fed into the HDBSCAN run have a batch-derived label and are therefore eligible for re-assignment. Signals older than `BatchWindow` were not part of the clustering calculation and must not be moved — doing so would produce a re-assignment decision with no algorithmic basis.
+> **Superseded by spec 006.** Individual signals are never reassigned. Membership changes only through a split or a merge, each of which moves a whole group and emits an event; `EventSignalReassigned` now accompanies outlier promotion, split migration, and merge migration.
 
 The `StabilityWindow` config field is **removed**; `BatchWindow` is the authoritative and consistent scope for re-assignment.
 
@@ -187,7 +173,7 @@ The `StabilityWindow` config field is **removed**; `BatchWindow` is the authorit
 
 - A **Dormant** story may be the *target* of a merge (absorbing an active story reactivates it) but may not be *split*. If a split is detected on a Dormant story, the split is suppressed: the story remains intact and the diverging signals are promoted as a new story instead.
 - **Archived** stories are excluded from cluster mapping entirely. The batch Apply phase skips them when building the $S_P$ candidate set; any new signals on the same topic will form a new story via the unmatched-$C_B$ path.
-- **Noise retention**: If a signal already assigned to a story is labeled as Noise (label −1) by a batch run, it is **retained** in its current story and not evicted to the outlier bucket. HDBSCAN's noise label reflects local density insufficiency, not evidence of a better cluster. Evicting such signals would produce "flickering" — the same signal repeatedly entering and leaving a story across successive batch runs.
+- **Noise retention**: no longer applicable. There is no noise label; a signal assigned to a story stays there until the story splits or merges.
 
 ---
 
@@ -248,11 +234,15 @@ type Config[T any] struct {
     SilenceWindow    time.Duration // Active -> Dormant (default: 7d)
     ArchiveWindow    time.Duration // Dormant -> Archived (default: 30d)
     // StabilityWindow removed: re-assignment scope is BatchWindow (see Stability & Re-assignment).
-    BatchSampleCap              int           // Max signals fed to HDBSCAN per run; excess is reservoir-sampled (default: 50_000)
+    BatchSampleCap              int           // Deprecated (spec 006): unused
     SampleGuaranteeMaxFraction  float64       // Max fraction of BatchSampleCap reserved for per-story minimums; remainder is proportional (default: 0.5)
     OutlierTTL                  time.Duration // Max age of an outlier signal (relative to last batch run) before eviction (default: 2 × BatchWindow)
-    MinClusterSize   int           // HDBSCAN min points to form a cluster; fixed constant (default: 3)
-    MinSamples       int           // HDBSCAN core-point density (default: MinClusterSize)
+    AssignThreshold  float64       // Max centroid distance for a signal to join a story (default: 0.28)
+    MergeThreshold   float64       // Centroid distance at or below which two stories merge (default: 0.22)
+    SplitThreshold   float64       // Best-partition distance above which a story splits (default: 0.30)
+    MinStorySize     int           // Signals required for a group to be a story (default: 3)
+    MinClusterSize   int           // Deprecated (spec 006): unused
+    MinSamples       int           // Deprecated (spec 006): unused
     AssignmentK      float64       // σ multiplier for per-story assignment radius (default: 2.0)
     InitialSigmaGlobal float64     // σ_global stand-in before the first batch run measures one (default: 0.25)
     ColdStartMinSignals int        // Signals needed before per-story σ is trusted; uses σ_global below (default: 5)
@@ -346,3 +336,77 @@ type BatchSummary struct {
 - Distributed operation (single-node, embedded).
 - Approximate Nearest Neighbor (ANN) indexing (brute-force centroids is $O(stories)$ and fast enough for the expected story count).
 - Built-in embedding generation (caller provided).
+
+
+## Maintenance Pass
+
+Replaces batch re-clustering as of spec 006. HDBSCAN was removed: it builds an
+MST over mutual-reachability distances, which is single linkage with a density
+correction, and news embeddings chain through it. On a 596-signal corpus,
+transitive grouping at cosine distance 0.25 put 324 signals into one component
+while nearest-centroid grouping at the same threshold produced a largest group
+of 22. Re-clustering also discarded story identity every run, which is what the
+Jaccard/Hungarian mapping engine existed to reconstruct.
+
+### Operations, in order
+
+| # | Operation | Rule |
+|---|---|---|
+| 1 | Evict | Outliers older than `lastBatch − OutlierTTL`. |
+| 2 | Promote | Groups of outliers that are mutually within `AssignThreshold` and number at least `MinStorySize` become new stories. |
+| 3 | Split | A story whose best two-way partition has part centroids more than `SplitThreshold` apart, with both parts at least `MinStorySize`, divides in two. |
+| 4 | Merge | Stories whose centroids are within `MergeThreshold` unify; oldest `CreatedAt` survives. |
+| 5 | Recentre | Recompute both centroids, radius, mean distance, σ, and σ_global. |
+| 6 | Lifecycle | Active → Dormant → Archived on the existing windows. |
+
+Promotion uses **mutual-neighbour cliques, not connected components**:
+components are the transitive linkage that chains. Every member of a promoted
+story is within `AssignThreshold` of every other, so it is compact from birth.
+
+### Thresholds
+
+`MergeThreshold` (0.22) and `SplitThreshold` (0.30) are the two edges of one
+hysteresis band, and `SplitThreshold` must be strictly greater. Merge tests one
+historically-given partition; split searches for the best partition. A search
+can beat a fixed arrangement on the same signals, so with a single shared value
+a merge and a split undo each other along different seams and story IDs churn
+while the data is unchanged. `validate()` rejects a collapsed band.
+
+`AssignThreshold` (0.28) governs a different comparison — one point against a
+centroid, rather than two centroids against each other — and so keeps its own
+value. It also clamps the adaptive per-story threshold, so a story that has
+drifted wide cannot keep widening its own catchment.
+
+### The split radius gate
+
+Testing every story's partition each run is wasteful, so a necessary condition
+runs first: attempt a split only when `4r − 2r² > SplitThreshold`, where *r* is
+the story radius.
+
+The bound is **not** the Euclidean `2r`. Cosine distance is not a metric and
+`1 − cos` grows quadratically in the angle, so two members each at cosine
+distance *r* from the centroid can be `1 − cos(2·arccos(1−r))` apart, which
+expands to `4r − 2r²`. At *r* = 0.122 that is 0.458 against the 0.245 a
+Euclidean bound predicts, so `2r` would skip stories that genuinely split.
+
+### Centroids
+
+Each story carries two. `Centroid` is the unweighted mean of **all** members and
+is the identity geometry: merge, split, radius, and σ measure against it.
+`RecentCentroid` covers members within `ActiveContextWindow` and is what Draft
+admission compares against, so a developing story keeps admitting its own
+current coverage while its identity stays anchored.
+
+Both are **recomputed from members every run**, never accumulated. A running
+mean or EMA depends on arrival order and elapsed run count, so two stores
+holding identical signals would carry different centroids and every threshold
+comparison downstream would differ with them.
+
+### Membership stability
+
+No signal is relocated individually. Membership changes only through split or
+merge, each of which moves a whole group and emits an event. An individual
+misassignment is therefore not individually correctable — it is repaired only
+when enough similar signals accumulate to form a group that clears
+`MinStorySize`, which is exactly when the error is worth acting on. Churning one
+signal between stories every run is the instability this design removes.

@@ -29,30 +29,16 @@ No Makefile or custom tooling exists yet.
 
 ## Architecture & System Design
 
-The library is a hybrid clustering system: a **Draft phase** (real-time, per-signal) and a **Refinement phase** (periodic batch, HDBSCAN).
+The library is a hybrid clustering system: a **Draft phase** (real-time, per-signal nearest-centroid assignment) and a **Maintenance phase** (periodic batch: promote, split, merge, recentre).
 
 ### Signal Flow
 
-1. `Ingest` → cosine-similarity nearest-centroid lookup → assign or outlier-bucket.
-2. Background goroutine fires every `BatchInterval` → HDBSCAN → cluster mapping → KV apply → emit events.
+1. `Ingest` → cosine-similarity nearest-`RecentCentroid` lookup → assign or outlier-bucket.
+2. Background goroutine fires every `BatchInterval` → maintenance pass → KV apply → emit events.
 
-### Cluster Mapping (Two-Phase)
+### Merge Survivor Rule
 
-- **Phase 1**: Uses the Hungarian algorithm for optimal 1-to-1 continuity (cost = 1 − Jaccard).
-- **Phase 2**: Scans full unmatched set for splits and merges.
-- Both phases use Jaccard over **BatchWindow-scoped signals only** — not lifetime signals — to avoid denominator blow-up on mature stories.
-- For N-way merges, the **oldest StoryID survives** (earliest creation time). If secondary story is older than primary, survivor/retired labels flip.
-
-### Sampling (Two-Pass)
-
-When `len(signals) > BatchSampleCap`, sampling is two-pass:
-1. **Guaranteed pass**: `MinClusterSize` signals per Active story, capped at `SampleGuaranteeMaxFraction` (0.5) × `BatchSampleCap` total. If budget is exceeded, per-story reservations scale down proportionally (floor 1).
-2. **Proportional pass**: remaining capacity distributed by signal count.
-
-### Stability Rule
-
-Re-assignment is scoped to `BatchWindow`. Signals older than `BatchWindow` are never moved by a batch run.
-**Exception**: a merge is a key-space migration (all signal keys move under the surviving story's prefix, including historical ones) — exempt from the stability rule.
+For merges, the **oldest StoryID survives** (earliest `CreatedAt`). Signals migrate by key-space scan under the survivor's prefix, including signals older than `BatchWindow`. A split migrates the same way. Sampling and the `BatchWindow`-scoped re-assignment rule are gone: membership is read in full because the lifetime centroid is the mean of every member.
 
 ### Dormant & Archived Story Lifecycle
 
@@ -92,17 +78,24 @@ A buffered `Ingest` still returns a provisional story ID. It is computed from `d
 - `Config.OnBatchError` is the only way to observe a failed batch run: a failure leaves the store untouched, returns an empty summary, and the next tick retries.
 - `Config.InitialSigmaGlobal` (default 0.25) is the σ_global stand-in before the first batch measures one. Until then every story is in cold-start, so this single value decides the Draft assignment radius.
 
-### Cluster Extraction
+### Maintenance Pass (spec 006)
 
-`Config.ClusterSelection` picks how clusters are read out of the condensed tree: `ClusterSelectionEOM` (excess of mass, the default) or `ClusterSelectionLeaf`.
+HDBSCAN is **gone**. `internal/hdbscan` and `internal/hungarian` were deleted, along with the two-phase Jaccard mapping engine. The batch phase now maintains existing stories rather than re-deriving them: evict, promote, split, merge, recentre, lifecycle.
 
-EOM can select a broad parent over the tighter clusters nested inside it, collapsing several distinct stories into one. The apply phase then moves those stories' window signals into the winner and retires the emptied stories. Raising `MinClusterSize` does not help — that acts during condensation, and a broad region that is genuinely dense only gets more stable. Use leaf extraction when the corpus has that shape.
+Why: HDBSCAN's MST over mutual-reachability distances is single linkage with a density correction, and news embeddings chain through it. Measured on 596 real signals, transitive grouping at cosine distance 0.25 produced a 324-signal component; nearest-centroid grouping at the same threshold produced a largest group of 22.
 
-`Config.MaxClusterSize` (0 = unlimited) caps candidate cluster size under EOM, forcing a descent into children. Not applicable to leaf extraction.
+Key rules when touching this code:
+
+- **Promotion uses mutual-neighbour cliques, never connected components.** Components are the transitive linkage that chains.
+- **`MergeThreshold` < `SplitThreshold` is mandatory** and enforced by `validate()`. Merge tests a given partition; split searches for the best one, so a shared value lets them undo each other along different seams.
+- **The split radius gate is `4r − 2r²`, not `2r`.** Cosine distance is not a metric; `1 − cos` is quadratic in the angle. A Euclidean bound silently skips stories that should split.
+- **Centroids are recomputed from members every run, never accumulated.** An incremental mean depends on arrival order, which breaks reproducibility.
+- **Two centroids:** `Centroid` (lifetime) for identity geometry, `RecentCentroid` (ActiveContextWindow) for admission.
+- **No individual signal reassignment.** Membership changes only via split or merge.
 
 ### Resolved Design Decisions
 
-- `MinClusterSize` is a **fixed config constant** — not derived from window population.
+- `MinStorySize` is the minimum signals for a group to be a story; it gates promotion and both sides of a split. It replaced `MinClusterSize`, which is retained as a deprecated no-op field.
 - `StabilityWindow` is **removed** — `BatchWindow` is the sole re-assignment scope.
 - Signal UUID namespace is a **fixed compile-time constant** (`TrackerNamespace`) — not derived from store path.
 - Default windows are calibrated for **news-frequency ingestion** (1–10 signals/day per topic).

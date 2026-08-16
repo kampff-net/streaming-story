@@ -4,7 +4,7 @@
 
 It implements a **Hybrid Clustering** approach:
 1. **Real-time Ingestion (Draft Phase)**: Immediate low-latency signal assignment to the nearest active story centroid based on cosine similarity and dynamic adaptive thresholding.
-2. **Periodic Batch Re-clustering (Refinement Phase)**: Asynchronous background HDBSCAN density clustering to discover true story structures, resolving splits, merges, and initial draft misassignments over sliding temporal windows.
+2. **Periodic Maintenance (Refinement Phase)**: An asynchronous background pass that refines the existing story structure — promoting groups of outliers, splitting stories that have diverged, and merging those that have converged — without re-deriving stories from scratch. Story identity is therefore stable across runs.
 
 ---
 
@@ -24,7 +24,7 @@ go get go.kvsh.ch/streaming-story
 * **Story**: Persistent semantic cluster with a calculated centroid, radius, creation timestamp, and state (`Active`, `Dormant`, `Archived`).
 * **Tiered Temporal Windows**:
   - **Tier 1 (Ingestion)**: 1 signal at a time for immediate provisional draft assignment.
-  - **Tier 2 (Batch Window)**: Recent signals (default: 24h) fed to HDBSCAN for batch re-clustering.
+  - **Tier 2 (Batch Window)**: Bounds outlier retention and lifecycle transitions for the periodic maintenance pass.
   - **Tier 3 (Active Context)**: Recent stories (default: 30d) used as centroid anchors.
 
 ---
@@ -173,14 +173,16 @@ for meta := range tracker.Stories(story.StoryStateActive) {
 
 | Parameter | Default | Description |
 |---|---|---|
-| `BatchWindow` | `24h` | Sliding temporal window of signals fed into each HDBSCAN batch run. |
-| `BatchInterval` | `30m` | Interval between background HDBSCAN re-clustering runs. |
+| `BatchWindow` | `24h` | Sliding temporal window bounding outlier retention and lifecycle transitions. |
+| `BatchInterval` | `30m` | Interval between background maintenance runs. |
 | `SilenceWindow` | `7d` | Inactivity threshold before an Active story transitions to `Dormant`. |
 | `ArchiveWindow` | `30d` | Inactivity threshold before a Dormant story transitions to `Archived`. |
 | `ActiveContextWindow` | `30d` | How far back the `t:` time index anchors Draft-phase story lookup. |
 | `OutlierTTL` | `2×BatchWindow` | Max outlier age relative to the last batch timestamp. |
-| `MinClusterSize` | `3` | Fixed HDBSCAN minimum cluster size constraint. |
-| `MinSamples` | `MinClusterSize` | HDBSCAN core-point density. |
+| `AssignThreshold` | `0.28` | Max cosine distance for a signal to join a story. |
+| `MergeThreshold` | `0.22` | At or below this centroid distance, two stories merge. |
+| `SplitThreshold` | `0.30` | Above this best-partition distance, a story splits. Must exceed `MergeThreshold`. |
+| `MinStorySize` | `3` | Signals required for a group to be a story. |
 | `BatchSampleCap` | `50,000` | Maximum signals processed per batch run; excess is sampled. |
 | `SampleGuaranteeMaxFraction` | `0.5` | Max fraction of the sample cap reserved for per-story minimums. |
 | `AssignmentK` | `2.0` | $\sigma$-multiplier for draft distance threshold $T_{\text{assign}}(\text{story})$. |
