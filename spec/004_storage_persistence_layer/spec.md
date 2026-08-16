@@ -64,7 +64,7 @@ type Tx interface {
 ```
 
 ### 2.3 Protocol / API Changes
-- Key prefix definitions implemented in [`keys.go`](file:///home/ksharlaimov/dev/go.kvsh.ch/go.kvsh.ch-streaming-story/keys.go).
+- Key prefix definitions implemented in [`keys.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/keys.go).
 
 ### 2.4 Real-Time & Resource Impacts
 - Allocation Budget: Zero key formatting allocations via pre-allocated byte slices.

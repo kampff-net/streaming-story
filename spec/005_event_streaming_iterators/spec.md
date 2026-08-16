@@ -54,7 +54,7 @@ func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error]
 ```
 
 ### 2.3 Protocol / API Changes
-- Implement `Stories` and `SignalsOf` in [`tracker.go`](file:///home/ksharlaimov/dev/go.kvsh.ch/go.kvsh.ch-streaming-story/tracker.go).
+- Implement `Stories` and `SignalsOf` in [`tracker.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/tracker.go).
 
 ### 2.4 Real-Time & Resource Impacts
 - Allocation Budget: Zero allocation for Go 1.22 Range-over-func iterators during traversal.
