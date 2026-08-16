@@ -427,8 +427,12 @@ func TestPersistStory_LifecycleTransitions(t *testing.T) {
 		}
 		var summary BatchSummary
 		var events []StoryEvent[string]
+		// Lifecycle is driven by membership now: an empty story is retired
+		// rather than transitioned, so the subject needs a member whose age
+		// puts it past the window under test.
+		members := []*batchSignal{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return tr.persistStory(tx, sid, prev, nil, &emaAccum{}, &summary, &events, now)
+			return tr.recentreStory(tx, sid, prev, true, members, &emaAccum{}, &summary, &events, now)
 		}))
 
 		require.Len(t, events, 1)
@@ -440,7 +444,6 @@ func TestPersistStory_LifecycleTransitions(t *testing.T) {
 		assert.Equal(t, StoryStateDormant, meta.State)
 		assert.Equal(t, 0.3, meta.FrozenMeanDistance)
 		assert.Equal(t, 0.1, meta.FrozenSigma)
-		assert.Zero(t, meta.MeanDistance)
 	})
 
 	t.Run("dormant_to_archived", func(t *testing.T) {
@@ -455,8 +458,12 @@ func TestPersistStory_LifecycleTransitions(t *testing.T) {
 		}
 		var summary BatchSummary
 		var events []StoryEvent[string]
+		// Lifecycle is driven by membership now: an empty story is retired
+		// rather than transitioned, so the subject needs a member whose age
+		// puts it past the window under test.
+		members := []*batchSignal{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return tr.persistStory(tx, sid, prev, nil, &emaAccum{}, &summary, &events, now)
+			return tr.recentreStory(tx, sid, prev, true, members, &emaAccum{}, &summary, &events, now)
 		}))
 
 		require.Len(t, events, 1)
@@ -474,11 +481,39 @@ func TestPersistStory_LifecycleTransitions(t *testing.T) {
 		}
 		var summary BatchSummary
 		var events []StoryEvent[string]
+		members := []*batchSignal{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return tr.persistStory(tx, sid, prev, nil, &emaAccum{}, &summary, &events, now)
+			return tr.recentreStory(tx, sid, prev, true, members, &emaAccum{}, &summary, &events, now)
 		}))
 		assert.Empty(t, events)
 	})
+}
+
+// TestCalcThreshold_ClampedToAssignThreshold covers the ceiling on the
+// adaptive rule. Without it a story that has drifted wide keeps widening its
+// own catchment, which is how one story ends up absorbing unrelated coverage.
+func TestCalcThreshold_ClampedToAssignThreshold(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.cfg.AssignThreshold = 0.28
+	tr.sigmaGlobal = 0.5
+
+	wide := StoryMeta{
+		State:        StoryStateActive,
+		SignalCount:  100,
+		MeanDistance: 0.9,
+		Sigma:        0.4,
+	}
+	assert.InDelta(t, 0.28, tr.calcThreshold(wide), 1e-9,
+		"an adaptive threshold above AssignThreshold must be clamped")
+
+	tight := StoryMeta{
+		State:        StoryStateActive,
+		SignalCount:  100,
+		MeanDistance: 0.05,
+		Sigma:        0.01,
+	}
+	assert.Less(t, tr.calcThreshold(tight), 0.28,
+		"a threshold below the ceiling must pass through unchanged")
 }
 
 func TestCollectBatch_OutlierEviction(t *testing.T) {

@@ -152,6 +152,7 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, erro
 				rec := storyRecord{
 					State:              bestStory.State,
 					Centroid:           bestStory.Centroid,
+					RecentCentroid:     bestStory.RecentCentroid,
 					Radius:             bestStory.Radius,
 					CreatedAt:          bestStory.CreatedAt,
 					LastSignalAt:       bestStory.LastSignalAt,
@@ -435,7 +436,7 @@ func (t *Tracker[T]) calcThreshold(story StoryMeta) float64 {
 		if sigma < floor {
 			sigma = floor
 		}
-		return story.FrozenMeanDistance + t.cfg.AssignmentK*sigma
+		return t.clampAssign(story.FrozenMeanDistance + t.cfg.AssignmentK*sigma)
 	}
 
 	if story.SignalCount >= t.cfg.ColdStartMinSignals {
@@ -443,10 +444,25 @@ func (t *Tracker[T]) calcThreshold(story StoryMeta) float64 {
 		if sigma < floor {
 			sigma = floor
 		}
-		return story.MeanDistance + t.cfg.AssignmentK*sigma
+		return t.clampAssign(story.MeanDistance + t.cfg.AssignmentK*sigma)
 	}
 
-	return t.cfg.AssignmentK * sigmaGlobal
+	return t.clampAssign(t.cfg.AssignmentK * sigmaGlobal)
+}
+
+// clampAssign bounds an adaptive threshold by AssignThreshold. Without the
+// clamp a story that has drifted wide keeps widening its own catchment, which
+// is how a single story ends up absorbing unrelated coverage.
+func (t *Tracker[T]) clampAssign(d float64) float64 {
+	// Zero means unset, which happens only for a Config that skipped
+	// validate(); clamping to zero there would reject every assignment.
+	if t.cfg.AssignThreshold <= 0 {
+		return d
+	}
+	if d > t.cfg.AssignThreshold {
+		return t.cfg.AssignThreshold
+	}
+	return d
 }
 
 // findNearestStory finds the nearest active or dormant story centroid for emb.
@@ -480,7 +496,9 @@ func (t *Tracker[T]) findNearestStory(tx Tx, emb []float32) (StoryMeta, float64,
 		if rec.State == StoryStateArchived || len(rec.Centroid) == 0 {
 			return nil
 		}
-		d := dist.CosineDistance(emb, rec.Centroid)
+		// Admission uses the recency centroid so a developing story keeps
+		// admitting its own current coverage (spec 006 §2.7).
+		d := dist.CosineDistance(emb, recentOrCentroid(rec))
 		if d < bestDist {
 			bestDist = d
 			bestStory = storyMetaFromRecord(id, rec)
@@ -582,6 +600,7 @@ func storyMetaFromRecord(id uuid.UUID, rec storyRecord) StoryMeta {
 		ID:                 id,
 		State:              rec.State,
 		Centroid:           rec.Centroid,
+		RecentCentroid:     recentOrCentroid(rec),
 		Radius:             rec.Radius,
 		CreatedAt:          rec.CreatedAt,
 		LastSignalAt:       rec.LastSignalAt,

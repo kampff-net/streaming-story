@@ -41,9 +41,21 @@ type Signal[T any] struct {
 
 // StoryMeta holds the current metadata for a persistent story.
 type StoryMeta struct {
-	ID           uuid.UUID
-	State        StoryState
-	Centroid     []float32
+	ID    uuid.UUID
+	State StoryState
+
+	// Centroid is the unweighted mean of every member's embedding. It is the
+	// story's identity geometry: merge, split, radius, and sigma are all
+	// measured against it, so it must not chase recent traffic.
+	Centroid []float32
+
+	// RecentCentroid is the unweighted mean of members within
+	// ActiveContextWindow, and is what the Draft phase compares an arriving
+	// signal against. A developing story therefore keeps admitting current
+	// coverage even as Centroid stays anchored on its whole history. Stories
+	// with no recent members carry a copy of Centroid.
+	RecentCentroid []float32
+
 	Radius       float64
 	CreatedAt    time.Time
 	LastSignalAt time.Time

@@ -100,19 +100,6 @@ func TestConfig_validate(t *testing.T) {
 		assert.Equal(t, 5*time.Hour, cfg.OutlierTTL)
 	})
 
-	t.Run("default_MinClusterSize", func(t *testing.T) {
-		cfg := minimalConfig()
-		require.NoError(t, cfg.validate())
-		assert.Equal(t, 3, cfg.MinClusterSize)
-	})
-
-	t.Run("MinSamples_defaults_to_MinClusterSize", func(t *testing.T) {
-		cfg := minimalConfig()
-		cfg.MinClusterSize = 7
-		require.NoError(t, cfg.validate())
-		assert.Equal(t, 7, cfg.MinSamples)
-	})
-
 	t.Run("explicit_MinSamples_preserved", func(t *testing.T) {
 		cfg := minimalConfig()
 		cfg.MinSamples = 5
@@ -168,34 +155,63 @@ func TestConfig_validate(t *testing.T) {
 		assert.Equal(t, 512, cfg.EventBufferSize)
 	})
 
-	t.Run("default_ClusterSelection_is_EOM", func(t *testing.T) {
+	t.Run("default_thresholds", func(t *testing.T) {
 		cfg := minimalConfig()
 		require.NoError(t, cfg.validate())
-		assert.Equal(t, ClusterSelectionEOM, cfg.ClusterSelection)
+		assert.InDelta(t, 0.28, cfg.AssignThreshold, 1e-9)
+		assert.InDelta(t, 0.22, cfg.MergeThreshold, 1e-9)
+		assert.InDelta(t, 0.30, cfg.SplitThreshold, 1e-9)
+		assert.Equal(t, 3, cfg.MinStorySize)
 	})
 
-	t.Run("leaf_ClusterSelection_preserved", func(t *testing.T) {
+	t.Run("explicit_thresholds_preserved", func(t *testing.T) {
 		cfg := minimalConfig()
-		cfg.ClusterSelection = ClusterSelectionLeaf
+		cfg.AssignThreshold = 0.4
+		cfg.MergeThreshold = 0.1
+		cfg.SplitThreshold = 0.5
+		cfg.MinStorySize = 7
 		require.NoError(t, cfg.validate())
-		assert.Equal(t, ClusterSelectionLeaf, cfg.ClusterSelection)
+		assert.InDelta(t, 0.4, cfg.AssignThreshold, 1e-9)
+		assert.InDelta(t, 0.1, cfg.MergeThreshold, 1e-9)
+		assert.InDelta(t, 0.5, cfg.SplitThreshold, 1e-9)
+		assert.Equal(t, 7, cfg.MinStorySize)
 	})
 
-	t.Run("unknown_ClusterSelection_returns_error", func(t *testing.T) {
+	// The hysteresis band is the whole reason split and merge do not undo
+	// each other, so collapsing it must fail loudly rather than silently
+	// producing story-ID churn.
+	t.Run("SplitThreshold_equal_to_MergeThreshold_returns_error", func(t *testing.T) {
 		cfg := minimalConfig()
-		cfg.ClusterSelection = ClusterSelection(9)
+		cfg.MergeThreshold = 0.22
+		cfg.SplitThreshold = 0.22
 		require.Error(t, cfg.validate())
 	})
 
-	t.Run("default_MaxClusterSize_is_unlimited", func(t *testing.T) {
+	t.Run("SplitThreshold_below_MergeThreshold_returns_error", func(t *testing.T) {
 		cfg := minimalConfig()
-		require.NoError(t, cfg.validate())
-		assert.Zero(t, cfg.MaxClusterSize)
+		cfg.MergeThreshold = 0.25
+		cfg.SplitThreshold = 0.20
+		require.Error(t, cfg.validate())
 	})
 
-	t.Run("negative_MaxClusterSize_returns_error", func(t *testing.T) {
+	t.Run("MergeThreshold_at_or_above_AssignThreshold_returns_error", func(t *testing.T) {
 		cfg := minimalConfig()
-		cfg.MaxClusterSize = -1
+		cfg.AssignThreshold = 0.2
+		cfg.MergeThreshold = 0.2
+		require.Error(t, cfg.validate())
+	})
+
+	t.Run("AssignThreshold_out_of_range_returns_error", func(t *testing.T) {
+		for _, v := range []float64{-0.1, 1.5} {
+			cfg := minimalConfig()
+			cfg.AssignThreshold = v
+			require.Error(t, cfg.validate(), "AssignThreshold=%g", v)
+		}
+	})
+
+	t.Run("MinStorySize_below_two_returns_error", func(t *testing.T) {
+		cfg := minimalConfig()
+		cfg.MinStorySize = 1
 		require.Error(t, cfg.validate())
 	})
 }

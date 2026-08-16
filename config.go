@@ -70,24 +70,51 @@ type Config[T any] struct {
 	// It defaults to ArchiveWindow.
 	ActiveContextWindow time.Duration
 
-	// Sampling.
-	BatchSampleCap             int           // max signals per HDBSCAN run (default: 50_000)
-	SampleGuaranteeMaxFraction float64       // max fraction of cap for per-story minimums (default: 0.5)
-	OutlierTTL                 time.Duration // max outlier age relative to last batch (default: 2×BatchWindow)
+	// Deprecated: unused since spec 006. Maintenance is O(stories²) over
+	// centroids, so windowed sampling is no longer needed.
+	BatchSampleCap int
+	// Deprecated: unused since spec 006.
+	SampleGuaranteeMaxFraction float64
 
-	// HDBSCAN — MinClusterSize is a fixed constant, not derived from window population.
-	MinClusterSize int // minimum points to form a cluster (default: 3)
-	MinSamples     int // core-point density; defaults to MinClusterSize
+	// OutlierTTL is the maximum outlier age relative to the last batch run
+	// (default: 2×BatchWindow).
+	OutlierTTL time.Duration
 
-	// ClusterSelection chooses how clusters are extracted from the condensed
-	// tree (default: ClusterSelectionEOM). See the constants for the
-	// trade-off. ClusterSelectionLeaf suits corpora where a broad subject
-	// area would otherwise absorb the distinct stories inside it.
+	// Clustering thresholds, in cosine distance.
+
+	// AssignThreshold is the maximum centroid distance for a signal to join a
+	// story (default: 0.28). It is the cold-start assignment radius and the
+	// ceiling for the adaptive per-story threshold, so a diffuse story cannot
+	// widen its own catchment without bound.
+	AssignThreshold float64
+
+	// MergeThreshold is the centroid distance at or below which two stories
+	// are the same story and are merged (default: 0.22).
+	MergeThreshold float64
+
+	// SplitThreshold is the centroid distance above which a story's best
+	// two-way partition is two stories and is split (default: 0.30).
+	//
+	// It must exceed MergeThreshold. The band between them is hysteresis:
+	// merge tests one historically-given partition while split searches for
+	// the best one, so equal thresholds let a merge and a split undo each
+	// other along different seams, churning story IDs without the underlying
+	// data having changed.
+	SplitThreshold float64
+
+	// MinStorySize is the number of signals a group must hold to exist as a
+	// story (default: 3). It gates outlier promotion and both sides of a
+	// split; a smaller group stays in the outlier bucket or stays put.
+	MinStorySize int
+
+	// Deprecated: unused since the move to centroid-based incremental
+	// clustering (spec 006). Retained so existing callers still compile.
+	MinClusterSize int
+	// Deprecated: unused since spec 006.
+	MinSamples int
+	// Deprecated: unused since spec 006.
 	ClusterSelection ClusterSelection
-
-	// MaxClusterSize rejects candidate clusters holding more than this many
-	// sampled signals, forcing extraction to descend into their children.
-	// Zero means unlimited (default). Applies to ClusterSelectionEOM only.
+	// Deprecated: unused since spec 006.
 	MaxClusterSize int
 
 	// Draft-phase assignment.
@@ -105,9 +132,11 @@ type Config[T any] struct {
 	SigmaFloor          float64 // per-story σ floor as fraction of σ_global (default: 0.1)
 	EMAAlpha            float64 // EMA decay for σ_global updates (default: 0.1)
 
-	// Cluster mapping.
-	MappingMinJaccard float64 // Jaccard threshold for primary cluster continuation (default: 0.6)
-	SplitMinJaccard   float64 // Jaccard threshold for split/merge detection (default: 0.3)
+	// Deprecated: unused since spec 006. The Jaccard-based cluster mapping
+	// engine was removed with batch re-clustering.
+	MappingMinJaccard float64
+	// Deprecated: unused since spec 006.
+	SplitMinJaccard float64
 
 	// Concurrency.
 	IngestBufferCap int // signals buffered in memory during batch Apply (default: 10_000)
@@ -131,12 +160,7 @@ func (c *Config[T]) validate() error {
 	if c.Codec == nil {
 		return fmt.Errorf("story: Config.Codec is required")
 	}
-	if c.ClusterSelection != ClusterSelectionEOM && c.ClusterSelection != ClusterSelectionLeaf {
-		return fmt.Errorf("story: Config.ClusterSelection %d is not a known selection method", c.ClusterSelection)
-	}
-	if c.MaxClusterSize < 0 {
-		return fmt.Errorf("story: Config.MaxClusterSize must be >= 0, got %d", c.MaxClusterSize)
-	}
+
 	if c.Namespace == (uuid.UUID{}) {
 		c.Namespace = TrackerNamespace
 	}
@@ -164,11 +188,17 @@ func (c *Config[T]) validate() error {
 	if c.OutlierTTL == 0 {
 		c.OutlierTTL = 2 * c.BatchWindow
 	}
-	if c.MinClusterSize == 0 {
-		c.MinClusterSize = 3
+	if c.AssignThreshold == 0 {
+		c.AssignThreshold = 0.28
 	}
-	if c.MinSamples == 0 {
-		c.MinSamples = c.MinClusterSize
+	if c.MergeThreshold == 0 {
+		c.MergeThreshold = 0.22
+	}
+	if c.SplitThreshold == 0 {
+		c.SplitThreshold = 0.30
+	}
+	if c.MinStorySize == 0 {
+		c.MinStorySize = 3
 	}
 	if c.AssignmentK == 0 {
 		c.AssignmentK = 2.0
@@ -196,6 +226,31 @@ func (c *Config[T]) validate() error {
 	}
 	if c.EventBufferSize == 0 {
 		c.EventBufferSize = 512
+	}
+
+	// Threshold coherence. Checked after defaulting so a caller who sets none
+	// of them still gets a valid configuration.
+	if c.AssignThreshold <= 0 || c.AssignThreshold > 1 {
+		return fmt.Errorf("story: Config.AssignThreshold must be in (0, 1], got %g", c.AssignThreshold)
+	}
+	if c.MergeThreshold <= 0 {
+		return fmt.Errorf("story: Config.MergeThreshold must be > 0, got %g", c.MergeThreshold)
+	}
+	if c.MergeThreshold >= c.AssignThreshold {
+		return fmt.Errorf(
+			"story: Config.MergeThreshold (%g) must be below AssignThreshold (%g): stories may not merge at a distance wider than a signal may sit from a centroid",
+			c.MergeThreshold, c.AssignThreshold)
+	}
+	if c.SplitThreshold > 1 {
+		return fmt.Errorf("story: Config.SplitThreshold must be <= 1, got %g", c.SplitThreshold)
+	}
+	if c.SplitThreshold <= c.MergeThreshold {
+		return fmt.Errorf(
+			"story: Config.SplitThreshold (%g) must exceed MergeThreshold (%g): without a hysteresis band a merge and a split undo each other along different seams",
+			c.SplitThreshold, c.MergeThreshold)
+	}
+	if c.MinStorySize < 2 {
+		return fmt.Errorf("story: Config.MinStorySize must be >= 2, got %d", c.MinStorySize)
 	}
 	return nil
 }
