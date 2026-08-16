@@ -291,14 +291,23 @@ are different stories.
 Evaluating a partition for every story on every run is wasteful, so a cheap
 necessary condition runs first:
 
-> Attempt a split only when `radius > SplitThreshold / 2`.
+> Attempt a split only when `4·radius − 2·radius² > SplitThreshold`.
 
-This gate is **sound**, not heuristic. Every member lies within `radius` of the
-story centroid, so any two subsets of members have centroids inside that same
-ball, and two points in a ball of radius *r* are at most *2r* apart. If
-`2 × radius ≤ SplitThreshold`, no partition can produce parts separated by more
-than `SplitThreshold`, and the split test would necessarily fail. Skipping those
-stories cannot miss a split.
+This gate is **sound**, not heuristic, but the bound is not the Euclidean
+`2 × radius`. Cosine distance is not a metric, and `1 − cos` grows
+quadratically in the angle, so two members each at cosine distance *r* from the
+centroid can be up to `1 − cos(2·arccos(1−r))` apart — which expands to
+`4r − 2r²`. At *r* = 0.122 that is 0.458, nearly four times the Euclidean
+guess of 0.245.
+
+An implementation using `2 × radius` therefore skips stories that genuinely
+split. The first version of this spec made exactly that error; the soundness
+test caught it.
+
+With the correct ceiling: every member lies within *r* of the centroid, so any
+two subsets have centroids within `4r − 2r²` of each other. When that does not
+exceed `SplitThreshold`, no partition can clear the bar and skipping the story
+cannot miss a split.
 
 `radius` is already maintained on `StoryMeta` and recomputed during recentre, so
 the gate costs one comparison per story.

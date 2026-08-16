@@ -149,16 +149,22 @@ type splitResult struct {
 // splitStory tests whether a story holds two groups that SplitThreshold says
 // are separate stories, and returns the division if so.
 //
-// The radius gate is a sound necessary condition, not a heuristic: every
-// member lies within radius of the centroid, so any two subsets have centroids
-// inside that ball and are at most 2*radius apart. When 2*radius <=
-// SplitThreshold no partition can clear the bar, so skipping the story cannot
-// miss a split.
+// The radius gate is a sound necessary condition, not a heuristic, but the
+// bound is not the Euclidean 2*radius: cosine distance is not a metric, and
+// 1-cos grows quadratically in the angle, so two points each at angular
+// distance a from the centroid can be up to 1-cos(2a) apart rather than
+// 2*(1-cos(a)).
+//
+// With cos(a) = 1-radius, that ceiling works out to 4*radius - 2*radius^2.
+// When it does not exceed SplitThreshold no partition can clear the bar, so
+// skipping the story cannot miss a split. Using 2*radius here would skip
+// stories that do split -- a point pair at +/-0.5 rad sits 0.122 from the
+// centroid but 0.46 from its opposite.
 func (t *Tracker[T]) splitStory(members []*batchSignal, radius float64) (splitResult, bool) {
 	if len(members) < 2*t.cfg.MinStorySize {
 		return splitResult{}, false
 	}
-	if 2*radius <= t.cfg.SplitThreshold {
+	if maxAngularSeparation(radius) <= t.cfg.SplitThreshold {
 		return splitResult{}, false
 	}
 
@@ -207,6 +213,19 @@ func (t *Tracker[T]) splitStory(members []*batchSignal, radius float64) (splitRe
 		keep, spawn = right, left
 	}
 	return splitResult{keep: keep, spawn: spawn}, true
+}
+
+// maxAngularSeparation returns the largest cosine distance possible between
+// two directions that both lie within cosine distance r of a common centre.
+// It is 1-cos(2*arccos(1-r)), expanded to avoid the trigonometry.
+func maxAngularSeparation(r float64) float64 {
+	if r <= 0 {
+		return 0
+	}
+	if r >= 1 {
+		return 2
+	}
+	return 4*r - 2*r*r
 }
 
 // twoMedoids returns the indices of the two mutually most distant members,
