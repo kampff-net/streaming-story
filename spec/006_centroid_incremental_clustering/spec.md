@@ -80,7 +80,8 @@ run (§2.2).
   * Threshold-based merge of converged stories.
   * Threshold-based split of diverged stories, gated by a sound radius test.
   * Outlier promotion into new stories via mutual-neighbour groups.
-  * Centroid, radius, and σ recomputation from current membership.
+  * Centroid, radius, and σ recomputation from current membership, with a
+    separate recency centroid for admission (§2.7).
   * Retire `internal/hdbscan` and `internal/hungarian` and the spec 003 mapping
     engine.
   * Config: `AssignThreshold`, `MergeThreshold`, `SplitThreshold`,
@@ -140,7 +141,7 @@ graph TD
         EVICT --> PROMOTE["2. promote outlier groups<br/>(mutual neighbours, size >= MinStorySize)"]
         PROMOTE --> SPLIT["3. split diverged stories<br/>(best partition > T_split)"]
         SPLIT --> MERGE["4. merge converged stories<br/>(centroid distance <= T_merge)"]
-        MERGE --> RECENTRE["5. recentre: centroid, radius, sigma, sigma_global"]
+        MERGE --> RECENTRE["5. recentre: centroids, radius, sigma, sigma_global"]
         RECENTRE --> LIFECYCLE["6. lifecycle: Active → Dormant → Archived"]
         LIFECYCLE --> EMIT["emit events + BatchSummary"]
     end
@@ -418,7 +419,83 @@ Three things bound the damage:
 promotion (`StoryID` = the new story), split migration (`StoryID` = the child),
 and merge migration (`StoryID` = the survivor).
 
-### 2.7 Configuration
+### 2.7 Centroid Maintenance
+
+A story's centroid is recomputed on every run, but *which* centroid and *over
+what* are separate questions, and the answers differ by purpose.
+
+#### Two Centroids
+
+`StoryMeta` carries two vectors:
+
+| Field | Computed over | Used for |
+|---|---|---|
+| `Centroid` | **all** members, unweighted mean | merge and split geometry, radius, σ |
+| `RecentCentroid` | members with `At >= now - ActiveContextWindow`, unweighted mean | Draft-phase admission |
+
+Admission compares an arriving signal against `RecentCentroid`, so a developing
+story keeps admitting current coverage as it moves from the event to its
+aftermath. Merge and split compare `Centroid`, so the identity decisions rest on
+a story's whole history and do not swing with the last few days of traffic.
+
+Using one vector for both is the tempting simplification and it fails in both
+directions. A lifetime-only centroid anchors admission on the story's opening
+coverage, so late developments drift out of catchment and get filed as new
+stories — over-fragmentation. A recency-only centroid lets a story walk: each
+run admits what is near the current centre, which moves toward what was just
+admitted, and over months the story becomes a different story under the same ID.
+That is concept drift, and it is worse than fragmentation because it is silent.
+
+A story with no members inside `ActiveContextWindow` — every Dormant story, by
+definition — has `RecentCentroid = Centroid`. That replaces the existing frozen
+`FrozenMeanDistance` / `FrozenSigma` mechanism's role for the centroid
+specifically; the frozen dispersion statistics are retained unchanged.
+
+#### Recompute, Never Accumulate
+
+Both centroids are **recomputed from current membership each run**, as a pure
+function of stored state. Neither is updated incrementally.
+
+This is a hard requirement of invariant 3, not a style preference. An
+incrementally-accumulated centroid — the natural `c += (x - c) / n` running mean
+or an EMA over arrivals — depends on the order signals arrived and on how many
+runs have elapsed, so two stores holding identical signals can carry different
+centroids. Every threshold comparison downstream then differs too, and the same
+data yields different stories. Recomputation costs `O(members × D)` per story
+per run, which the resource table (§2.9) already accounts for, and buys
+reproducibility outright.
+
+The same rule governs `radius`, `mean_distance`, and per-story σ: all are
+recomputed from members against the freshly computed `Centroid`. σ_global keeps
+its existing EMA — it is a global calibration constant, not a per-story identity
+input, and its smoothing is deliberate.
+
+#### Interaction With Split
+
+Because `Centroid` is the unweighted lifetime mean, a story that genuinely
+develops in a new direction grows its radius rather than sliding its centre.
+That is the intended coupling: growth past the radius gate puts the story in
+front of the split test (§2.4), which either finds a real bimodal seam and cuts
+it, or finds none and leaves a legitimately broad story alone.
+
+The alternative — letting the centroid slide so radius stays small — would hide
+exactly the signal the split test needs. Drift is not something to absorb
+quietly; it is evidence, and the design routes it to the operation that acts on
+it.
+
+#### Rejected: Age-Weighted Centroid
+
+A single centroid with exponential age weighting (`w = exp(-Δt / halfLife)`)
+would interpolate between the two behaviours with one vector instead of two. It
+is rejected for now on two grounds: it adds a half-life constant that has no
+measured basis in the corpus, and it makes merge and split comparisons
+time-dependent, so two stories can merge or split because time passed rather
+than because signals arrived. Recomputed-from-members weighting would at least
+stay deterministic, so this remains a viable refinement if the two-centroid
+split proves clumsy in practice — but it should be driven by an observed
+problem, not adopted upfront.
+
+### 2.8 Configuration
 
 ```go
 // Clustering thresholds, in cosine distance.
@@ -473,7 +550,7 @@ their introduction; that is the correct outcome of the measurement that
 followed, and the leaf-extraction work remains valid for any caller still using
 `internal/hdbscan` directly — which, after this spec, is nobody.
 
-### 2.8 Resource Impact
+### 2.9 Resource Impact
 
 Per batch run, with `S` stories, `O` in-window outliers, `D` embedding
 dimension:
@@ -485,7 +562,7 @@ dimension:
 | Merge | — | O(S² D) over centroids |
 | Promotion | — | O(O² D) over outliers |
 | Split | — | O(M² D) per gated story, M = its member count |
-| Recentre | O(N D) | O(N D) |
+| Recentre | O(N D) | O(N D) — two centroids, same pass |
 
 Only stories past the radius gate (§2.4) pay the split cost, and the gate is
 sound, so a compact story costs one comparison. A pathological story holding
@@ -520,14 +597,24 @@ benchmark at 10k signals.
   - **Files:** `tracker.go` (`calcThreshold`), `tracker_test.go`
   - **Verification:** `go test -run TestCalcThreshold ./...`
 
-- [ ] **Task 3:** Implement outlier promotion by greedy mutual-neighbour
+- [ ] **Task 3:** Add `RecentCentroid` to `StoryMeta` and its persistence;
+      recompute both centroids from members during recentre; point Draft
+      admission at `RecentCentroid`.
+  - **Files:** `types.go`, `tracker.go`, `batch.go`, `persist.go`,
+    `snapshot.go`, `tracker_test.go`, `snapshot_test.go`
+  - **Verification:** `go test -run 'TestCentroid|TestSnapshot' ./...` (covers:
+    recompute is order-independent over shuffled insertion; a story with no
+    recent members has `RecentCentroid == Centroid`; a developing story keeps
+    admitting current coverage that a lifetime centroid would reject)
+
+- [ ] **Task 4:** Implement outlier promotion by greedy mutual-neighbour
       cliques.
   - **Files:** `batch.go`, `batch_test.go`
   - **Verification:** `go test -run TestPromote ./...` (covers: clique beats
     component on a chained fixture, `MinStorySize` boundary, tie-break
     determinism)
 
-- [ ] **Task 4:** Implement the split: radius gate, 2-medoid partition,
+- [ ] **Task 5:** Implement the split: radius gate, 2-medoid partition,
       `MinStorySize` and `SplitThreshold` acceptance, larger-part-keeps-ID.
   - **Files:** `batch.go`, `batch_test.go`
   - **Verification:** `go test -run TestSplit ./...` (covers: bimodal story
@@ -536,24 +623,24 @@ benchmark at 10k signals.
     split; larger part keeps the ID with deterministic tie-break; historical
     signals migrate; one split per story per run)
 
-- [ ] **Task 5:** Implement threshold merge with the oldest-survives rule,
+- [ ] **Task 6:** Implement threshold merge with the oldest-survives rule,
       reusing the spec 003 key-space migration.
   - **Files:** `batch.go`, `batch_test.go`
   - **Verification:** `go test -run TestMerge ./...` (covers: transitive A–B–C,
     survivor selection, historical signal migration, determinism under shuffled
     story order)
 
-- [ ] **Task 6:** Rewrite `runBatchCore` as the six-step maintenance pass;
+- [ ] **Task 7:** Rewrite `runBatchCore` as the six-step maintenance pass;
       delete `clusterSignals`, `mapClusters`, `sampleSignals`, and the Jaccard
       helpers.
   - **Files:** `batch.go`, `batch_test.go`, `tracker_behavior_test.go`
   - **Verification:** `go test ./...`
 
-- [ ] **Task 7:** Delete `internal/hdbscan` and `internal/hungarian`.
+- [ ] **Task 8:** Delete `internal/hdbscan` and `internal/hungarian`.
   - **Files:** `internal/hdbscan/`, `internal/hungarian/`
   - **Verification:** `go build ./... && go vet ./...`
 
-- [ ] **Task 8:** Stability regression suite — the four invariants of §2.1 as
+- [ ] **Task 9:** Stability regression suite — the four invariants of §2.1 as
       executable tests.
   - **Files:** `stability_test.go`
   - **Verification:** `go test -run TestStability ./...` (idempotent re-run
@@ -562,12 +649,12 @@ benchmark at 10k signals.
     cycle** — a corpus run for 50 consecutive batches emits no repeated
     split-then-merge on the same signal set)
 
-- [ ] **Task 9:** Update `DESIGN.md`, `AGENTS.md`, `README.md`; mark spec 002
+- [ ] **Task 10:** Update `DESIGN.md`, `AGENTS.md`, `README.md`; mark spec 002
       and 003 `SUPERSEDED`; update `spec/README.md`.
   - **Files:** docs and spec index
   - **Verification:** manual review
 
-- [ ] **Task 10:** Update `magic-giant` config plumbing for the new knobs.
+- [ ] **Task 11:** Update `magic-giant` config plumbing for the new knobs.
   - **Files:** `../magic-giant/internal/config/config.go`,
     `../magic-giant/cmd/magic-giant/main.go`, both YAML files, tests
   - **Verification:** `cd ../magic-giant && go test ./...`
@@ -582,7 +669,8 @@ benchmark at 10k signals.
 | **Split fragments a diffuse story.** A broad topic with no internal gap gets cut arbitrarily. | Split events on stories whose parts land inside the hysteresis band. | Acceptance needs part-centroid separation `> SplitThreshold`, not merely a partition existing. Diffuse is not bimodal. Both parts must also clear `MinStorySize`. |
 | **Slow convergence on multi-modal stories.** One split per story per run means a three-group story takes two runs. | Story radius staying high across runs. | Accepted: bounded, observable change per run beats unbounded recursion, which is re-clustering by another name. |
 | **Lost discovery.** A fixed threshold cannot find cluster shapes density clustering would. | Stories that should be one remaining several. | Accepted and explicit. Merge reunites over-fragmentation across runs; for developing news, identity continuity outranks shape discovery. |
-| **Centroid drift** on long-running stories pulling the catchment off-topic. | Radius growth. | Adaptive threshold clamped to `AssignThreshold` so catchment cannot widen without bound; split (§2.4) cuts a story that has drifted into two. |
+| **Centroid drift** on long-running stories. A recency-tracking centre lets a story silently become a different story under the same ID. | Radius growth; `Centroid` vs `RecentCentroid` divergence, which is directly measurable. | Identity geometry uses the lifetime `Centroid`, which cannot slide (§2.7); only admission follows recency. Adaptive threshold clamped to `AssignThreshold`. Drift surfaces as radius growth and is routed to the split test rather than absorbed. |
+| **Stale catchment.** The mirror risk: a story stops admitting its own developments because its centre reflects opening coverage. | Rising outlier rate alongside topically-related stories being created. | `RecentCentroid` over `ActiveContextWindow` governs admission for exactly this reason. |
 | **Deprecated fields mislead callers** into thinking clustering is still tunable. | Code review. | `Deprecated:` godoc on every superseded field, plus a `DESIGN.md` note. |
 | **Over-fragmentation at startup.** Cold start with few signals promotes little and creates many singleton outliers. | Outlier fraction after first runs. | Expected and benign: outliers are retained until `OutlierTTL` and promoted once coverage arrives. `MinStorySize` 3 matches the previous `MinClusterSize` default. |
 
