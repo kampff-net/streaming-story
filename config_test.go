@@ -167,4 +167,35 @@ func TestConfig_validate(t *testing.T) {
 		require.NoError(t, cfg.validate())
 		assert.Equal(t, 512, cfg.EventBufferSize)
 	})
+
+	t.Run("default_ClusterSelection_is_EOM", func(t *testing.T) {
+		cfg := minimalConfig()
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, ClusterSelectionEOM, cfg.ClusterSelection)
+	})
+
+	t.Run("leaf_ClusterSelection_preserved", func(t *testing.T) {
+		cfg := minimalConfig()
+		cfg.ClusterSelection = ClusterSelectionLeaf
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, ClusterSelectionLeaf, cfg.ClusterSelection)
+	})
+
+	t.Run("unknown_ClusterSelection_returns_error", func(t *testing.T) {
+		cfg := minimalConfig()
+		cfg.ClusterSelection = ClusterSelection(9)
+		require.Error(t, cfg.validate())
+	})
+
+	t.Run("default_MaxClusterSize_is_unlimited", func(t *testing.T) {
+		cfg := minimalConfig()
+		require.NoError(t, cfg.validate())
+		assert.Zero(t, cfg.MaxClusterSize)
+	})
+
+	t.Run("negative_MaxClusterSize_returns_error", func(t *testing.T) {
+		cfg := minimalConfig()
+		cfg.MaxClusterSize = -1
+		require.Error(t, cfg.validate())
+	})
 }

@@ -13,6 +13,37 @@ type Codec[T any] interface {
 	Decode(b []byte) (Signal[T], error)
 }
 
+// ClusterSelection picks how the batch phase extracts clusters from the
+// condensed cluster tree.
+type ClusterSelection uint8
+
+const (
+	// ClusterSelectionEOM is excess-of-mass selection, the method described
+	// in Campello et al. and the historical default. A node wins over its
+	// whole subtree when its own stability is at least the sum of its
+	// descendants'.
+	//
+	// EOM favours breadth. A large, diffuse, long-lived region accumulates
+	// stability across the entire lambda range it survives, which can exceed
+	// the summed stability of the tighter clusters nested inside it — so the
+	// whole region emerges as one cluster and every story inside it is
+	// reported as the same story. Raising MinClusterSize does not counteract
+	// this: density pruning happens earlier, and a broad region that is
+	// genuinely dense only becomes more stable.
+	ClusterSelectionEOM ClusterSelection = iota
+
+	// ClusterSelectionLeaf selects every leaf of the condensed tree,
+	// ignoring stability comparisons between a node and its descendants. It
+	// yields more, smaller, more homogeneous clusters and never collapses
+	// nested clusters into their common parent.
+	//
+	// For news tracking this is usually the better choice: it reports "the
+	// summit walkout" rather than "European politics". The cost is that a
+	// genuinely broad story may be split across several stories, which the
+	// batch phase's merge detection can later reunite.
+	ClusterSelectionLeaf
+)
+
 // Config holds all configuration for a Tracker.
 //
 // Default values are calibrated for low-to-medium frequency news ingestion
@@ -47,6 +78,17 @@ type Config[T any] struct {
 	// HDBSCAN — MinClusterSize is a fixed constant, not derived from window population.
 	MinClusterSize int // minimum points to form a cluster (default: 3)
 	MinSamples     int // core-point density; defaults to MinClusterSize
+
+	// ClusterSelection chooses how clusters are extracted from the condensed
+	// tree (default: ClusterSelectionEOM). See the constants for the
+	// trade-off. ClusterSelectionLeaf suits corpora where a broad subject
+	// area would otherwise absorb the distinct stories inside it.
+	ClusterSelection ClusterSelection
+
+	// MaxClusterSize rejects candidate clusters holding more than this many
+	// sampled signals, forcing extraction to descend into their children.
+	// Zero means unlimited (default). Applies to ClusterSelectionEOM only.
+	MaxClusterSize int
 
 	// Draft-phase assignment.
 	AssignmentK float64 // σ multiplier for per-story assignment radius (default: 2.0)
@@ -88,6 +130,12 @@ func (c *Config[T]) validate() error {
 	}
 	if c.Codec == nil {
 		return fmt.Errorf("story: Config.Codec is required")
+	}
+	if c.ClusterSelection != ClusterSelectionEOM && c.ClusterSelection != ClusterSelectionLeaf {
+		return fmt.Errorf("story: Config.ClusterSelection %d is not a known selection method", c.ClusterSelection)
+	}
+	if c.MaxClusterSize < 0 {
+		return fmt.Errorf("story: Config.MaxClusterSize must be >= 0, got %d", c.MaxClusterSize)
 	}
 	if c.Namespace == (uuid.UUID{}) {
 		c.Namespace = TrackerNamespace

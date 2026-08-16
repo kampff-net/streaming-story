@@ -92,6 +92,14 @@ A buffered `Ingest` still returns a provisional story ID. It is computed from `d
 - `Config.OnBatchError` is the only way to observe a failed batch run: a failure leaves the store untouched, returns an empty summary, and the next tick retries.
 - `Config.InitialSigmaGlobal` (default 0.25) is the σ_global stand-in before the first batch measures one. Until then every story is in cold-start, so this single value decides the Draft assignment radius.
 
+### Cluster Extraction
+
+`Config.ClusterSelection` picks how clusters are read out of the condensed tree: `ClusterSelectionEOM` (excess of mass, the default) or `ClusterSelectionLeaf`.
+
+EOM can select a broad parent over the tighter clusters nested inside it, collapsing several distinct stories into one. The apply phase then moves those stories' window signals into the winner and retires the emptied stories. Raising `MinClusterSize` does not help — that acts during condensation, and a broad region that is genuinely dense only gets more stable. Use leaf extraction when the corpus has that shape.
+
+`Config.MaxClusterSize` (0 = unlimited) caps candidate cluster size under EOM, forcing a descent into children. Not applicable to leaf extraction.
+
 ### Resolved Design Decisions
 
 - `MinClusterSize` is a **fixed config constant** — not derived from window population.

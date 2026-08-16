@@ -18,14 +18,86 @@ import (
 	"go.kvsh.ch/streaming-story/internal/dist"
 )
 
-// Cluster runs HDBSCAN* on pts and returns a cluster label per point.
-// Labels are 0-indexed integers; −1 means noise.
+// Selection picks which nodes of the condensed cluster tree become clusters.
+type Selection int
+
+const (
+	// SelectionEOM is excess-of-mass selection: a node wins over its whole
+	// subtree when its own stability is at least the sum of its descendants'.
+	// This is the method described in Campello et al. and the historical
+	// default.
+	//
+	// EOM favours breadth. A large, diffuse, long-lived region accumulates
+	// stability across the entire lambda range it survives, which can exceed
+	// the summed stability of the tighter sub-clusters inside it. The whole
+	// region then emerges as one cluster. Raising MinClusterSize does not
+	// counteract this: density pruning happens earlier, during condensation,
+	// and a broad region that is genuinely dense only becomes more stable.
+	SelectionEOM Selection = iota
+
+	// SelectionLeaf selects every leaf of the condensed tree, ignoring
+	// stability comparisons between a node and its descendants. It yields
+	// more, smaller, more homogeneous clusters, and never collapses distinct
+	// sub-clusters into their common parent.
+	//
+	// Prefer it when the domain wants the finest stable grouping — distinct
+	// news stories rather than a subject area, for instance — and accept that
+	// a genuinely broad topic is reported as several clusters instead of one.
+	SelectionLeaf
+)
+
+// Options configures a clustering run.
+type Options struct {
+	// MinClusterSize is the minimum number of points in a persistent
+	// cluster. Required, must be >= 1.
+	MinClusterSize int
+
+	// MinSamples is the neighbourhood size used to compute core distances.
+	// Required, must be >= 1.
+	MinSamples int
+
+	// Selection chooses the cluster extraction method. The zero value is
+	// SelectionEOM.
+	Selection Selection
+
+	// MaxClusterSize rejects any candidate cluster holding more than this
+	// many points, forcing selection to descend into its children instead.
+	// Zero means unlimited.
+	//
+	// It applies to SelectionEOM only: leaf selection has no larger candidate
+	// to fall back from, so capping there would discard points with nothing
+	// to replace them. An over-sized leaf under EOM likewise has no children
+	// to descend into, so its points become noise — the cap trades coverage
+	// for cohesion, deliberately.
+	MaxClusterSize int
+}
+
+// Cluster runs HDBSCAN* on pts with excess-of-mass selection and returns a
+// cluster label per point. Labels are 0-indexed integers; −1 means noise.
 //
 //   - minClusterSize: minimum number of points in a persistent cluster.
 //   - minSamples:     neighbourhood size used to compute the core distance.
+//
+// It is shorthand for ClusterWithOptions with the default Options.
 func Cluster(pts [][]float32, minClusterSize, minSamples int) ([]int, error) {
+	return ClusterWithOptions(pts, Options{
+		MinClusterSize: minClusterSize,
+		MinSamples:     minSamples,
+	})
+}
+
+// ClusterWithOptions runs HDBSCAN* on pts and returns a cluster label per
+// point. Labels are 0-indexed integers; −1 means noise.
+func ClusterWithOptions(pts [][]float32, opts Options) ([]int, error) {
+	minClusterSize, minSamples := opts.MinClusterSize, opts.MinSamples
 	if len(pts) == 0 {
 		return nil, errors.New("hdbscan: empty input")
+	}
+	if opts.Selection != SelectionEOM && opts.Selection != SelectionLeaf {
+		return nil, errors.New("hdbscan: unknown selection method")
+	}
+	if opts.MaxClusterSize < 0 {
+		return nil, errors.New("hdbscan: maxClusterSize must be >= 0")
 	}
 	if minClusterSize < 1 {
 		return nil, errors.New("hdbscan: minClusterSize must be ≥ 1")
@@ -65,7 +137,7 @@ func Cluster(pts [][]float32, minClusterSize, minSamples int) ([]int, error) {
 	}
 
 	computeStability(clusters, pointFallout)
-	selected := selectClusters(clusters)
+	selected := selectClusters(clusters, opts.Selection, opts.MaxClusterSize)
 
 	labelID := 0
 	for i := range clusters {
@@ -363,9 +435,42 @@ func computeStability(clusters []cCluster, pointFallout []fallout) {
 	}
 }
 
-// ── Step 7: excess-of-mass cluster selection ─────────────────────────────────
+// ── Step 7: cluster selection ────────────────────────────────────────────────
 
-func selectClusters(clusters []cCluster) []bool {
+// viable reports whether a cluster's stability qualifies it for selection.
+func viable(c cCluster) bool {
+	return c.stability > 0 || math.IsInf(c.stability, 1)
+}
+
+func selectClusters(clusters []cCluster, method Selection, maxClusterSize int) []bool {
+	if method == SelectionLeaf {
+		return selectLeaves(clusters)
+	}
+	return selectExcessOfMass(clusters, maxClusterSize)
+}
+
+// selectLeaves selects every leaf of the condensed tree. Leaves are disjoint
+// and cover every point that survived condensation, so no stability
+// comparison between levels is needed — the tradeoff a node-versus-subtree
+// test would decide has already been settled in favour of the subtree.
+//
+// Unlike EOM, leaf selection applies no stability floor. A leaf with zero
+// stability is one whose points all fall out at its own birth lambda, which
+// happens whenever a cluster is tight enough to die immediately after
+// splitting. Those are exactly the tightest groupings in the data, and
+// discarding them would send the densest points to noise while looser ones
+// survive.
+func selectLeaves(clusters []cCluster) []bool {
+	selected := make([]bool, len(clusters))
+	for i := range clusters {
+		if len(clusters[i].children) == 0 {
+			selected[i] = true
+		}
+	}
+	return selected
+}
+
+func selectExcessOfMass(clusters []cCluster, maxClusterSize int) []bool {
 	n := len(clusters)
 	propStability := make([]float64, n)
 	for i := range propStability {
@@ -385,6 +490,10 @@ func selectClusters(clusters []cCluster) []bool {
 		}
 	}
 
+	oversized := func(idx int) bool {
+		return maxClusterSize > 0 && clusters[idx].size > maxClusterSize
+	}
+
 	selected := make([]bool, n)
 	// Top-down pass to select. Skip root if it split.
 	var bfs []int
@@ -392,7 +501,7 @@ func selectClusters(clusters []cCluster) []bool {
 		bfs = append(bfs, clusters[0].children...)
 	} else {
 		// Root is leaf, so it's the only potential cluster.
-		if clusters[0].stability > 0 || math.IsInf(clusters[0].stability, 1) {
+		if viable(clusters[0]) && !oversized(0) {
 			selected[0] = true
 		}
 		return selected
@@ -403,7 +512,10 @@ func selectClusters(clusters []cCluster) []bool {
 		bfs = bfs[1:]
 
 		if len(clusters[curr].children) == 0 {
-			if clusters[curr].stability > 0 || math.IsInf(clusters[curr].stability, 1) {
+			// An oversized leaf has no children to descend into, so its
+			// points fall through to noise rather than forming a cluster
+			// wider than the caller allows.
+			if viable(clusters[curr]) && !oversized(curr) {
 				selected[curr] = true
 			}
 			continue
@@ -414,7 +526,7 @@ func selectClusters(clusters []cCluster) []bool {
 			childSum += propStability[childIdx]
 		}
 
-		if clusters[curr].stability >= childSum {
+		if clusters[curr].stability >= childSum && !oversized(curr) {
 			selected[curr] = true
 		} else {
 			bfs = append(bfs, clusters[curr].children...)

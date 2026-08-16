@@ -404,7 +404,16 @@ func (t *Tracker[T]) clusterSignals(signals []batchSignal) {
 	for k, i := range kept {
 		pts[k] = signals[i].emb
 	}
-	labels, err := hdbscan.Cluster(pts, t.cfg.MinClusterSize, t.cfg.MinSamples)
+	selection := hdbscan.SelectionEOM
+	if t.cfg.ClusterSelection == ClusterSelectionLeaf {
+		selection = hdbscan.SelectionLeaf
+	}
+	labels, err := hdbscan.ClusterWithOptions(pts, hdbscan.Options{
+		MinClusterSize: t.cfg.MinClusterSize,
+		MinSamples:     t.cfg.MinSamples,
+		Selection:      selection,
+		MaxClusterSize: t.cfg.MaxClusterSize,
+	})
 	if err != nil {
 		t.reportBatchError(fmt.Errorf("story: batch cluster: %w", err))
 		return
