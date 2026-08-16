@@ -38,18 +38,94 @@ type promotion struct {
 	members []*batchSignal
 }
 
-// promoteOutliers groups outliers into new stories by greedy mutual-neighbour
-// cliques.
+// greedyCliques partitions [0, n) into groups whose members are all mutually
+// adjacent under near, returning only groups of at least minSize.
 //
-// Connected components are deliberately not used: transitive linkage over news
-// embeddings chains, which is the failure this design exists to remove. Every
-// member of a promoted group is within AssignThreshold of every other, so a
-// new story is compact from birth.
+// Cliques rather than connected components, everywhere. Components are
+// transitive: a ladder whose neighbours are each 0.005 apart forms one
+// component even when its ends are 0.55 apart, which is the chaining that
+// collapses a corpus into a single blob. Requiring mutual adjacency keeps a
+// group as tight as its threshold claims.
 //
-// The greedy approximation (maximal cliques are exponential) picks the
-// outlier with the most neighbours, forms a group from it and the neighbours
-// that are mutually within threshold, removes them, and repeats. Ties break on
-// signal ID so the result does not depend on scan order.
+// Maximal-clique enumeration is exponential, so this is the standard greedy
+// approximation: take the highest-degree unused vertex, extend with neighbours
+// that are adjacent to everything already chosen, remove the group, repeat.
+// Callers pass indices in a stable order, and ties resolve to the lower index,
+// so the result is deterministic.
+func greedyCliques(n int, near func(i, j int) bool, minSize int) [][]int {
+	adj := make([][]bool, n)
+	degree := make([]int, n)
+	for i := range adj {
+		adj[i] = make([]bool, n)
+	}
+	for i := range n {
+		for j := i + 1; j < n; j++ {
+			if near(i, j) {
+				adj[i][j], adj[j][i] = true, true
+				degree[i]++
+				degree[j]++
+			}
+		}
+	}
+
+	drop := func(i int, used []bool) {
+		used[i] = true
+		for j := range n {
+			if adj[i][j] {
+				degree[j]--
+			}
+		}
+		degree[i] = -1
+	}
+
+	used := make([]bool, n)
+	var out [][]int
+	for {
+		seed := -1
+		for i := range n {
+			if used[i] {
+				continue
+			}
+			if seed == -1 || degree[i] > degree[seed] {
+				seed = i
+			}
+		}
+		if seed == -1 || degree[seed] < minSize-1 {
+			break
+		}
+
+		group := []int{seed}
+		for j := range n {
+			if used[j] || j == seed || !adj[seed][j] {
+				continue
+			}
+			mutual := true
+			for _, g := range group {
+				if g != j && !adj[g][j] {
+					mutual = false
+					break
+				}
+			}
+			if mutual {
+				group = append(group, j)
+			}
+		}
+
+		if len(group) < minSize {
+			// This seed cannot anchor a group; retire it rather than looping.
+			drop(seed, used)
+			continue
+		}
+		for _, g := range group {
+			drop(g, used)
+		}
+		out = append(out, group)
+	}
+	return out
+}
+
+// promoteOutliers groups outliers into new stories by mutual-neighbour
+// cliques, so a promoted story is compact from birth rather than a chain.
 func (t *Tracker[T]) promoteOutliers(outliers []*batchSignal) []promotion {
 	if len(outliers) < t.cfg.MinStorySize {
 		return nil
@@ -61,79 +137,15 @@ func (t *Tracker[T]) promoteOutliers(outliers []*batchSignal) []promotion {
 		return cand[i].id.String() < cand[j].id.String()
 	})
 
-	near := make([][]bool, len(cand))
-	degree := make([]int, len(cand))
-	for i := range near {
-		near[i] = make([]bool, len(cand))
-	}
-	for i := range cand {
-		for j := i + 1; j < len(cand); j++ {
-			if dist.CosineDistance(cand[i].emb, cand[j].emb) <= t.cfg.AssignThreshold {
-				near[i][j], near[j][i] = true, true
-				degree[i]++
-				degree[j]++
-			}
-		}
-	}
+	groups := greedyCliques(len(cand), func(i, j int) bool {
+		return dist.CosineDistance(cand[i].emb, cand[j].emb) <= t.cfg.AssignThreshold
+	}, t.cfg.MinStorySize)
 
-	used := make([]bool, len(cand))
-	var out []promotion
-	for {
-		seed := -1
-		for i := range cand {
-			if used[i] {
-				continue
-			}
-			// Ties break toward the lower index, which is the lower signal ID
-			// after the sort above.
-			if seed == -1 || degree[i] > degree[seed] {
-				seed = i
-			}
-		}
-		if seed == -1 || degree[seed] < t.cfg.MinStorySize-1 {
-			break
-		}
-
-		group := []int{seed}
-		for j := range cand {
-			if used[j] || j == seed || !near[seed][j] {
-				continue
-			}
-			mutual := true
-			for _, g := range group {
-				if g != seed && !near[g][j] {
-					mutual = false
-					break
-				}
-			}
-			if mutual {
-				group = append(group, j)
-			}
-		}
-
-		if len(group) < t.cfg.MinStorySize {
-			// This seed cannot anchor a story. Retire it from consideration
-			// rather than looping on it forever.
-			used[seed] = true
-			for j := range cand {
-				if near[seed][j] {
-					degree[j]--
-				}
-			}
-			degree[seed] = -1
-			continue
-		}
-
-		members := make([]*batchSignal, 0, len(group))
-		for _, g := range group {
-			used[g] = true
-			members = append(members, cand[g])
-			for j := range cand {
-				if near[g][j] {
-					degree[j]--
-				}
-			}
-			degree[g] = -1
+	out := make([]promotion, 0, len(groups))
+	for _, g := range groups {
+		members := make([]*batchSignal, 0, len(g))
+		for _, i := range g {
+			members = append(members, cand[i])
 		}
 		out = append(out, promotion{members: members})
 	}
@@ -279,62 +291,58 @@ func earliest(members []*batchSignal) time.Time {
 // mergePlan maps each retired story to the story that absorbs it.
 type mergePlan map[uuid.UUID]uuid.UUID
 
-// planMerges groups stories whose centroids are within MergeThreshold and
-// picks the oldest of each group as the survivor.
+// planMerges groups stories that are close enough to be one story and picks
+// the oldest of each group as the survivor.
 //
-// Grouping is transitive across a single run — A–B and B–C become one story —
-// which is the one place chaining is permitted. It is bounded: the graph is
-// over story centroids, of which there are orders of magnitude fewer than
-// signals, and the merged centroid is not recomputed until the groups are
-// closed, so a run cannot cascade.
-func planMerges(ids []uuid.UUID, centroids map[uuid.UUID][]float32,
-	created map[uuid.UUID]time.Time, threshold float64) mergePlan {
+// Two conditions, both necessary:
+//
+//  1. **Clique, not component.** Every member is within threshold of every
+//     other. An earlier version used union-find, reasoning that a story-level
+//     chain would be bounded because there are far fewer stories than signals.
+//     That was wrong: a ladder of 12 stories each 0.005 from its neighbour
+//     merged into one whose ends were 0.55 apart.
+//
+//  2. **The merged story must not be born splittable.** Centroid proximity
+//     alone ignores spread: two stories of radius 0.25 whose centroids are 0.2
+//     apart produce a union spanning far more than either. Left unchecked this
+//     compounds across runs -- the merged centroid shifts toward what it just
+//     absorbed, reaching the next neighbour, and a corpus collapses into one
+//     story over successive batches. Requiring the union to fall below the
+//     split gate makes merge and split exact inverses: a merge may not create
+//     something the next run would want to cut apart.
+func (t *Tracker[T]) planMerges(
+	members map[uuid.UUID][]*batchSignal,
+	centroids map[uuid.UUID][]float32,
+	created map[uuid.UUID]time.Time,
+) mergePlan {
 
-	sorted := make([]uuid.UUID, len(ids))
-	copy(sorted, ids)
+	sorted := make([]uuid.UUID, 0, len(centroids))
+	for id := range centroids {
+		sorted = append(sorted, id)
+	}
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].String() < sorted[j].String() })
 
-	parent := make(map[uuid.UUID]uuid.UUID, len(sorted))
-	for _, id := range sorted {
-		parent[id] = id
-	}
-	var find func(uuid.UUID) uuid.UUID
-	find = func(x uuid.UUID) uuid.UUID {
-		for parent[x] != x {
-			parent[x] = parent[parent[x]]
-			x = parent[x]
+	groups := greedyCliques(len(sorted), func(i, j int) bool {
+		ca, cb := centroids[sorted[i]], centroids[sorted[j]]
+		if len(ca) == 0 || len(cb) == 0 {
+			return false
 		}
-		return x
-	}
-
-	for i, a := range sorted {
-		for _, b := range sorted[i+1:] {
-			ca, cb := centroids[a], centroids[b]
-			if len(ca) == 0 || len(cb) == 0 {
-				continue
-			}
-			if dist.CosineDistance(ca, cb) <= threshold {
-				ra, rb := find(a), find(b)
-				if ra != rb {
-					parent[ra] = rb
-				}
-			}
-		}
-	}
-
-	groups := make(map[uuid.UUID][]uuid.UUID)
-	for _, id := range sorted {
-		r := find(id)
-		groups[r] = append(groups[r], id)
-	}
+		return dist.CosineDistance(ca, cb) <= t.cfg.MergeThreshold
+	}, 2)
 
 	plan := make(mergePlan)
-	for _, members := range groups {
-		if len(members) < 2 {
+	for _, g := range groups {
+		ids := make([]uuid.UUID, 0, len(g))
+		for _, i := range g {
+			ids = append(ids, sorted[i])
+		}
+		ids = t.compactMergeGroup(ids, members)
+		if len(ids) < 2 {
 			continue
 		}
-		survivor := members[0]
-		for _, id := range members[1:] {
+
+		survivor := ids[0]
+		for _, id := range ids[1:] {
 			switch {
 			case created[id].Before(created[survivor]):
 				survivor = id
@@ -342,13 +350,49 @@ func planMerges(ids []uuid.UUID, centroids map[uuid.UUID][]float32,
 				survivor = id
 			}
 		}
-		for _, id := range members {
+		for _, id := range ids {
 			if id != survivor {
 				plan[id] = survivor
 			}
 		}
 	}
 	return plan
+}
+
+// compactMergeGroup shrinks a candidate merge group until the story it would
+// produce falls below the split gate, dropping the member furthest from the
+// union centroid each round. It returns a group of fewer than two when no
+// compact subset survives, meaning no merge happens at all.
+func (t *Tracker[T]) compactMergeGroup(ids []uuid.UUID, members map[uuid.UUID][]*batchSignal) []uuid.UUID {
+	for len(ids) >= 2 {
+		var union []*batchSignal
+		for _, id := range ids {
+			union = append(union, members[id]...)
+		}
+		if len(union) == 0 {
+			return nil
+		}
+		if maxAngularSeparation(radiusOf(union)) <= t.cfg.SplitThreshold {
+			return ids
+		}
+
+		// Drop the story whose centroid sits furthest from the union centre.
+		c := centroidOf(union)
+		worst, worstD := -1, -1.0
+		for i, id := range ids {
+			if len(members[id]) == 0 {
+				continue
+			}
+			if d := dist.CosineDistance(centroidOf(members[id]), c); d > worstD {
+				worst, worstD = i, d
+			}
+		}
+		if worst < 0 {
+			return nil
+		}
+		ids = append(ids[:worst:worst], ids[worst+1:]...)
+	}
+	return nil
 }
 
 // migrateSignals moves every signal key under from into to.
@@ -471,15 +515,13 @@ func (t *Tracker[T]) applyMaintenance(
 		// 4. Merge stories that have converged, measured on post-split
 		// centroids so a split and a merge in one run see consistent state.
 		centroids := make(map[uuid.UUID][]float32, len(members))
-		var mergeIDs []uuid.UUID
 		for _, sid := range sortedIDs(members) {
 			if len(members[sid]) == 0 {
 				continue
 			}
 			centroids[sid] = centroidOf(members[sid])
-			mergeIDs = append(mergeIDs, sid)
 		}
-		plan := planMerges(mergeIDs, centroids, created, t.cfg.MergeThreshold)
+		plan := t.planMerges(members, centroids, created)
 		for _, retired := range sortedPlanKeys(plan) {
 			survivor := plan[retired]
 			// Migrate the full key space, including signals older than

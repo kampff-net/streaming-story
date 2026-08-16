@@ -187,13 +187,16 @@ func TestPlanMerges_OldestSurvives(t *testing.T) {
 	centroids := map[uuid.UUID][]float32{a: unitAt(0), b: unitAt(0.05)}
 	created := map[uuid.UUID]time.Time{a: now, b: now.Add(-time.Hour)}
 
-	plan := planMerges([]uuid.UUID{a, b}, centroids, created, 0.22)
+	plan := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
 
 	require.Len(t, plan, 1)
 	assert.Equal(t, b, plan[a], "the older story must survive")
 }
 
-func TestPlanMerges_Transitive(t *testing.T) {
+// TestPlanMerges_MutuallyCloseGroupMerges covers the legitimate multi-way
+// case: three centroids that are within threshold of each other pairwise, not
+// merely chained through a middle one.
+func TestPlanMerges_MutuallyCloseGroupMerges(t *testing.T) {
 	a, b, c := uuid.New(), uuid.New(), uuid.New()
 	now := time.Now()
 	centroids := map[uuid.UUID][]float32{a: unitAt(0), b: unitAt(0.1), c: unitAt(0.2)}
@@ -201,9 +204,11 @@ func TestPlanMerges_Transitive(t *testing.T) {
 		a: now, b: now.Add(-time.Hour), c: now.Add(-2 * time.Hour),
 	}
 
-	plan := planMerges([]uuid.UUID{a, b, c}, centroids, created, 0.22)
+	plan := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
 
-	assert.Len(t, plan, 2, "A-B and B-C must collapse into one story")
+	require.Less(t, cosDist(centroids[a], centroids[c]), 0.22,
+		"fixture must be a clique, not a chain, or it tests the wrong thing")
+	assert.Len(t, plan, 2, "a mutually close trio must collapse into one story")
 	for _, retired := range []uuid.UUID{a, b} {
 		assert.Equal(t, c, plan[retired])
 	}
@@ -215,7 +220,57 @@ func TestPlanMerges_BeyondThresholdStaysApart(t *testing.T) {
 	centroids := map[uuid.UUID][]float32{a: unitAt(0), b: unitAt(1.2)}
 	created := map[uuid.UUID]time.Time{a: now, b: now}
 
-	assert.Empty(t, planMerges([]uuid.UUID{a, b}, centroids, created, 0.22))
+	assert.Empty(t, mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created))
+}
+
+// TestPlanMerges_DoesNotChain is the regression for a real collapse. Story
+// centroids in a ladder, each 0.005 from its neighbour but 0.55 end to end,
+// formed a single connected component under the original union-find merge and
+// swallowed the whole corpus into one story. Cliques stop it.
+func TestPlanMerges_DoesNotChain(t *testing.T) {
+	const n = 12
+	ids := make([]uuid.UUID, n)
+	centroids := map[uuid.UUID][]float32{}
+	created := map[uuid.UUID]time.Time{}
+	now := time.Now()
+	for i := range ids {
+		ids[i] = uuid.NewSHA1(TrackerNamespace, []byte{byte(i)})
+		centroids[ids[i]] = unitAt(float64(i) * 0.1)
+		created[ids[i]] = now.Add(-time.Duration(i) * time.Minute)
+	}
+	require.Greater(t, cosDist(centroids[ids[0]], centroids[ids[n-1]]), 0.22,
+		"fixture ends must be beyond the merge threshold")
+
+	plan := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
+
+	survivors := map[uuid.UUID]bool{}
+	for _, id := range ids {
+		if s, ok := plan[id]; ok {
+			survivors[s] = true
+		} else {
+			survivors[id] = true
+		}
+	}
+	assert.Greater(t, len(survivors), 1,
+		"a chain of %d stories collapsed into %d", n, len(survivors))
+
+	// Every surviving group must be no wider than the threshold.
+	members := map[uuid.UUID][]uuid.UUID{}
+	for _, id := range ids {
+		s, ok := plan[id]
+		if !ok {
+			s = id
+		}
+		members[s] = append(members[s], id)
+	}
+	for survivor, group := range members {
+		for _, x := range group {
+			for _, y := range group {
+				assert.LessOrEqual(t, cosDist(centroids[x], centroids[y]), 0.22,
+					"story %s merged members %.4f apart", survivor, cosDist(centroids[x], centroids[y]))
+			}
+		}
+	}
 }
 
 func TestPlanMerges_DeterministicUnderShuffledOrder(t *testing.T) {
@@ -229,12 +284,12 @@ func TestPlanMerges_DeterministicUnderShuffledOrder(t *testing.T) {
 		created[ids[i]] = now.Add(-time.Duration(i) * time.Minute)
 	}
 
-	forward := planMerges(ids, centroids, created, 0.22)
+	forward := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
 	reversed := make([]uuid.UUID, len(ids))
 	for i, id := range ids {
 		reversed[len(ids)-1-i] = id
 	}
-	assert.Equal(t, forward, planMerges(reversed, centroids, created, 0.22))
+	assert.Equal(t, forward, mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created))
 }
 
 // --- helpers ---
@@ -242,6 +297,25 @@ func TestPlanMerges_DeterministicUnderShuffledOrder(t *testing.T) {
 // cosDist is the package-internal distance under test, wrapped so the tests
 // read the same way the implementation does.
 func cosDist(a, b []float32) float64 { return dist.CosineDistance(a, b) }
+
+// mergeTracker builds a tracker whose thresholds isolate the merge rule under
+// test: the split gate is set wide so compactMergeGroup never interferes.
+func mergeTracker(t *testing.T, merge float64) *Tracker[string] {
+	tr := newTestTracker(t)
+	tr.cfg.MergeThreshold = merge
+	tr.cfg.SplitThreshold = 2
+	return tr
+}
+
+// singleMembers gives each story one member at its centroid, which is enough
+// for rules that only compare centroids.
+func singleMembers(centroids map[uuid.UUID][]float32) map[uuid.UUID][]*batchSignal {
+	out := make(map[uuid.UUID][]*batchSignal, len(centroids))
+	for id, c := range centroids {
+		out[id] = []*batchSignal{{id: id, emb: c, at: time.Now()}}
+	}
+	return out
+}
 
 func idsOf(members []*batchSignal) []uuid.UUID {
 	out := make([]uuid.UUID, len(members))
