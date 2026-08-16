@@ -359,6 +359,52 @@ func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error] {
 	}
 }
 
+// Signal returns the signal with the given ID, wherever it currently lives:
+// attached to a story or held in the outlier bucket. Callers that need to know
+// which of the two, or which story, should use SignalsOf or Outliers instead;
+// this method deliberately reports only the signal.
+//
+// It returns an error wrapping ErrNotFound when the ID has no location-index
+// entry, when the index points at a record that no longer exists, or when the
+// index value is malformed. A signal evicted from the outlier bucket or
+// belonging to a retired story is therefore not found, which is the intended
+// behavior.
+func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error) {
+	var sig Signal[T]
+	err := t.cfg.Store.View(func(tx Tx) error {
+		storyID, isOutlier, hasIndex, err := readSignalLoc(tx, id)
+		if err != nil {
+			return err
+		}
+		if !hasIndex {
+			return fmt.Errorf("signal %s: %w", id, ErrNotFound)
+		}
+
+		var key []byte
+		if isOutlier {
+			key = keyOutlier(id)
+		} else {
+			key = keySignal(storyID, id)
+		}
+
+		b, err := tx.Get(key)
+		if err != nil {
+			return err
+		}
+		if b == nil {
+			return fmt.Errorf("signal %s: %w", id, ErrNotFound)
+		}
+
+		s, err := t.cfg.Codec.Decode(b)
+		if err != nil {
+			return fmt.Errorf("decode signal %s: %w", id, err)
+		}
+		sig = s
+		return nil
+	})
+	return sig, err
+}
+
 // calcThreshold calculates the dynamic distance threshold T_assign(story).
 //
 // T_assign(story) = mean_distance(story) + AssignmentK × σ(story).

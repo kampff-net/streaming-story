@@ -353,3 +353,260 @@ func TestTracker_Ingest(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// errDecodeFailed is returned by failingDecodeCodec to prove that a codec
+// failure reaches the caller unchanged.
+var errDecodeFailed = errors.New("codec decode failed")
+
+// failingDecodeCodec encodes normally but always fails to decode.
+type failingDecodeCodec[T any] struct{ JSONCodec[T] }
+
+func (failingDecodeCodec[T]) Decode([]byte) (Signal[T], error) {
+	return Signal[T]{}, errDecodeFailed
+}
+
+func TestTracker_Signal(t *testing.T) {
+	t.Run("signal_attached_to_story", func(t *testing.T) {
+		tr := newTestTracker(t)
+		storyID := uuid.New()
+		sigID := uuid.New()
+		sig := Signal[string]{
+			ID:        sigID,
+			At:        time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
+			Embedding: []float32{1.0, 2.0},
+			Data:      "story-data-payload",
+		}
+		b, err := tr.cfg.Codec.Encode(sig)
+		require.NoError(t, err)
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			if err := tx.Put(keySignal(storyID, sigID), b); err != nil {
+				return err
+			}
+			return writeSignalLoc(tx, sigID, storyID, false)
+		}))
+
+		got, err := tr.Signal(sigID)
+		require.NoError(t, err)
+		assert.Equal(t, sigID, got.ID)
+		assert.Equal(t, "story-data-payload", got.Data)
+		assert.Equal(t, sig.Embedding, got.Embedding)
+		assert.True(t, sig.At.Equal(got.At))
+	})
+
+	t.Run("signal_in_outlier_bucket", func(t *testing.T) {
+		tr := newTestTracker(t)
+		sigID := uuid.New()
+		sig := Signal[string]{
+			ID:        sigID,
+			At:        time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
+			Embedding: []float32{0.5, 0.5},
+			Data:      "outlier-data-payload",
+		}
+		b, err := tr.cfg.Codec.Encode(sig)
+		require.NoError(t, err)
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			if err := tx.Put(keyOutlier(sigID), b); err != nil {
+				return err
+			}
+			return writeSignalLoc(tx, sigID, uuid.Nil, true)
+		}))
+
+		got, err := tr.Signal(sigID)
+		require.NoError(t, err)
+		assert.Equal(t, sigID, got.ID)
+		assert.Equal(t, "outlier-data-payload", got.Data)
+	})
+
+	t.Run("signal_moved_between_stories_by_batch", func(t *testing.T) {
+		tr := newTestTracker(t)
+		tr.dim.Store(3)
+
+		// Story A is older, so a batch merge retires B into A and migrates
+		// B's signals under A's prefix.
+		storyA := uuid.NewSHA1(TrackerNamespace, []byte("signal-merge-A"))
+		storyB := uuid.NewSHA1(TrackerNamespace, []byte("signal-merge-B"))
+		now := time.Now()
+		aEmbs := [][]float32{
+			{1.00, 0.01, 0.02},
+			{0.99, 0.02, -0.01},
+			{1.01, -0.01, 0.01},
+			{0.98, 0.03, 0.00},
+			{1.00, 0.00, 0.00},
+		}
+		bEmbs := [][]float32{
+			{1.01, 0.00, 0.01},
+			{0.99, 0.01, 0.00},
+			{1.00, -0.01, 0.02},
+		}
+
+		var trackedID uuid.UUID
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			write := func(sid uuid.UUID, created time.Time, embs [][]float32) error {
+				for _, emb := range embs {
+					sigID := uuid.New()
+					sig := Signal[string]{
+						ID:        sigID,
+						At:        now.Add(-time.Minute),
+						Embedding: emb,
+						Data:      "moved-signal",
+					}
+					b, err := tr.cfg.Codec.Encode(sig)
+					if err != nil {
+						return err
+					}
+					if err := tx.Put(keySignal(sid, sigID), b); err != nil {
+						return err
+					}
+					if err := writeSignalLoc(tx, sigID, sid, false); err != nil {
+						return err
+					}
+					if sid == storyB {
+						trackedID = sigID
+					}
+				}
+				return tr.writeStoryMeta(tx, sid, time.Time{}, storyRecord{
+					State:        StoryStateActive,
+					Centroid:     []float32{1, 0, 0},
+					CreatedAt:    created,
+					LastSignalAt: now.Add(-time.Minute),
+				})
+			}
+			if err := write(storyA, now.Add(-2*time.Hour), aEmbs); err != nil {
+				return err
+			}
+			return write(storyB, now.Add(-time.Hour), bEmbs)
+		}))
+
+		before, err := tr.Signal(trackedID)
+		require.NoError(t, err)
+		assert.Equal(t, "moved-signal", before.Data)
+
+		tr.runBatch()
+
+		// The signal now lives under story A; Signal must follow the index.
+		require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+			assert.Nil(t, mustGet(t, tx, keySignal(storyB, trackedID)), "signal must leave retired story B")
+			assert.NotNil(t, mustGet(t, tx, keySignal(storyA, trackedID)), "signal must land under survivor story A")
+			return nil
+		}))
+
+		after, err := tr.Signal(trackedID)
+		require.NoError(t, err)
+		assert.Equal(t, trackedID, after.ID)
+		assert.Equal(t, "moved-signal", after.Data)
+	})
+
+	t.Run("unknown_uuid_returns_ErrNotFound", func(t *testing.T) {
+		tr := newTestTracker(t)
+		_, err := tr.Signal(uuid.New())
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrNotFound))
+	})
+
+	t.Run("dangling_index_returns_ErrNotFound", func(t *testing.T) {
+		tr := newTestTracker(t)
+		sigID := uuid.New()
+		storyID := uuid.New()
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			return writeSignalLoc(tx, sigID, storyID, false)
+		}))
+
+		_, err := tr.Signal(sigID)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrNotFound))
+	})
+
+	t.Run("malformed_index_returns_ErrNotFound", func(t *testing.T) {
+		tr := newTestTracker(t)
+		sigID := uuid.New()
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			return tx.Put(keySignalLoc(sigID), []byte("invalid-loc-format"))
+		}))
+
+		_, err := tr.Signal(sigID)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrNotFound))
+	})
+
+	t.Run("codec_error_propagates_not_ErrNotFound", func(t *testing.T) {
+		tr := newTestTracker(t)
+		sigID := uuid.New()
+		storyID := uuid.New()
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			if err := tx.Put(keySignal(storyID, sigID), []byte("{invalid json")); err != nil {
+				return err
+			}
+			return writeSignalLoc(tx, sigID, storyID, false)
+		}))
+
+		_, err := tr.Signal(sigID)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, ErrNotFound))
+		assert.Contains(t, err.Error(), "decode signal")
+	})
+
+	t.Run("codec_decode_error_propagates_not_ErrNotFound", func(t *testing.T) {
+		tr, err := NewTracker[string](Config[string]{
+			Store:         newMemStore(),
+			Codec:         failingDecodeCodec[string]{},
+			BatchInterval: time.Hour,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = tr.Close() })
+
+		sigID := uuid.New()
+		storyID := uuid.New()
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			if err := tx.Put(keySignal(storyID, sigID), []byte("payload")); err != nil {
+				return err
+			}
+			return writeSignalLoc(tx, sigID, storyID, false)
+		}))
+
+		_, err = tr.Signal(sigID)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, ErrNotFound))
+		assert.True(t, errors.Is(err, errDecodeFailed))
+	})
+
+	// Signal must behave like the other read accessors after Close: whatever
+	// the store does with reads post-close, Story and Signal agree.
+	t.Run("after_close_matches_other_accessors", func(t *testing.T) {
+		tr := newTestTracker(t)
+		sigID := uuid.New()
+		storyID := uuid.New()
+		sig := Signal[string]{ID: sigID, Data: "post-close-signal"}
+		b, err := tr.cfg.Codec.Encode(sig)
+		require.NoError(t, err)
+		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+			if err := tx.Put(keySignal(storyID, sigID), b); err != nil {
+				return err
+			}
+			if err := writeSignalLoc(tx, sigID, storyID, false); err != nil {
+				return err
+			}
+			return tr.writeStoryMeta(tx, storyID, time.Time{}, storyRecord{
+				State:     StoryStateActive,
+				CreatedAt: time.Now(),
+			})
+		}))
+
+		gotSigBefore, sigErrBefore := tr.Signal(sigID)
+		_, storyErrBefore := tr.Story(storyID)
+
+		require.NoError(t, tr.Close())
+
+		gotSigAfter, sigErrAfter := tr.Signal(sigID)
+		_, storyErrAfter := tr.Story(storyID)
+
+		assert.Equal(t, sigErrBefore == nil, sigErrAfter == nil, "Signal must not change outcome across Close")
+		assert.Equal(t, storyErrBefore == nil, storyErrAfter == nil, "Story must not change outcome across Close")
+		assert.Equal(t, sigErrAfter == nil, storyErrAfter == nil, "Signal and Story must agree post-close")
+		assert.Equal(t, gotSigBefore, gotSigAfter)
+
+		_, missingSigErr := tr.Signal(uuid.New())
+		_, missingStoryErr := tr.Story(uuid.New())
+		assert.True(t, errors.Is(missingSigErr, ErrNotFound))
+		assert.True(t, errors.Is(missingStoryErr, ErrNotFound))
+	})
+}
