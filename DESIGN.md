@@ -104,6 +104,18 @@ Equivalent to `uuid.NewSHA1(cfg.Namespace, []byte(domainKey))`.
 constant, so IDs are stable regardless of deployment path or store location.
 Multi-tenant deployments needing isolation set `Config.Namespace` per tenant.
 
+Story IDs are UUID v5 under the same namespace, derived by the maintenance pass
+rather than supplied: the name is the sorted list of the signal IDs the story
+was founded on — the promoted outlier group, or the signals moving into a split
+child — prefixed with the birth route, `promote` or `split:{parentID}`. Replaying
+a signal stream against a fresh store therefore reproduces the same story IDs,
+so a recorded run can be diffed against a replay.
+
+An ID already held by another story is rederived with an incrementing salt. A
+split can spawn exactly the member set some existing story was founded on, and
+reusing that ID would silently fold the two together; the salt is part of the
+derivation, so a replay meets the same occupied IDs in the same order.
+
 Deterministic IDs make re-ingestion idempotent: a signal already stored under a
 story is a strict no-op.
 
@@ -402,13 +414,14 @@ which the store is a hard fixpoint that repeated passes do not touch. Absorption
 only ever *adds* assignments; a settling pass never moves a signal between
 stories. `TestStreaming_IncrementalArrivalsAreStable` asserts both halves.
 
-**The scope of that guarantee is one store.** Two *fresh* ingests of the same
-corpus into two empty stores can differ slightly, because a new story's ID comes
-from `uuid.New()` and decisions are ordered by story ID — so which of two
-otherwise equivalent stories is visited first varies. Measured on the streaming
-suite, this moves total churn between 0.4% and 1.0% run to run. Deriving new
-story IDs from their founding signals would close the gap and is the obvious fix
-if cross-store reproducibility ever matters.
+**That guarantee now extends across stores.** Two *fresh* ingests of the same
+corpus into two empty stores used to differ slightly: a new story's ID came from
+`uuid.New()`, and decisions are ordered by story ID, so which of two otherwise
+equivalent stories was visited first varied — worth 0.4% to 1.0% of total churn
+run to run on the streaming suite. Story IDs are derived from their founding
+signals (see [UUID Namespace](#uuid-namespace)), which removes that source of
+variation: the 300-seed shape now reports the same 3 of 791 carried assignments
+on every fresh run, and the other three shapes report zero.
 
 ### Global calibration
 

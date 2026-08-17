@@ -7,12 +7,13 @@
 * **Last Updated:** 2026-08-17
 * **Approver:** Codefather
 
-> **This document describes the design as built.** Four decisions were revised
+> **This document describes the design as built.** Five decisions were revised
 > after the first implementation was measured against the reference corpus: the
 > geometry distances are measured in, the promotion rule, the merge admission
-> test, and the handling of outliers no promotion claimed. Each revision is
-> folded into the sections below and summarised in §2.10. The approaches they
-> replaced are recorded in [`HISTORY.md`](../../HISTORY.md).
+> test, the handling of outliers no promotion claimed, and the derivation of
+> story IDs. Each revision is folded into the sections below and summarised in
+> §2.10. The approaches they replaced are recorded in
+> [`HISTORY.md`](../../HISTORY.md).
 
 ---
 
@@ -281,8 +282,9 @@ of them into a new story.
    nearest the *running* centroid while it stays within the threshold.
 3. **Compact** it: recompute the centroid and drop any member now beyond
    `AssignThreshold`, repeating until every survivor is inside.
-4. A group of at least `MinStorySize` becomes a new story; `EventStoryCreated` is
-   emitted. Retire the seed and repeat from 2 until no seed has enough neighbours.
+4. A group of at least `MinStorySize` becomes a new story, its ID derived from
+   its members (§2.11); `EventStoryCreated` is emitted. Retire the seed and
+   repeat from 2 until no seed has enough neighbours.
 5. Outliers no group claimed fall through to admission (§2.3.1).
 
 **Why growth and not cliques.** Connected components are out of the question —
@@ -396,8 +398,9 @@ the test is recomputed from membership every time.
 
 #### Identity and Events
 
-**The larger part keeps the story ID**; the smaller becomes a new story with a
-fresh ID and `CreatedAt = now`. Ties break toward the part holding the older
+**The larger part keeps the story ID**; the smaller becomes a new story with
+`CreatedAt = now` and an ID derived from the signals moving into it (§2.11).
+Ties break toward the part holding the older
 signal, so the outcome does not depend on iteration order. Keeping the ID with
 the majority preserves continuity for most downstream holders of that ID.
 
@@ -724,6 +727,45 @@ in [`HISTORY.md`](../../HISTORY.md#8-raw-cosine-geometry).
 | Unclaimed outliers (§2.3.1) | held until `OutlierTTL` | admitted into stories that cover them | [§10](../../HISTORY.md#10-outliers-as-a-terminal-bucket) |
 | Merge gate (§2.5) | union must pass the split radius gate | union must be one `Split` leaves whole | [§9](../../HISTORY.md#9-radius-gate-as-the-merge-admission-test) |
 | Dead config fields (§2.8) | retained as `Deprecated:` no-ops | removed outright | [removed fields](../../HISTORY.md#removed-config-fields) |
+| Story IDs (§2.11) | `uuid.New()` at both mint sites | UUID v5 over the founding signals | [§11](../../HISTORY.md#11-random-story-ids) |
+
+### 2.11 Deterministic Story IDs
+
+Every other output of a run is a function of the input stream: promotion sorts
+its candidates by signal ID (§2.3), centroids are recomputed from members rather
+than accumulated (§2.7), and a second run over unchanged data changes nothing
+(§2.1). Story IDs were the one exception — `uuid.New()` at both mint sites — so
+replaying a recorded stream against a fresh store produced the same stories
+under different names, and the two runs could not be diffed. The randomness also
+reached behaviour: story IDs order the split and merge decisions, which is where
+the run-to-run spread in the residual churn of Task 14 came from.
+
+A new story's ID is therefore derived:
+
+```
+storyID = UUIDv5(Config.Namespace, seed || 0x00 || sorted(founding signal IDs) [|| 0x00 || salt])
+```
+
+- **Founding signals** are the members the story is born with: the promoted
+  group in §2.3, the spawn side of the division in §2.4. Sorted by raw ID bytes,
+  so the ID does not depend on collection order.
+- **Seed** names the birth route — `promote`, or `split:{parentID}`. One member
+  set reaching story status by either route must not claim a single ID.
+- **Salt** is absent on the first attempt and increments per rejection. An ID
+  already held is rejected: a split can spawn exactly the member set an existing
+  story was founded on, and reusing that ID would silently fold the two
+  together. Occupancy is tested against both the stories this run has already
+  created — they hold an ID before any metadata is written — and the store,
+  which is the authority because archived stories are left out of the batch's
+  story map. Salting is inside the derivation, so a replay meets the same
+  occupied IDs in the same order and takes the same number of steps.
+
+Signal IDs keep their own derivation (`Tracker.SignalID`, UUID v5 over a caller
+domain key). Both live under `Config.Namespace`, and the seed prefix keeps a
+story ID from colliding with a signal ID derived from a domain key.
+
+The property under test is replay: the same stream against two fresh stores
+yields identical story IDs and identical membership.
 
 ---
 
@@ -842,9 +884,10 @@ in [`HISTORY.md`](../../HISTORY.md#8-raw-cosine-geometry).
     arrival shapes (400 seed with increments of 50/20/5, plus 300 seed with 50).
     Measured: **zero** churn in all three 400-seed shapes (0 of 645, 1690, and
     6874 carried assignments); 3–8 of 791 (0.4–1.0%) with the 300-seed shape,
-    where the spread across fresh runs comes from `uuid.New()` story IDs ordering
-    the decisions rather than from the data. Each shape also asserts convergence
-    within one extra pass and a hard fixpoint after it.
+    where the spread across fresh runs came from random story IDs ordering the
+    decisions rather than from the data — that source of variation is gone as of
+    Task 17 (§2.11). Each shape also asserts convergence within one extra pass
+    and a hard fixpoint after it.
 
 - [x] **Task 15:** Restructure by function: extract `internal/geom`,
       `internal/cluster`, `internal/keys`; regroup the root package into
@@ -861,6 +904,17 @@ in [`HISTORY.md`](../../HISTORY.md#8-raw-cosine-geometry).
     `spec/006_centroid_incremental_clustering/spec.md`, `spec/README.md`
   - **Verification:** manual review; README code blocks compile against the module
 
+- [x] **Task 17:** Derive story IDs from their founding signals (§2.11),
+      replacing `uuid.New()` at the promotion and split mint sites. Adds
+      `deriveStoryID` with occupancy-checked salting.
+  - **Files:** `maintain.go`, `maintain_test.go`, `AGENTS.md`, `doc.go`,
+    `HISTORY.md`
+  - **Verification:** `go test -run 'TestDeriveStoryID|TestStoryIDs' ./...`
+    (covers: members only, member order irrelevant, seed separates promotion
+    from split, occupied IDs salted reproducibly, in-run set agrees with the
+    store, and an end-to-end replay against a fresh store reproducing every
+    story ID and its membership)
+
 ### 3.2 Risks & Mitigation
 
 | Risk | Detection | Mitigation |
@@ -874,6 +928,7 @@ in [`HISTORY.md`](../../HISTORY.md#8-raw-cosine-geometry).
 | **Centroid drift** on long-running stories. A recency-tracking centre lets a story silently become a different story under the same ID. | Radius growth; `Centroid` vs `RecentCentroid` divergence, which is directly measurable. | Identity geometry uses the lifetime `Centroid`, which cannot slide (§2.7); only admission follows recency. Adaptive threshold clamped to `AssignThreshold`. Drift surfaces as radius growth and is routed to the split test rather than absorbed. |
 | **Stale catchment.** The mirror risk: a story stops admitting its own developments because its centre reflects opening coverage. | Rising outlier rate alongside topically-related stories being created. | `RecentCentroid` over `ActiveContextWindow` governs admission for exactly this reason. |
 | **Deprecated fields mislead callers** into thinking clustering is still tunable. | Code review. | `Deprecated:` godoc on every superseded field, plus a `DESIGN.md` note. |
+| **Derived story ID already held** (§2.11). A split can spawn exactly the member set an existing story was founded on; reusing that ID would fold the two together silently. | Mint-time occupancy check against the run's stories and the store. | The ID is rederived with the next salt until one is free. Salting is inside the derivation, so replay is unaffected. The check reads the store rather than the batch's story map, which omits archived stories. |
 | **Over-fragmentation at startup.** Cold start with few signals promotes little and creates many singleton outliers. | Outlier fraction after first runs. | Expected and benign: outliers are retained until `OutlierTTL` and promoted once coverage arrives. `MinStorySize` 3 matches the previous `MinClusterSize` default. |
 
 ---

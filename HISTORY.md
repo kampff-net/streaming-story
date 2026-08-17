@@ -224,6 +224,32 @@ Draft test against stories that now exist.
 
 ---
 
+## 11. Random story IDs
+
+**What it was.** A story born in the maintenance pass took its ID from
+`uuid.New()` — random, at both mint sites: promotion out of the outlier bucket
+and the child of a split.
+
+**Why it was removed.** Every other output of a run is a function of the input
+stream: grouping is sorted by signal ID, centroids are recomputed from members,
+and the pass is idempotent over unchanged data. The IDs were the one exception,
+so replaying a recorded stream against a fresh store produced the same stories
+under different names and could not be diffed against the original run. The
+randomness also leaked into behaviour — story IDs order the split and merge
+decisions, and the residual churn measured by the streaming suite (3–8 of 791
+carried assignments at a 300-signal seed) moved run to run for that reason
+alone.
+
+**What replaced it.** `deriveStoryID`: UUID v5 under `Config.Namespace` over the
+sorted founding signal IDs, seeded with the birth route (`promote`, or
+`split:{parentID}`). An ID already held — by a live story of the same run or by
+any record in the store, archived included — is rederived with the next salt,
+because a split can spawn exactly the member set an existing story was founded
+on and reusing that ID would silently fold the two together. Salting is inside
+the derivation, so a replay meets the same occupied IDs in the same order.
+
+---
+
 ## Removed `Config` fields
 
 These were kept as documented no-ops for one cycle so callers would still

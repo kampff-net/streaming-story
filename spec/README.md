@@ -22,9 +22,10 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 006 | Centroid-Based Incremental Clustering | ✅ `COMPLETED` | 2026-08-16 | 2026-08-17 | [spec.md](006_centroid_incremental_clustering/spec.md) |
 
-> Implemented, then revised in four places once measured against the reference
-> corpus: centred geometry, promotion by centroid growth, outlier admission, and
-> the merge admission test. §2.10 of the spec summarises them; superseded
+> Implemented, then revised in five places once measured against the reference
+> corpus: centred geometry, promotion by centroid growth, outlier admission, the
+> merge admission test, and story IDs derived from their founding signals rather
+> than drawn at random. §2.10 of the spec summarises them; superseded
 > approaches are in [HISTORY.md](../HISTORY.md). One item remains open: no
 > pre-change benchmark baseline was captured, so batch-run performance is
 > unverified rather than known-good.
