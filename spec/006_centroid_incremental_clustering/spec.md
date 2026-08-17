@@ -627,7 +627,7 @@ removing them would break callers' compilation for no benefit. That was revisite
 a field that silently does nothing is worse than one that fails to compile,
 because it reads as a tuning knob to whoever inherits the configuration. All of
 them are now **removed**, along with the `ClusterSelection` type and its
-constants. Callers must drop them — `magic-giant` sets several (Task 11).
+constants. Callers must drop them; `magic-giant` did so in Task 11.
 
 `ClusterSelection` and `MaxClusterSize` were added on 2026-08-16 to mitigate
 chaining under EOM extraction. This spec supersedes them within one day of
@@ -806,12 +806,15 @@ in [`HISTORY.md`](../../HISTORY.md#8-raw-cosine-geometry).
   - **Files:** docs and spec index
   - **Verification:** manual review
 
-- [ ] **Task 11:** Update `magic-giant` config plumbing for the new knobs,
-      including `MeanRemoval` and the rebased threshold defaults. **Not done** —
-      separate repository, untouched by this work.
+- [x] **Task 11:** Update `magic-giant` config plumbing for the new knobs,
+      including `MeanRemoval` and the rebased threshold defaults. Done in that
+      repository, separately from this work.
   - **Files:** `../magic-giant/internal/config/config.go`,
     `../magic-giant/cmd/magic-giant/main.go`, both YAML files, tests
-  - **Verification:** `cd ../magic-giant && go test ./...`
+  - **Verification:** `cd ../magic-giant && go build ./... && go vet ./... &&
+    go test -count=1 ./...` — clean. Its defaults carry the centred-space values
+    (0.50 / 0.40 / 0.55, `MeanRemoval` 0.9) and `mean_removal` is plumbed through
+    the YAML, so it is recalibrated rather than merely compiling.
 
 - [x] **Task 12:** Centre every distance against the corpus mean: `MeanRemoval`
       config, mean measured per run and persisted in `c:state`, projection applied
@@ -876,15 +879,14 @@ in [`HISTORY.md`](../../HISTORY.md#8-raw-cosine-geometry).
 ---
 
 ## Phase 4: Execution & Verification
-- [x] All per-task verification steps pass (Task 11 excepted: not attempted).
+- [x] All per-task verification steps pass.
 - [x] `go vet ./...` clean.
 - [x] Unit tests pass, including the four stability invariants and the
       50-batch no-oscillation run.
 - [x] `go build ./...` succeeds with `internal/hdbscan` and
       `internal/hungarian` deleted.
-- [ ] `magic-giant` builds and its suite passes against the new library. **Not
-      verified** — separate repository. Note the thresholds and their scale
-      changed, so its configuration needs revisiting before it is upgraded.
+- [x] `magic-giant` builds and its suite passes against the new library, with
+      its configuration recalibrated for centred space.
 - [ ] Benchmarks show no batch-run regression at 10k signals. All three
       benchmarks build and execute after the geometry and restructure work, but
       no pre-change baseline was captured, so "no regression" is unverified.
@@ -895,7 +897,7 @@ in [`HISTORY.md`](../../HISTORY.md#8-raw-cosine-geometry).
 ---
 
 ## Phase 5: Completed
-- [ ] All Phase 4 items `[x]` — two remain open, both listed above.
+- [ ] All Phase 4 items `[x]` — one remains open: the benchmark baseline.
 - [x] No regressions in this repository's suite.
 - [x] Spec document reflects the actual implementation, revisions included.
 - [x] Specs 002 and 003 marked `SUPERSEDED` with a pointer here.

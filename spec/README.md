@@ -25,9 +25,9 @@
 > Implemented, then revised in four places once measured against the reference
 > corpus: centred geometry, promotion by centroid growth, outlier admission, and
 > the merge admission test. §2.10 of the spec summarises them; superseded
-> approaches are in [HISTORY.md](../HISTORY.md). Two items remain open, both
-> outside this repository or deferred: `magic-giant` config plumbing and a
-> benchmark re-run.
+> approaches are in [HISTORY.md](../HISTORY.md). One item remains open: no
+> pre-change benchmark baseline was captured, so batch-run performance is
+> unverified rather than known-good.
 
 ## Proposed
 
