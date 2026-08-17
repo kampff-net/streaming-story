@@ -16,6 +16,35 @@ You are operating UNDERCOVER in a PUBLIC/OPEN-SOURCE repository.
 Your commit messages, PR titles, and PR bodies MUST NOT contain ANY Google or Anthropic information.
 Do not blow your cover. Do not reveal yourself. Do not add AI signatures to commit messages.
 
+## Package Layout
+
+Public API and everything that touches the store live in the root `story`
+package. Pure logic lives in `internal/`, which nothing outside the module can
+import, so those packages can be reshaped freely.
+
+| Package | Holds |
+|---|---|
+| `story` (root) | Public types, `Config`, `Store`/`Tx`, `MemStore`, `JSONCodec`, and the `Tracker`: ingest, batch orchestration, persistence, events. |
+| `internal/geom` | Vector geometry: the corpus mean, the projector that centres against it, group statistics, the quadratic angular bound. |
+| `internal/cluster` | Grouping decisions over an index-based `Point`: growth, cliques, split, merge planning. Pure — no store, no clock, no `Config`. |
+| `internal/keys` | The KV key schema and its parsers. Nothing else assembles a key. |
+| `internal/dist` | Cosine distance over BLAS. |
+
+Root files are grouped by function, not by type: `types.go` (public types and
+events), `config.go` (knobs and validation), `store.go` (the `Store`/`Tx`/`Codec`
+contracts plus `MemStore` and `JSONCodec`), `tracker.go` (lifecycle, batch loop,
+subscriber fan-out), `ingest.go` (the Draft path), `threshold.go` (admission
+radius policy, shared by Draft and by outlier admission), `batch.go` (collection,
+apply window, snapshot, buffer drain), `maintain.go` (the pass itself),
+`points.go` (the collected-signal form and every conversion into the `geom` /
+`cluster` views), `record.go` (persisted shapes, their store access, and
+calibration state), and `query.go` (the read API).
+
+Two rules worth keeping: a decision belongs in `internal/cluster` if it can be
+expressed over points and thresholds alone, and any conversion between a
+`batchSignal` and an algorithm's view belongs in `points.go` rather than at the
+call site.
+
 ## Build and Test Commands
 
 ```bash
@@ -64,7 +93,7 @@ A buffered `Ingest` still returns a provisional story ID. It is computed from `d
 
 | Prefix | Content |
 |---|---|
-| `c:state` | `σ_global`, dimensionality, last batch timestamp |
+| `c:state` | `σ_global`, dimensionality, last batch timestamp, corpus mean |
 | `s:{storyID}:m` | Story metadata (centroid, radius, state, timestamps, frozen stats) |
 | `s:{storyID}:s:{signalID}` | Signal data |
 | `o:{signalID}` | Outlier signal |
@@ -86,16 +115,22 @@ Why: HDBSCAN's MST over mutual-reachability distances is single linkage with a d
 
 Key rules when touching this code:
 
-- **Promotion uses mutual-neighbour cliques, never connected components.** Components are the transitive linkage that chains.
+- **Every distance is measured in centred space.** The corpus mean is subtracted (`Config.MeanRemoval`, default 0.9) before any comparison; see `internal/geom`. Raw cosine is anisotropic: the mean of a large group converges on the shared direction every embedding carries, so two unrelated halves of the corpus had centroids 0.06 apart while their nearest members sat 0.84 apart. Split could therefore never fire, and centroid-based growth snowballed — end to end, `MeanRemoval = 0` yields 2 stories with a 581-signal blob where 0.9 yields 32 with a largest of 28.
+- **`MeanRemoval` is 0.9, not 1.0.** Full removal is degenerate when the corpus is itself one tight group: the mean lands on top of every signal and the residual noise reads as opposition, shattering a coherent story into antipodal halves.
+- **Thresholds are centred-space distances**, roughly twice the raw-cosine scale. Defaults: `AssignThreshold` 0.50, `MergeThreshold` 0.40, `SplitThreshold` 0.55. A value carried over from raw cosine is far too tight.
+- **Promotion uses nearest-centroid growth with a closing compaction, not cliques.** Growth admits whatever is nearest the running centroid; the compaction then drops any member the final centroid left outside the threshold, which bounds the group whatever path the centre took. Cliques were replaced because a real news cluster does not satisfy all-pairs adjacency: at one threshold it grouped 98 of 596 signals (16%) where growth grouped 182 (31%); the shipped pipeline reaches 234 (39%). Connected components remain forbidden — they are the transitive linkage that chains.
+- **Outliers are admitted to covering stories during maintenance.** A signal that arrives before the batch creating its story lands in the outlier bucket, and Draft never runs again for it; without admission, 342 of 596 signals stayed stranded until TTL. This is not the forbidden signal reassignment — an outlier has no membership to disturb.
+- **Merge is gated by the split decision itself, not the radius gate.** The gate is only a *necessary* condition for a split, so using it to approve a merge refuses unions no split would ever touch: at `SplitThreshold` 0.55 it demands a union radius under 0.15, and merges never fire.
 - **`MergeThreshold` < `SplitThreshold` is mandatory** and enforced by `validate()`. Merge tests a given partition; split searches for the best one, so a shared value lets them undo each other along different seams.
 - **The split radius gate is `4r − 2r²`, not `2r`.** Cosine distance is not a metric; `1 − cos` is quadratic in the angle. A Euclidean bound silently skips stories that should split.
 - **Centroids are recomputed from members every run, never accumulated.** An incremental mean depends on arrival order, which breaks reproducibility.
 - **Two centroids:** `Centroid` (lifetime) for identity geometry, `RecentCentroid` (ActiveContextWindow) for admission.
-- **No individual signal reassignment.** Membership changes only via split or merge.
+- **No individual signal reassignment.** Story membership changes only via split or merge; outlier admission is the one documented exception, and it moves signals into stories, never between them.
 
 ### Resolved Design Decisions
 
-- `MinStorySize` is the minimum signals for a group to be a story; it gates promotion and both sides of a split. It replaced `MinClusterSize`, which is retained as a deprecated no-op field.
+- `MinStorySize` is the minimum signals for a group to be a story; it gates promotion and both sides of a split. It replaced `MinClusterSize`, which has since been removed along with every other dead knob — `Config` has no no-op fields, and none should be reintroduced. See [`HISTORY.md`](HISTORY.md#removed-config-fields).
+- **`BatchWindow` only sets the `OutlierTTL` default.** It does not bound clustering input: membership is read in full every pass. Do not reach for it to limit work.
 - `StabilityWindow` is **removed** — `BatchWindow` is the sole re-assignment scope.
 - Signal UUID namespace is a **fixed compile-time constant** (`TrackerNamespace`) — not derived from store path.
 - Default windows are calibrated for **news-frequency ingestion** (1–10 signals/day per topic).

@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"go.kvsh.ch/streaming-story/internal/keys"
+
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -134,7 +136,7 @@ func TestTracker_Ingest_ReingestIsIdempotent(t *testing.T) {
 
 	var stored int
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		return tx.ScanPrefix(keySignalPrefix(storyID), func(key, val []byte) error {
+		return tx.ScanPrefix(keys.SignalPrefix(storyID), func(key, val []byte) error {
 			stored++
 			return nil
 		})
@@ -168,7 +170,7 @@ func TestTracker_Ingest_CrossStoryMoveReingestDoesNotDuplicate(t *testing.T) {
 		LastSignalAt: time.Now(),
 	})
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		return moveSignal(tx, keySignal(storyA, sig.ID), keySignal(storyB, sig.ID))
+		return moveSignal(tx, keys.Signal(storyA, sig.ID), keys.Signal(storyB, sig.ID))
 	}))
 
 	// Re-ingestion must find the copy's batch-moved location and be a no-op:
@@ -178,11 +180,11 @@ func TestTracker_Ingest_CrossStoryMoveReingestDoesNotDuplicate(t *testing.T) {
 	assert.Equal(t, storyB, assigned2)
 
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keySignal(storyA, sig.ID)), "no copy may remain under the old story")
-		assert.NotNil(t, mustGet(t, tx, keySignal(storyB, sig.ID)), "the moved copy must stay put")
+		assert.Nil(t, mustGet(t, tx, keys.Signal(storyA, sig.ID)), "no copy may remain under the old story")
+		assert.NotNil(t, mustGet(t, tx, keys.Signal(storyB, sig.ID)), "the moved copy must stay put")
 
 		var copies int
-		for _, prefix := range [][]byte{keySignalPrefix(storyA), keySignalPrefix(storyB)} {
+		for _, prefix := range [][]byte{keys.SignalPrefix(storyA), keys.SignalPrefix(storyB)} {
 			require.NoError(t, tx.ScanPrefix(prefix, func(key, val []byte) error {
 				copies++
 				return nil
@@ -210,7 +212,7 @@ func TestTracker_Ingest_DeletesOutlierCopyOnAssignment(t *testing.T) {
 	require.NoError(t, err)
 	// Simulate a prior outlier copy of the same signal.
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		return tx.Put(keyOutlier(sig.ID), encoded)
+		return tx.Put(keys.Outlier(sig.ID), encoded)
 	}))
 
 	assigned, err := tr.Ingest(context.Background(), sig)
@@ -218,8 +220,8 @@ func TestTracker_Ingest_DeletesOutlierCopyOnAssignment(t *testing.T) {
 	assert.Equal(t, storyID, assigned)
 
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keyOutlier(sig.ID)), "stale outlier copy must be removed")
-		assert.NotNil(t, mustGet(t, tx, keySignal(storyID, sig.ID)))
+		assert.Nil(t, mustGet(t, tx, keys.Outlier(sig.ID)), "stale outlier copy must be removed")
+		assert.NotNil(t, mustGet(t, tx, keys.Signal(storyID, sig.ID)))
 		return nil
 	}))
 }
@@ -404,7 +406,7 @@ func TestWriteStoryMeta_TimeIndexMaintenance(t *testing.T) {
 func assertTimeIndex(t *testing.T, tr *Tracker[string], storyID uuid.UUID, at time.Time) {
 	t.Helper()
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		v := mustGet(t, tx, keyTimeIndex(at.Unix(), storyID))
+		v := mustGet(t, tx, keys.TimeIndex(at.Unix(), storyID))
 		require.NotNil(t, v, "time index entry missing for %v", at)
 		return nil
 	}))
@@ -530,7 +532,7 @@ func TestCollectBatch_OutlierEviction(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if err := tx.Put(keyOutlier(sig.ID), b); err != nil {
+			if err := tx.Put(keys.Outlier(sig.ID), b); err != nil {
 				return err
 			}
 		}
@@ -564,7 +566,7 @@ func TestTracker_saveCalibState_RoundTrip(t *testing.T) {
 	var b []byte
 	require.NoError(t, ms.View(func(tx Tx) error {
 		var err error
-		b, err = tx.Get(keyCalibState())
+		b, err = tx.Get(keys.CalibState())
 		return err
 	}))
 	var s calibState

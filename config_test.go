@@ -74,18 +74,6 @@ func TestConfig_validate(t *testing.T) {
 		assert.Equal(t, 30*24*time.Hour, cfg.ArchiveWindow)
 	})
 
-	t.Run("default_BatchSampleCap", func(t *testing.T) {
-		cfg := minimalConfig()
-		require.NoError(t, cfg.validate())
-		assert.Equal(t, 50_000, cfg.BatchSampleCap)
-	})
-
-	t.Run("default_SampleGuaranteeMaxFraction", func(t *testing.T) {
-		cfg := minimalConfig()
-		require.NoError(t, cfg.validate())
-		assert.Equal(t, 0.5, cfg.SampleGuaranteeMaxFraction)
-	})
-
 	t.Run("OutlierTTL_defaults_to_2x_BatchWindow", func(t *testing.T) {
 		cfg := minimalConfig()
 		cfg.BatchWindow = 3 * time.Hour
@@ -100,11 +88,11 @@ func TestConfig_validate(t *testing.T) {
 		assert.Equal(t, 5*time.Hour, cfg.OutlierTTL)
 	})
 
-	t.Run("explicit_MinSamples_preserved", func(t *testing.T) {
+	t.Run("explicit_MinStorySize_preserved", func(t *testing.T) {
 		cfg := minimalConfig()
-		cfg.MinSamples = 5
+		cfg.MinStorySize = 5
 		require.NoError(t, cfg.validate())
-		assert.Equal(t, 5, cfg.MinSamples)
+		assert.Equal(t, 5, cfg.MinStorySize)
 	})
 
 	t.Run("default_AssignmentK", func(t *testing.T) {
@@ -131,18 +119,6 @@ func TestConfig_validate(t *testing.T) {
 		assert.InDelta(t, 0.1, cfg.EMAAlpha, 1e-9)
 	})
 
-	t.Run("default_MappingMinJaccard", func(t *testing.T) {
-		cfg := minimalConfig()
-		require.NoError(t, cfg.validate())
-		assert.InDelta(t, 0.6, cfg.MappingMinJaccard, 1e-9)
-	})
-
-	t.Run("default_SplitMinJaccard", func(t *testing.T) {
-		cfg := minimalConfig()
-		require.NoError(t, cfg.validate())
-		assert.InDelta(t, 0.3, cfg.SplitMinJaccard, 1e-9)
-	})
-
 	t.Run("default_IngestBufferCap", func(t *testing.T) {
 		cfg := minimalConfig()
 		require.NoError(t, cfg.validate())
@@ -158,10 +134,27 @@ func TestConfig_validate(t *testing.T) {
 	t.Run("default_thresholds", func(t *testing.T) {
 		cfg := minimalConfig()
 		require.NoError(t, cfg.validate())
-		assert.InDelta(t, 0.28, cfg.AssignThreshold, 1e-9)
-		assert.InDelta(t, 0.22, cfg.MergeThreshold, 1e-9)
-		assert.InDelta(t, 0.30, cfg.SplitThreshold, 1e-9)
+		// Centred-space distances, roughly twice the raw-cosine scale these
+		// values used to carry; see internal/geom.
+		assert.InDelta(t, 0.50, cfg.AssignThreshold, 1e-9)
+		assert.InDelta(t, 0.40, cfg.MergeThreshold, 1e-9)
+		assert.InDelta(t, 0.55, cfg.SplitThreshold, 1e-9)
 		assert.Equal(t, 3, cfg.MinStorySize)
+		assert.InDelta(t, 0.9, cfg.MeanRemoval, 1e-9)
+	})
+
+	t.Run("MeanRemoval_bounds", func(t *testing.T) {
+		cfg := minimalConfig()
+		cfg.MeanRemoval = 1.5
+		assert.Error(t, cfg.validate())
+
+		cfg = minimalConfig()
+		cfg.MeanRemoval = -0.1
+		assert.Error(t, cfg.validate())
+
+		cfg = minimalConfig()
+		cfg.MeanRemoval = 1.0
+		assert.NoError(t, cfg.validate())
 	})
 
 	t.Run("explicit_thresholds_preserved", func(t *testing.T) {

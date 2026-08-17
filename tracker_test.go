@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"go.kvsh.ch/streaming-story/internal/keys"
+
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -48,7 +50,7 @@ func TestNewTracker(t *testing.T) {
 		b, err := json.Marshal(state)
 		require.NoError(t, err)
 		require.NoError(t, ms.Update(func(tx Tx) error {
-			return tx.Put(keyCalibState(), b)
+			return tx.Put(keys.CalibState(), b)
 		}))
 
 		tr, err := NewTracker[string](Config[string]{
@@ -198,7 +200,7 @@ func TestTracker_loadCalibState(t *testing.T) {
 		ms := newMemStore()
 		b, _ := json.Marshal(calibState{SigmaGlobal: 1.23, Dim: 128})
 		require.NoError(t, ms.Update(func(tx Tx) error {
-			return tx.Put(keyCalibState(), b)
+			return tx.Put(keys.CalibState(), b)
 		}))
 
 		tr := &Tracker[string]{cfg: Config[string]{Store: ms}}
@@ -222,7 +224,7 @@ func TestTracker_saveCalibState(t *testing.T) {
 
 	var got calibState
 	require.NoError(t, ms.View(func(tx Tx) error {
-		b, err := tx.Get(keyCalibState())
+		b, err := tx.Get(keys.CalibState())
 		if err != nil {
 			return err
 		}
@@ -257,7 +259,7 @@ func TestTracker_readStoryMeta(t *testing.T) {
 		}
 		b, _ := json.Marshal(rec)
 		require.NoError(t, ms.Update(func(tx Tx) error {
-			return tx.Put(keyStoryMeta(id), b)
+			return tx.Put(keys.StoryMeta(id), b)
 		}))
 
 		tr := &Tracker[string]{cfg: Config[string]{Store: ms}}
@@ -296,7 +298,7 @@ func TestTracker_Story(t *testing.T) {
 		}
 		b, _ := json.Marshal(rec)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return tx.Put(keyStoryMeta(id), b)
+			return tx.Put(keys.StoryMeta(id), b)
 		}))
 
 		meta, err := tr.Story(id)
@@ -379,7 +381,7 @@ func TestTracker_Signal(t *testing.T) {
 		b, err := tr.cfg.Codec.Encode(sig)
 		require.NoError(t, err)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keySignal(storyID, sigID), b); err != nil {
+			if err := tx.Put(keys.Signal(storyID, sigID), b); err != nil {
 				return err
 			}
 			return writeSignalLoc(tx, sigID, storyID, false)
@@ -405,7 +407,7 @@ func TestTracker_Signal(t *testing.T) {
 		b, err := tr.cfg.Codec.Encode(sig)
 		require.NoError(t, err)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keyOutlier(sigID), b); err != nil {
+			if err := tx.Put(keys.Outlier(sigID), b); err != nil {
 				return err
 			}
 			return writeSignalLoc(tx, sigID, uuid.Nil, true)
@@ -454,7 +456,7 @@ func TestTracker_Signal(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					if err := tx.Put(keySignal(sid, sigID), b); err != nil {
+					if err := tx.Put(keys.Signal(sid, sigID), b); err != nil {
 						return err
 					}
 					if err := writeSignalLoc(tx, sigID, sid, false); err != nil {
@@ -485,8 +487,8 @@ func TestTracker_Signal(t *testing.T) {
 
 		// The signal now lives under story A; Signal must follow the index.
 		require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-			assert.Nil(t, mustGet(t, tx, keySignal(storyB, trackedID)), "signal must leave retired story B")
-			assert.NotNil(t, mustGet(t, tx, keySignal(storyA, trackedID)), "signal must land under survivor story A")
+			assert.Nil(t, mustGet(t, tx, keys.Signal(storyB, trackedID)), "signal must leave retired story B")
+			assert.NotNil(t, mustGet(t, tx, keys.Signal(storyA, trackedID)), "signal must land under survivor story A")
 			return nil
 		}))
 
@@ -520,7 +522,7 @@ func TestTracker_Signal(t *testing.T) {
 		tr := newTestTracker(t)
 		sigID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return tx.Put(keySignalLoc(sigID), []byte("invalid-loc-format"))
+			return tx.Put(keys.SignalLoc(sigID), []byte("invalid-loc-format"))
 		}))
 
 		_, err := tr.Signal(sigID)
@@ -533,7 +535,7 @@ func TestTracker_Signal(t *testing.T) {
 		sigID := uuid.New()
 		storyID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keySignal(storyID, sigID), []byte("{invalid json")); err != nil {
+			if err := tx.Put(keys.Signal(storyID, sigID), []byte("{invalid json")); err != nil {
 				return err
 			}
 			return writeSignalLoc(tx, sigID, storyID, false)
@@ -557,7 +559,7 @@ func TestTracker_Signal(t *testing.T) {
 		sigID := uuid.New()
 		storyID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keySignal(storyID, sigID), []byte("payload")); err != nil {
+			if err := tx.Put(keys.Signal(storyID, sigID), []byte("payload")); err != nil {
 				return err
 			}
 			return writeSignalLoc(tx, sigID, storyID, false)
@@ -579,7 +581,7 @@ func TestTracker_Signal(t *testing.T) {
 		b, err := tr.cfg.Codec.Encode(sig)
 		require.NoError(t, err)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keySignal(storyID, sigID), b); err != nil {
+			if err := tx.Put(keys.Signal(storyID, sigID), b); err != nil {
 				return err
 			}
 			if err := writeSignalLoc(tx, sigID, storyID, false); err != nil {

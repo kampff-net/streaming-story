@@ -122,11 +122,10 @@ func TestIngestDuringApplyReturnsProvisionalStory(t *testing.T) {
 		release:  make(chan struct{}),
 	}
 	tr, err := NewTracker[string](Config[string]{
-		Store:          store,
-		Codec:          JSONCodec[string]{},
-		BatchInterval:  time.Hour,
-		MinClusterSize: 3,
-		MinSamples:     1,
+		Store:         store,
+		Codec:         JSONCodec[string]{},
+		BatchInterval: time.Hour,
+		MinStorySize:  3,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = tr.Close() })

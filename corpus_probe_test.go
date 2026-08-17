@@ -14,7 +14,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"go.kvsh.ch/streaming-story/internal/cluster"
 	"go.kvsh.ch/streaming-story/internal/dist"
+	"go.kvsh.ch/streaming-story/internal/geom"
 )
 
 func TestCorpusProbe(t *testing.T) {
@@ -67,12 +69,19 @@ func probeReport(t *testing.T, tr *Tracker[string], total int, label string) {
 		label, len(sizes), assigned, total-assigned, largest, shown)
 
 	// Diagnose the largest story: why is split declining to cut it?
+	//
+	// Signals are stored raw, so every embedding read back here has to be put
+	// through the projector before it is measured. Without that these numbers
+	// describe a geometry the maintenance pass never sees.
+	p := tr.projector()
 	var big []*batchSignal
 	for meta := range tr.Stories(StoryStateAny) {
 		var group []*batchSignal
 		for sig, err := range tr.SignalsOf(meta.ID) {
 			if err == nil {
-				group = append(group, &batchSignal{id: sig.ID, at: sig.At, emb: sig.Embedding})
+				group = append(group, &batchSignal{
+					id: sig.ID, at: sig.At, emb: p.Project(sig.Embedding),
+				})
 			}
 		}
 		if len(group) > len(big) {
@@ -81,8 +90,9 @@ func probeReport(t *testing.T, tr *Tracker[string], total int, label string) {
 	}
 	if len(big) >= 2*tr.cfg.MinStorySize {
 		r := radiusOf(big)
-		gate := maxAngularSeparation(r)
-		a, b := twoMedoids(big)
+		gate := geom.MaxAngularSeparation(r)
+		pts := clusterPoints(big)
+		a, b := cluster.TwoMedoids(pts)
 		seedSep := dist.CosineDistance(big[a].emb, big[b].emb)
 		res, ok := tr.splitStory(big, r)
 		sep := 0.0

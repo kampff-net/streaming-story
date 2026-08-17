@@ -1,16 +1,30 @@
 # Streaming Story Tracker (`go.kvsh.ch/streaming-story`)
 
-`go.kvsh.ch/streaming-story` is a Go library for ingesting a continuous stream of semantic vector signals and grouping them into evolving, real-time stories.
+A Go library for ingesting a continuous stream of embedding vectors ("signals")
+and grouping them into evolving clusters ("stories") — incremental topic
+clustering for news-shaped data, with stable cluster identity over time.
 
-It implements a **Hybrid Clustering** approach:
-1. **Real-time Ingestion (Draft Phase)**: Immediate low-latency signal assignment to the nearest active story centroid based on cosine similarity and dynamic adaptive thresholding.
-2. **Periodic Maintenance (Refinement Phase)**: An asynchronous background pass that refines the existing story structure — promoting groups of outliers, splitting stories that have diverged, and merging those that have converged — without re-deriving stories from scratch. Story identity is therefore stable across runs.
+Two phases:
+
+1. **Draft phase** — real time. Each arriving signal is assigned to the nearest
+   story centroid if it falls inside that story's adaptive radius, and held as an
+   outlier otherwise. Low latency, provisional.
+2. **Maintenance phase** — periodic, background. Existing stories are
+   *maintained*, not re-derived: evict, promote, admit, split, merge, recentre,
+   lifecycle. Story IDs therefore survive across runs, and a re-run over
+   unchanged data changes nothing.
+
+Distances are measured in **centred space**: the corpus mean is subtracted before
+any comparison, which is what keeps embeddings from collapsing into a single
+blob. Every threshold below is a centred-space distance —
+see [Geometry](DESIGN.md#geometry-centred-space).
 
 ---
 
 ## Installation
 
-Requires **Go 1.26.5+** (uses standard library range-over-func iterators `iter.Seq` / `iter.Seq2`).
+Requires **Go 1.26.5+** (uses `iter.Seq` / `iter.Seq2` range-over-func
+iterators).
 
 ```bash
 go get go.kvsh.ch/streaming-story
@@ -18,111 +32,92 @@ go get go.kvsh.ch/streaming-story
 
 ---
 
-## Architecture & Concepts
+## Concepts
 
-* **Signal**: Atomic input element containing a UUID, timestamp, `float32` vector embedding, and opaque payload `T`.
-* **Story**: Persistent semantic cluster with a calculated centroid, radius, creation timestamp, and state (`Active`, `Dormant`, `Archived`).
-* **Tiered Temporal Windows**:
-  - **Tier 1 (Ingestion)**: 1 signal at a time for immediate provisional draft assignment.
-  - **Tier 2 (Batch Window)**: Bounds outlier retention and lifecycle transitions for the periodic maintenance pass.
-  - **Tier 3 (Active Context)**: Recent stories (default: 30d) used as centroid anchors.
+- **Signal** — one input: UUID v5 ID, timestamp, `[]float32` embedding, and an
+  opaque payload `T`. Embedding dimensionality is fixed by the first ingest.
+- **Story** — a persistent cluster. Carries `Centroid` (mean of all members, the
+  identity geometry), `RecentCentroid` (mean of recent members, what admission
+  compares against), radius, per-story statistics, and a lifecycle state.
+- **Outlier** — a signal no story covers yet. Held in its own bucket for the next
+  maintenance pass to promote, admit, or evict.
+- **Lifecycle** — `Active → Dormant → Archived`, on `SilenceWindow` and
+  `ArchiveWindow`. Dormant can reactivate; Archived is terminal. Signals are
+  retained in every state.
+- **Store** — any prefix-scannable KV store with lexicographic byte ordering
+  (bbolt, LevelDB, …). `MemStore` ships for tests.
 
 ---
 
-## Quickstart & Usage
+## Quickstart
 
-### 1. Implement a `Codec[T]` for Payload Persistence
+### 1. Create a tracker
 
-Define a codec to serialize and deserialize your custom payload type `T`:
-
-```go
-package main
-
-import (
-	"encoding/json"
-	"go.kvsh.ch/streaming-story"
-)
-
-type ArticlePayload struct {
-	Title   string `json:"title"`
-	Source  string `json:"source"`
-	Content string `json:"content"`
-}
-
-type JSONCodec struct{}
-
-func (c JSONCodec) Encode(sig story.Signal[ArticlePayload]) ([]byte, error) {
-	return json.Marshal(sig)
-}
-
-func (c JSONCodec) Decode(b []byte) (story.Signal[ArticlePayload], error) {
-	var sig story.Signal[ArticlePayload]
-	err := json.Unmarshal(b, &sig)
-	return sig, err
-}
-```
-
-### 2. Initialize the Tracker
-
-Create a `Tracker[T]` instance with your store backend and codec:
+`JSONCodec[T]` and `MemStore` ship with the library, so a working tracker needs
+no custom types:
 
 ```go
 package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
-	"github.com/google/uuid"
-	"go.kvsh.ch/streaming-story"
+	story "go.kvsh.ch/streaming-story"
 )
 
+type Article struct {
+	Title  string `json:"title"`
+	Source string `json:"source"`
+}
+
 func main() {
-	// Initialize your Store implementation (e.g. in-memory or KV backend)
-	store := NewMyStoreBackend()
-
-	cfg := story.Config[ArticlePayload]{
-		Store:         store,
-		Codec:         JSONCodec{},
-		BatchWindow:   24 * time.Hour,
+	tracker, err := story.NewTracker(story.Config[Article]{
+		Store:         story.NewMemStore(),        // required; swap for bbolt/LevelDB in production
+		Codec:         story.JSONCodec[Article]{}, // required
 		BatchInterval: 30 * time.Minute,
-	}
-
-	tracker, err := story.NewTracker(cfg)
+		OnBatchError:  func(err error) { log.Printf("batch: %v", err) },
+	})
 	if err != nil {
-		log.Fatalf("failed to create tracker: %v", err)
+		log.Fatal(err)
 	}
 	defer tracker.Close()
 
-	// Derive deterministic UUID v5 Signal ID using TrackerNamespace
-	domainKey := "article-12345"
-	sigID := uuid.NewSHA1(story.TrackerNamespace, []byte(domainKey))
-
-	sig := story.Signal[ArticlePayload]{
-		ID:        sigID,
+	sig := story.Signal[Article]{
+		ID:        tracker.SignalID("article-12345"), // deterministic UUID v5
 		At:        time.Now(),
 		Embedding: []float32{0.12, -0.43, 0.88 /* ... */},
-		Data: ArticlePayload{
-			Title:  "Breaking News Event",
-			Source: "Wire",
-		},
+		Data:      Article{Title: "Breaking News Event", Source: "Wire"},
 	}
 
-	// Ingest signal real-time
 	storyID, err := tracker.Ingest(context.Background(), sig)
 	if err != nil {
-		log.Fatalf("ingest error: %v", err)
+		log.Fatal(err)
 	}
-
-	fmt.Printf("Signal ingested into provisional StoryID: %s\n", storyID)
+	// storyID is uuid.Nil when the signal was held as an outlier, and is
+	// provisional otherwise: the next maintenance pass may move it.
+	log.Printf("provisional story: %s", storyID)
 }
 ```
 
-### 3. Subscribe to Real-Time & Refinement Events
+Use `tracker.SignalID(domainKey)` rather than `uuid.NewSHA1` directly — it
+honours a configured `Namespace`. Deterministic IDs make re-ingesting the same
+signal a no-op.
 
-`Subscribe()` returns a caller-independent channel delivering real-time draft assignments and batch structural updates:
+A custom `Codec` is only needed for binary encodings:
+
+```go
+type Codec[T any] interface {
+	Encode(sig Signal[T]) ([]byte, error)
+	Decode(b []byte) (Signal[T], error)
+}
+```
+
+### 2. Subscribe to events
+
+`Subscribe()` returns an independent, buffered channel per caller, closed when
+the tracker closes:
 
 ```go
 events := tracker.Subscribe()
@@ -131,73 +126,170 @@ go func() {
 	for ev := range events {
 		switch ev.Kind {
 		case story.EventDraftAssigned:
-			fmt.Printf("[Real-time] Signal %s provisionally assigned to Story %s\n", ev.SignalID, ev.StoryID)
-		case story.EventStoryMerged:
-			fmt.Printf("[Batch] Story %s merged into surviving Story %s\n", ev.StoryID2, ev.StoryID)
-		case story.EventStoryRetired:
-			fmt.Printf("[Batch] Story %s retired (emptied by re-clustering)\n", ev.StoryID)
+			log.Printf("signal %s provisionally in story %s", ev.SignalID, ev.StoryID)
+		case story.EventStoryCreated:
+			log.Printf("story %s created", ev.StoryID)
 		case story.EventStorySplit:
-			fmt.Printf("[Batch] Story %s split into child Story %s\n", ev.StoryID, ev.StoryID2)
+			log.Printf("story %s split off child %s", ev.StoryID, ev.StoryID2)
+		case story.EventStoryMerged:
+			log.Printf("story %s absorbed retired story %s", ev.StoryID, ev.StoryID2)
+		case story.EventStoryRetired:
+			log.Printf("story %s retired (emptied)", ev.StoryID)
 		case story.EventBatchComplete:
-			fmt.Printf("[Batch] Re-clustering complete: %d created, %d merged, %d split, %d retired\n",
-				ev.BatchSummary.StoriesCreated, ev.BatchSummary.StoriesMerged, ev.BatchSummary.StoriesSplit, ev.BatchSummary.StoriesRetired)
+			s := ev.BatchSummary
+			log.Printf("batch: +%d stories, %d merged, %d split, %d promoted, %d admitted",
+				s.StoriesCreated, s.StoriesMerged, s.StoriesSplit,
+				s.OutliersPromoted, s.OutliersAdmitted)
+		case story.EventBufferOverflow:
+			log.Print("subscriber fell behind; events were dropped")
 		}
 	}
 }()
 ```
 
-### 4. Traverse Stories and Signals (Go 1.22 Iterators)
+| Event | Meaning |
+|---|---|
+| `EventDraftAssigned` | Real-time assignment; provisional. |
+| `EventSignalReassigned` | A maintenance pass moved a signal (promotion, admission, split, or merge). |
+| `EventStoryCreated` | New story persisted. |
+| `EventStorySplit` | One story became two; `StoryID2` is the new child. |
+| `EventStoryMerged` | Two became one; `StoryID2` is the retired ID. |
+| `EventStoryRetired` | A pass emptied the story and deleted its record. |
+| `EventStoryDormant` / `EventStoryArchived` | Lifecycle transitions. |
+| `EventBatchComplete` | One per run; `BatchSummary` is populated. |
+| `EventBufferOverflow` | Channel was full; events were dropped. |
 
-Use Go 1.22 range-over-func iterators for zero-allocation traversal:
+A run touching many signals emits many `EventSignalReassigned` before
+`EventBatchComplete`. Slow subscribers should consume `EventBatchComplete` for
+coarse progress and query the store for detail, or raise `EventBufferSize`.
+
+### 3. Read stories and signals
 
 ```go
-// Iterate all Active stories
-for meta := range tracker.Stories(story.StoryStateActive) {
-	fmt.Printf("Active Story %s (Created: %s, Radius: %.4f)\n",
-		meta.ID, meta.CreatedAt.Format(time.RFC3339), meta.Radius)
+for meta := range tracker.Stories(story.StoryStateActive) { // StoryStateAny for all
+	log.Printf("story %s: %d signals, radius %.3f, created %s",
+		meta.ID, meta.SignalCount, meta.Radius, meta.CreatedAt.Format(time.RFC3339))
 
-	// Traversal over signals belonging to story
 	for sig, err := range tracker.SignalsOf(meta.ID) {
 		if err != nil {
-			log.Printf("error reading signal: %v", err)
+			log.Printf("read error: %v", err)
 			continue
 		}
-		fmt.Printf("  └─ Signal %s: %s\n", sig.ID, sig.Data.Title)
+		log.Printf("  └─ %s: %s", sig.ID, sig.Data.Title)
 	}
 }
 ```
+
+`Story(id)` fetches one story (`ErrNotFound` if absent). `Signal(id)` fetches one
+signal whether it lives in a story or the outlier bucket.
 
 ---
 
 ## Configuration Reference
 
-| Parameter | Default | Description |
+`Config` has no dead fields: every parameter below is read by the running
+tracker. Only `Store` and `Codec` are required, and every other field defaults —
+a zero value always means "use the default", so no parameter can be *set* to
+zero. `MeanRemoval: 0` yields 0.9; pass a small epsilon if you genuinely want
+raw geometry (you do not — see [Tuning](#tuning)).
+
+`validate()` runs at `NewTracker` and rejects incoherent combinations rather than
+silently correcting them: `AssignThreshold` outside `(0, 1]`, `MergeThreshold` at
+or above `AssignThreshold`, `SplitThreshold` at or below `MergeThreshold` or above
+1, `MeanRemoval` outside `[0, 1]`, and `MinStorySize` below 2.
+
+### Required
+
+| Parameter | Effect |
+|---|---|
+| `Store` | The persistence backend. Must give lexicographic byte ordering — the range scans over the time index and story prefixes depend on it. `NewMemStore()` for tests. |
+| `Codec` | Encodes and decodes `Signal[T]`. `JSONCodec[T]{}` unless you need a binary format for large embeddings or a tight latency budget. |
+
+### Identity
+
+| Parameter | Default | Effect |
 |---|---|---|
-| `BatchWindow` | `24h` | Sliding temporal window bounding outlier retention and lifecycle transitions. |
-| `BatchInterval` | `30m` | Interval between background maintenance runs. |
-| `SilenceWindow` | `7d` | Inactivity threshold before an Active story transitions to `Dormant`. |
-| `ArchiveWindow` | `30d` | Inactivity threshold before a Dormant story transitions to `Archived`. |
-| `ActiveContextWindow` | `30d` | How far back the `t:` time index anchors Draft-phase story lookup. |
-| `OutlierTTL` | `2×BatchWindow` | Max outlier age relative to the last batch timestamp. |
-| `AssignThreshold` | `0.28` | Max cosine distance for a signal to join a story. |
-| `MergeThreshold` | `0.22` | At or below this centroid distance, two stories merge. |
-| `SplitThreshold` | `0.30` | Above this best-partition distance, a story splits. Must exceed `MergeThreshold`. |
-| `MinStorySize` | `3` | Signals required for a group to be a story. |
-| `BatchSampleCap` | `50,000` | Maximum signals processed per batch run; excess is sampled. |
-| `SampleGuaranteeMaxFraction` | `0.5` | Max fraction of the sample cap reserved for per-story minimums. |
-| `AssignmentK` | `2.0` | $\sigma$-multiplier for draft distance threshold $T_{\text{assign}}(\text{story})$. |
-| `ColdStartMinSignals` | `5` | Signal count before a story's own $\sigma$ is trusted. |
-| `SigmaFloor` | `0.1` | Per-story $\sigma$ floor as a fraction of $\sigma_{global}$. |
-| `EMAAlpha` | `0.1` | EMA decay for $\sigma_{global}$ updates. |
-| `MappingMinJaccard` | `0.6` | Jaccard threshold for primary cluster continuation. |
-| `SplitMinJaccard` | `0.3` | Jaccard threshold for split/merge detection. |
-| `IngestBufferCap` | `10,000` | In-memory staging channel capacity during active batch persistence transactions. |
-| `EventBufferSize` | `512` | Per-subscriber event channel buffer depth. |
+| `Namespace` | `TrackerNamespace` | UUID v5 namespace root that `SignalID(domainKey)` derives from. Set it per tenant to isolate multi-tenant deployments. Changing it changes every derived ID, so the same domain key becomes a different signal. |
+
+### Cadence and lifecycle
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `BatchInterval` | `30m` | How often the maintenance pass runs. **This is the only thing that promotes, admits, splits, or merges** — the Draft phase alone never restructures anything. Lower it for faster structural correction, at proportional CPU cost. |
+| `BatchWindow` | `24h` | Reference span for outlier retention, and nothing else: it sets `OutlierTTL`'s default to `2×BatchWindow`. It does **not** bound clustering input — story membership is read in full on every pass, because the lifetime centroid is the mean of every member. Set `OutlierTTL` directly and this parameter stops mattering. |
+| `OutlierTTL` | `2×BatchWindow` | How long an unmatched signal is kept before eviction, measured against the **last batch timestamp** rather than wall clock, so a long maintenance pause cannot trigger mass eviction. Raise it to give sparse topics more time to accumulate `MinStorySize` corroborating signals. |
+| `SilenceWindow` | `7d` | Inactivity before Active → Dormant. A Dormant story keeps its centroid, can still be a merge target, and can reactivate through Draft assignment. |
+| `ArchiveWindow` | `30d` | Inactivity before Dormant → Archived, which is terminal: never collected, never an anchor, never reactivated. Signals are retained regardless and stay iterable. |
+| `ActiveContextWindow` | `ArchiveWindow` | Two effects. It bounds how far back the time index is scanned for Draft anchors, so stories quieter than this stop admitting new signals; and it defines which members make up `RecentCentroid`. Shorten it to make stories track current coverage more tightly and go quiet sooner. |
+
+### Geometry and thresholds
+
+Every distance here is a **centred-space** cosine distance — the corpus mean is
+subtracted before anything is measured — which puts the scale at roughly twice
+raw cosine. A threshold copied from a raw-cosine configuration will be far too
+tight.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `MeanRemoval` | `0.9` | Fraction of the corpus mean subtracted before any distance. The most consequential parameter in the file: at `0` the geometry is raw, unrelated stories look identical, and the reference corpus collapses to 2 stories with a 581-signal blob; at `1.0` a corpus that is itself one tight group shatters into antipodal halves. Raise toward 0.95 to sharpen separation on a diverse corpus, lower toward 0.8 for stability on a narrow one. |
+| `AssignThreshold` | `0.50` | Three roles: the maximum distance for a signal to join a story, the radius a promoted group must fit inside, and the hard ceiling on each story's adaptive radius — so a story that has drifted wide cannot keep widening its own catchment. Raising it increases coverage and lowers story count. |
+| `MergeThreshold` | `0.40` | At or below this centroid distance two stories are treated as one, provided the union is not something the split step would immediately cut. Raise it to reunite a fragmented topic; must stay below `AssignThreshold`, since stories may not merge at a distance wider than a signal may sit from a centroid. |
+| `SplitThreshold` | `0.55` | Above this best-partition distance a story divides in two. Must exceed `MergeThreshold`: the gap between them is the hysteresis band, and narrowing it lets a merge and a split undo each other along different seams, churning story IDs while the data sits still. |
+| `MinStorySize` | `3` | How much corroboration makes a story: it gates outlier promotion and both sides of every split. Raise it for high-frequency sources; below 2 is rejected, since a one-signal story is an outlier by another name. |
+
+### Draft-phase admission
+
+A story's admission radius is `MeanDistance + AssignmentK × σ`, clamped to
+`AssignThreshold`. These four parameters shape that expression, and the same
+expression governs outlier admission during maintenance.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `AssignmentK` | `2.0` | σ multiplier for the radius. Higher admits more freely; this is the knob for "how far outside its usual spread may a story reach". |
+| `ColdStartMinSignals` | `5` | Members a story needs before its own σ is trusted. Below it the radius is `AssignmentK × σ_global`, so young stories borrow the corpus-wide spread instead of their own unreliable one. |
+| `SigmaFloor` | `0.1` | Floors a story's σ at this fraction of σ_global, so a story whose first signals are near-identical cannot collapse its radius to zero and stop admitting its own coverage. Applies after cold-start too. |
+| `InitialSigmaGlobal` | `0.25` | Stand-in for σ_global until a pass measures one. Narrow reach: a story can only exist after a pass, and a pass seeds σ_global, so this only sets the admission radius during the very first pass, for the stories that pass just created. |
+| `EMAAlpha` | `0.1` | Weight given to the **previous** σ_global when a pass updates it: `σ_global ← EMAAlpha×σ_global + (1−EMAAlpha)×mean_this_pass`. The default therefore tracks the newest measurement at 90% rather than smoothing. Raise toward 1 to make σ_global sluggish. |
+
+### Concurrency and observability
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `IngestBufferCap` | `10,000` | Signals held in memory while a pass owns the write transaction. A full buffer applies back-pressure — `Ingest` blocks until space frees or `ctx` is cancelled — and buffered signals are lost if the process dies before the drain, which is the library's one **at-most-once** window. |
+| `EventBufferSize` | `512` | Per-subscriber channel depth. On overflow the subscriber receives `EventBufferOverflow` in place of the dropped events, so a slow consumer degrades visibly rather than silently. |
+| `OnBatchError` | `nil` | Called with any error that aborts a pass. A failed pass leaves the store untouched and the next tick retries, so **this is the only way to observe batch failures**. Runs on the batch goroutine; must not block. |
 
 ---
 
-## Specifications & Development
+## Tuning
 
-For deep architectural design and component specifications:
-- [Design Architecture (`DESIGN.md`)](DESIGN.md)
-- [Spec-Driven Development Specs (`spec/README.md`)](spec/README.md)
+Defaults are calibrated for low-to-medium frequency news (1–10 signals/day per
+topic) against a 596-signal reference corpus of roughly 20–30 topics, where they
+produce 32 stories with a largest of 28 and no drift across repeated runs.
+
+| Symptom | What to change |
+|---|---|
+| Too many signals stuck as outliers | Raise `AssignThreshold`, or lower `MeanRemoval` toward 0.8. Both trade cluster count for coverage: on the reference corpus 0.8 gives 34 stories over 260 signals against 32 over 234 at 0.9. |
+| Clusters too coarse — unrelated topics together | Raise `MeanRemoval` toward 0.95, or lower `AssignThreshold` and `MergeThreshold`. |
+| Clusters too fragmented — one topic in several stories | Raise `MergeThreshold` (keeping it below `AssignThreshold`), or lower `MinStorySize`. |
+| One story swallowing everything | `MeanRemoval` is too low. This is the anisotropy collapse; at `0` the reference corpus becomes 2 stories with a 581-signal blob. |
+| Story IDs churn between runs | `SplitThreshold` and `MergeThreshold` are too close. Widen the hysteresis band. |
+| High-frequency source (social, metrics) | Reduce `BatchWindow` (e.g. 30m), `BatchInterval` (5m), `SilenceWindow` (6h), `ArchiveWindow` (7d); raise `MinStorySize` (5–10). |
+| Structure corrects too slowly | Lower `BatchInterval`. Maintenance is the only thing that splits, merges, promotes, or admits. |
+| Assignments shuffling between stories | Give the first pass more to work with. Measured on the reference corpus, a 400-signal seed followed by increments of 50, 20, or 5 produces **zero** churn, while a 300-signal seed produces 0.4–1.0%: a seed too small for the topic count leaves the early stories unrepresentative. |
+
+Recalibrating for a different embedding model or source mix means re-measuring:
+the corpus probe (`CORPUS=path go test -run TestCorpusProbe -v .`) reports story
+count, size distribution, and outlier fraction per pass, and
+`TestStreaming_IncrementalArrivalsAreStable` reports churn under incremental
+arrival.
+
+---
+
+## Further Reading
+
+- [`DESIGN.md`](DESIGN.md) — architecture, algorithms, key schema, concurrency
+  model, and the reasoning behind each rule.
+- [`HISTORY.md`](HISTORY.md) — approaches that were implemented, measured, and
+  removed, and why. Read before reintroducing one.
+- [`spec/`](spec/README.md) — spec-driven development specifications.

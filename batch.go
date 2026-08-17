@@ -1,27 +1,24 @@
 package story
 
+// Batch plumbing: collection from the store, the apply window that redirects
+// Ingest, the snapshot that answers Draft lookups while it is open, and the
+// buffer drain. The decisions themselves are in maintain.go.
+
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
+	"go.kvsh.ch/streaming-story/internal/dist"
+	"go.kvsh.ch/streaming-story/internal/geom"
+	"go.kvsh.ch/streaming-story/internal/keys"
 )
 
-// errStopIteration terminates a range scan early; the caller checks for it
-// with errors.Is to distinguish a requested stop from a real failure.
-var errStopIteration = errors.New("stop iteration")
-
-// batchSignal is one signal collected for a batch run.
-type batchSignal struct {
-	id      uuid.UUID
-	at      time.Time
-	emb     []float32
-	storyID uuid.UUID // current story assignment; uuid.Nil for outlier signals
-	outlier bool      // stored under the o: prefix
-}
+// Batch plumbing: collection from the store, the apply window that redirects
+// Ingest, and the buffer drain. The decisions themselves are in maintain.go.
 
 // runBatch executes one full batch re-clustering cycle.
 func (t *Tracker[T]) runBatch() {
@@ -77,11 +74,18 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 		return &BatchSummary{}
 	}
 
+	// Establish this run's geometry before any distance is measured. The mean
+	// comes from the full collected membership, so it is a property of the
+	// stored data rather than of how many runs have happened, and every
+	// centroid recomputed below lands in the same space (geometry.go).
+	mean := corpusMeanOf(signals)
+	projectAll(geom.Projector{Mean: mean, Strength: float32(t.cfg.MeanRemoval)}, signals)
+
 	// Only the write transaction needs the ingest path redirected: collection
 	// is read-only, and every maintenance decision is computed inside the
 	// write transaction from state already in hand.
 	t.beginApplyWindow(stories)
-	summary, events, err := t.applyMaintenance(signals, stories, evict, now)
+	summary, events, err := t.applyMaintenance(signals, stories, evict, mean, now)
 	t.endApplyWindow()
 	if err != nil {
 		t.reportBatchError(fmt.Errorf("story: batch apply: %w", err))
@@ -135,7 +139,7 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchSignal, map[uuid
 	)
 
 	err := tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
-		id, ok := parseStoryMetaKey(key)
+		id, ok := keys.ParseStoryMeta(key)
 		if !ok {
 			return nil
 		}
@@ -151,7 +155,7 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchSignal, map[uuid
 		// Collect every member. The lifetime centroid is the mean of all of
 		// them (spec 006 §2.7), so a window-scoped read would compute a
 		// different, drifting centre.
-		return tx.ScanPrefix(keySignalPrefix(id), func(sigKey, sigVal []byte) error {
+		return tx.ScanPrefix(keys.SignalPrefix(id), func(sigKey, sigVal []byte) error {
 			sig, err := t.cfg.Codec.Decode(sigVal)
 			if err != nil {
 				return nil
@@ -231,32 +235,109 @@ func moveSignal(tx Tx, from, to []byte) error {
 	if err := tx.Delete(from); err != nil {
 		return err
 	}
-	sigID, ok := parseSignalIDFromLocKey(to)
+	sigID, ok := keys.ParseSignalIDFromLoc(to)
 	if !ok {
 		return nil
 	}
-	if isOutlierKey(to) {
+	if keys.IsOutlier(to) {
 		return writeSignalLoc(tx, sigID, uuid.Nil, true)
 	}
-	storyID, ok := parseStoryIDFromSignalKey(to)
+	storyID, ok := keys.ParseStoryIDFromSignal(to)
 	if !ok {
 		return fmt.Errorf("move signal: cannot parse destination story from %q", to)
 	}
 	return writeSignalLoc(tx, sigID, storyID, false)
 }
 
-// parseSignalKey extracts the signal ID from a "s:{storyID}:s:{signalID}" key
-// given the key's prefix.
-func parseSignalKey(key, prefix []byte) (uuid.UUID, bool) {
-	if len(key) <= len(prefix) {
-		return uuid.Nil, false
-	}
-	id, err := uuid.Parse(string(key[len(prefix):]))
-	if err != nil {
-		return uuid.Nil, false
-	}
-	return id, true
+// migrateSignals moves every signal key under from into to.
+func migrateSignals(tx Tx, from, to uuid.UUID) error {
+	prefix := keys.SignalPrefix(from)
+	return tx.ScanPrefix(prefix, func(key, val []byte) error {
+		sigID, ok := keys.ParseSignal(key, prefix)
+		if !ok {
+			return nil
+		}
+		return moveSignal(tx, key, keys.Signal(to, sigID))
+	})
 }
 
-// jaccardIndex returns the Jaccard similarity between two index sets, 0 if
-// either is empty.
+// The Draft answers served from memory while a batch run holds the write
+// transaction.
+
+// draftSnapshot is an immutable copy of the story metadata a batch run
+// collected, published for the duration of the Apply transaction.
+//
+// It exists because the Store contract does not promise that View may run
+// concurrently with Update — single-lock backends (MemStore among them) would
+// block a Draft lookup for the whole Apply, which is exactly the stall the
+// ingest buffer exists to avoid. Answering from memory keeps Ingest wait-free
+// while still using last-batch centroids, which is what the Draft phase reads
+// at any other time.
+type draftSnapshot struct {
+	stories []snapshotStory
+}
+
+// snapshotStory is one story's Draft-relevant metadata.
+type snapshotStory struct {
+	meta StoryMeta
+}
+
+// newDraftSnapshot builds a snapshot from the story records a batch run has
+// already read. Archived stories and stories with no centroid are omitted:
+// neither can be a Draft anchor.
+func newDraftSnapshot(stories map[uuid.UUID]storyRecord) *draftSnapshot {
+	snap := &draftSnapshot{stories: make([]snapshotStory, 0, len(stories))}
+	for id, rec := range stories {
+		if rec.State == StoryStateArchived || len(rec.Centroid) == 0 {
+			continue
+		}
+		snap.stories = append(snap.stories, snapshotStory{meta: storyMetaFromRecord(id, rec)})
+	}
+	return snap
+}
+
+// publishDraftSnapshot makes snap the source of Draft answers until it is
+// cleared.
+func (t *Tracker[T]) publishDraftSnapshot(stories map[uuid.UUID]storyRecord) {
+	t.draftSnapshot.Store(newDraftSnapshot(stories))
+}
+
+// clearDraftSnapshot drops the snapshot so Draft lookups go back to the store.
+func (t *Tracker[T]) clearDraftSnapshot() {
+	t.draftSnapshot.Store(nil)
+}
+
+// provisionalStory returns the story a signal would be assigned to, computed
+// against the published snapshot rather than the store. It returns uuid.Nil
+// when no story is within its adaptive threshold, or when no snapshot is
+// published.
+//
+// The answer is provisional in the same sense as any Draft assignment: the
+// Apply transaction running concurrently may merge, retire, or re-shape the
+// named story. The buffered signal is re-ingested for real once Apply
+// commits, and that placement is the authoritative one.
+func (t *Tracker[T]) provisionalStory(emb []float32, now time.Time) uuid.UUID {
+	snap := t.draftSnapshot.Load()
+	if snap == nil {
+		return uuid.Nil
+	}
+
+	cutoff := now.Add(-t.cfg.ActiveContextWindow)
+	best := uuid.Nil
+	bestDist := math.MaxFloat64
+	var bestMeta StoryMeta
+
+	for _, s := range snap.stories {
+		if s.meta.LastSignalAt.Before(cutoff) {
+			continue
+		}
+		d := dist.CosineDistance(emb, s.meta.Centroid)
+		if d < bestDist {
+			bestDist, best, bestMeta = d, s.meta.ID, s.meta
+		}
+	}
+	if best == uuid.Nil || bestDist > t.calcThreshold(bestMeta) {
+		return uuid.Nil
+	}
+	return best
+}

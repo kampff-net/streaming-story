@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"go.kvsh.ch/streaming-story/internal/keys"
+
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,20 +15,20 @@ import (
 
 func TestParseSignalKey(t *testing.T) {
 	sid := uuid.New()
-	prefix := keySignalPrefix(uuid.New())
-	id, ok := parseSignalKey(keySignal(uuid.New(), sid), prefix)
+	prefix := keys.SignalPrefix(uuid.New())
+	id, ok := keys.ParseSignal(keys.Signal(uuid.New(), sid), prefix)
 	assert.True(t, ok)
 	assert.Equal(t, sid, id)
 
-	_, ok = parseSignalKey([]byte("s:short"), prefix)
+	_, ok = keys.ParseSignal([]byte("s:short"), prefix)
 	assert.False(t, ok)
-	_, ok = parseSignalKey(prefix, prefix)
+	_, ok = keys.ParseSignal(prefix, prefix)
 	assert.False(t, ok)
 }
 func TestMoveSignal(t *testing.T) {
 	ms := newMemStore()
-	from := keySignal(uuid.New(), uuid.New())
-	to := keyOutlier(uuid.New())
+	from := keys.Signal(uuid.New(), uuid.New())
+	to := keys.Outlier(uuid.New())
 
 	require.NoError(t, ms.Update(func(tx Tx) error {
 		return tx.Put(from, []byte("payload"))
@@ -47,7 +49,7 @@ func TestMoveSignal(t *testing.T) {
 
 	// Moving a missing key is a no-op.
 	require.NoError(t, ms.Update(func(tx Tx) error {
-		return moveSignal(tx, keySignal(uuid.New(), uuid.New()), to)
+		return moveSignal(tx, keys.Signal(uuid.New(), uuid.New()), to)
 	}))
 }
 
@@ -57,9 +59,9 @@ func TestMoveSignal_MaintainsLocationIndex(t *testing.T) {
 	storyB := uuid.New()
 	sigID := uuid.New()
 
-	keyA := keySignal(storyA, sigID)
-	keyB := keySignal(storyB, sigID)
-	keyO := keyOutlier(sigID)
+	keyA := keys.Signal(storyA, sigID)
+	keyB := keys.Signal(storyB, sigID)
+	keyO := keys.Outlier(sigID)
 
 	require.NoError(t, ms.Update(func(tx Tx) error {
 		return tx.Put(keyA, []byte("payload"))
@@ -112,17 +114,17 @@ func TestEvictionDeletesLocationIndex(t *testing.T) {
 	encoded, err := tr.cfg.Codec.Encode(Signal[string]{ID: sigID, At: time.Now(), Embedding: []float32{0, 0}})
 	require.NoError(t, err)
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		if err := tx.Put(keyOutlier(sigID), encoded); err != nil {
+		if err := tx.Put(keys.Outlier(sigID), encoded); err != nil {
 			return err
 		}
 		return writeSignalLoc(tx, sigID, uuid.Nil, true)
 	}))
 
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		if err := tx.Delete(keyOutlier(sigID)); err != nil {
+		if err := tx.Delete(keys.Outlier(sigID)); err != nil {
 			return err
 		}
-		return tx.Delete(keySignalLoc(sigID))
+		return tx.Delete(keys.SignalLoc(sigID))
 	}))
 
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
@@ -208,7 +210,7 @@ func TestRunBatch_Merge(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if err := tx.Put(keySignal(sid, sigID), b); err != nil {
+				if err := tx.Put(keys.Signal(sid, sigID), b); err != nil {
 					return err
 				}
 			}
@@ -244,8 +246,8 @@ drain:
 
 	// A survives; B is gone.
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keyStoryMeta(storyB)), "retired story B metadata must be deleted")
-		assert.NotNil(t, mustGet(t, tx, keyStoryMeta(storyA)), "survivor story A metadata must exist")
+		assert.Nil(t, mustGet(t, tx, keys.StoryMeta(storyB)), "retired story B metadata must be deleted")
+		assert.NotNil(t, mustGet(t, tx, keys.StoryMeta(storyA)), "survivor story A metadata must exist")
 		return nil
 	}))
 

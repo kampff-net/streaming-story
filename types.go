@@ -119,4 +119,5 @@ type BatchSummary struct {
 	SignalsReassigned int
 	OutliersEvicted   int
 	OutliersPromoted  int
+	OutliersAdmitted  int
 }

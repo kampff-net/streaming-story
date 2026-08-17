@@ -24,7 +24,7 @@ func benchBlob(rng *rand.Rand, axis int) []float32 {
 }
 
 // BenchmarkBatch measures a full batch cycle — collect, cluster, map, apply —
-// over a window filled to BatchSampleCap.
+// over a full batch window.
 func BenchmarkBatch(b *testing.B) {
 	const signals = 400
 
@@ -32,12 +32,10 @@ func BenchmarkBatch(b *testing.B) {
 	now := time.Now()
 
 	tr, err := NewTracker[string](Config[string]{
-		Store:          newMemStore(),
-		Codec:          JSONCodec[string]{},
-		BatchInterval:  time.Hour, // the ticker must not fire mid-benchmark
-		MinClusterSize: 3,
-		MinSamples:     1,
-		BatchSampleCap: signals,
+		Store:         newMemStore(),
+		Codec:         JSONCodec[string]{},
+		BatchInterval: time.Hour, // the ticker must not fire mid-benchmark
+		MinStorySize:  3,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -97,11 +95,10 @@ func BenchmarkIngestSteadyState(b *testing.B) {
 	now := time.Now()
 
 	tr, err := NewTracker[string](Config[string]{
-		Store:          newMemStore(),
-		Codec:          JSONCodec[string]{},
-		BatchInterval:  time.Hour,
-		MinClusterSize: 3,
-		MinSamples:     1,
+		Store:         newMemStore(),
+		Codec:         JSONCodec[string]{},
+		BatchInterval: time.Hour,
+		MinStorySize:  3,
 	})
 	if err != nil {
 		b.Fatal(err)

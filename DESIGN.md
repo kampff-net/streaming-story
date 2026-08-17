@@ -2,11 +2,49 @@
 
 ## Overview
 
-`go.kvsh.ch/streaming-story` is a Go library for ingesting a continuous stream of signals and grouping them into evolving stories. It uses a **Hybrid Clustering** approach:
-1.  **Real-time Ingestion**: Immediate assignment to the nearest story for low-latency feedback (the "Draft" assignment).
-2.  **Periodic Maintenance**: A background process that refines the existing story structure — promoting outlier groups, splitting diverged stories, merging converged ones — without re-deriving stories from scratch. See [Maintenance Pass](#maintenance-pass).
+`go.kvsh.ch/streaming-story` ingests a continuous stream of embedding vectors
+("signals") and groups them into evolving clusters ("stories"). Clustering is
+hybrid:
 
-`Ingest` is goroutine-safe. `Subscribe` channels are per-caller and independently buffered.
+1. **Draft phase** — real time, per signal. Each arriving signal is assigned to
+   the nearest story centroid if it falls inside that story's adaptive radius,
+   and bucketed as an outlier otherwise.
+2. **Maintenance phase** — periodic, in the background. Existing stories are
+   *maintained*, not re-derived: evict, promote, admit, split, merge, recentre,
+   lifecycle. Story identity therefore survives every run.
+
+`Ingest` is goroutine-safe. `Subscribe` channels are per-caller and
+independently buffered.
+
+Approaches that were tried and removed — HDBSCAN, Jaccard/Hungarian mapping,
+sampling, raw cosine geometry, promotion cliques — are documented in
+[`HISTORY.md`](HISTORY.md). This document describes only current behaviour.
+
+## Code Layout
+
+The public API and everything that touches the store live in the root `story`
+package. The logic that can be stated without either lives in `internal/`:
+
+- **`internal/geom`** — the corpus mean, the projector that centres against it,
+  group statistics, and the quadratic angular bound. See
+  [Geometry](#geometry-centred-space).
+- **`internal/cluster`** — the grouping decisions, over an index-based `Point`
+  type: growth, cliques, split, merge planning. Pure functions of points and
+  thresholds; no store, no clock, no `Config`. See
+  [Maintenance Pass](#maintenance-pass).
+- **`internal/keys`** — the KV key schema and its parsers. See
+  [Key Schema](#key-schema).
+- **`internal/dist`** — cosine distance over BLAS.
+
+Root files are grouped by function, not by type: `types.go` (public types and
+events), `config.go` (knobs and validation), `store.go` (the `Store`/`Tx`/`Codec`
+contracts plus `MemStore` and `JSONCodec`), `tracker.go` (lifecycle, batch loop,
+subscriber fan-out), `ingest.go` (the Draft path), `threshold.go` (admission
+radius policy, shared by Draft and by outlier admission), `batch.go` (collection,
+apply window, snapshot, buffer drain), `maintain.go` (the pass itself),
+`points.go` (the collected-signal form and every conversion into the `geom` /
+`cluster` views), `record.go` (persisted shapes, their store access, and
+calibration state), and `query.go` (the read API).
 
 ---
 
@@ -14,62 +52,130 @@
 
 ### Signal
 
-The atomic unit of input. Defined as a generic type so the caller can attach arbitrary domain fields.
+The atomic unit of input, generic over a caller payload.
 
 ```go
 type Signal[T any] struct {
-    ID        uuid.UUID // UUID v5, provided by caller; see UUID Namespace below
+    ID        uuid.UUID // UUID v5; see UUID Namespace
     At        time.Time
-    Embedding []float32 // dimensionality fixed on first Ingest call; mismatch returns error
+    Embedding []float32 // dimensionality fixed by the first Ingest; mismatch returns ErrDimensionMismatch
     Data      T         // opaque caller payload
 }
 ```
 
 ### Story
 
-A persistent cluster of signals sharing semantic proximity.
-- **Centroid**: The mean embedding of signals in the active window.
-- **Story Radius**: The distance from the centroid to the furthest signal in the active window.
-- **Stability**: Signals in **Active** stories are "liquid" and may be re-assigned to a different story if a batch run finds a better structural fit. Once a story is **Dormant** or **Archived**, its membership is locked (see exceptions in [Lifecycle Rules](#lifecycle-rules)).
+A persistent group of semantically proximate signals. Its metadata carries two
+centroids, its geometry, its lifecycle state, and the statistics the Draft phase
+needs.
+
+Two centroids, because identity and admission are different questions:
+
+- **`Centroid`** — unweighted mean of **every** member. This is the identity
+  geometry: merge, split, radius, and σ all measure against it, so it must not
+  chase recent traffic.
+- **`RecentCentroid`** — unweighted mean of members within
+  `ActiveContextWindow`. This is what admission compares against, so a
+  developing story keeps admitting its own current coverage while its identity
+  stays anchored on its whole history. Stories with no recent members carry a
+  copy of `Centroid`.
+
+Both are **recomputed from members on every run, never accumulated.** A running
+mean or EMA depends on arrival order and elapsed run count, so two stores
+holding identical signals would carry different centroids, and every threshold
+comparison downstream would differ with them.
+
+**`Radius`** is the distance from `Centroid` to the furthest member.
+**`MeanDistance`** and **`Sigma`** are the mean and population standard
+deviation of member distances to `Centroid`, meaningful only once the story
+holds `ColdStartMinSignals` members.
 
 ### UUID Namespace
 
-Signal IDs are UUID v5. Callers should derive them as:
+Signal IDs are UUID v5 and are supplied by the caller. Derive them with the
+tracker, which honours a configured namespace:
 
 ```go
-uuid.NewV5(TrackerNamespace, domainKey)
+id := tracker.SignalID(domainKey)
 ```
 
-`TrackerNamespace` is a fixed UUID constant exported by the library:
+Equivalent to `uuid.NewSHA1(cfg.Namespace, []byte(domainKey))`.
+`Config.Namespace` defaults to `TrackerNamespace`, a fixed compile-time
+constant, so IDs are stable regardless of deployment path or store location.
+Multi-tenant deployments needing isolation set `Config.Namespace` per tenant.
 
-```go
-// TrackerNamespace is the root namespace for all Signal IDs.
-// It is a fixed compile-time constant so IDs are stable regardless of
-// deployment path, working directory, or how the store Dir is expressed.
-var TrackerNamespace = uuid.MustParse("d4e5f6a7-b8c9-4d0e-1f2a-3b4c5d6e7f80")
+Deterministic IDs make re-ingestion idempotent: a signal already stored under a
+story is a strict no-op.
+
+---
+
+## Geometry: Centred Space
+
+**Every distance in the library is measured in centred space, and every
+threshold in `Config` is a centred-space distance.**
+
+Before any comparison, an embedding is unit-normalized and has
+`MeanRemoval` × corpus-mean subtracted:
+
+```
+project(x) = unit(x) − MeanRemoval · mean
 ```
 
-Multi-tenant deployments that need namespace isolation per tenant can set `Config.Namespace`; if zero-value, `TrackerNamespace` is used. The `trackerDir`-based derivation that appeared in earlier drafts is **removed**: a path that changes (relative vs. absolute, symlink, container mount) would silently produce different IDs for the same `domainKey`.
+The result is not renormalized — cosine distance is scale-invariant, so the
+residual's length changes nothing.
+
+**Why.** Text embeddings are anisotropic: every vector carries a large component
+along one shared direction, so the corpus occupies a narrow cone rather than the
+sphere. The mean of a large group converges on that shared direction, which makes
+two unrelated groups' centroids nearly identical (measured: centroids 0.06 apart
+for halves whose closest members sat 0.84 apart) and makes centroid-based growth
+snowball. Split can never fire; groups collapse into a blob. Subtracting the mean
+removes the shared component and both effects with it. The full measurement
+table, and the alternatives that were rejected — further principal components,
+UMAP, random projection, whitening — are in [`HISTORY.md`](HISTORY.md#8-raw-cosine-geometry).
+
+**Why not 1.0.** Full removal is degenerate when the corpus is itself one tight
+group: the mean lands on top of every signal, the residuals are whatever noise
+remains, and a coherent story shatters into antipodal halves. Keeping a tenth of
+the mean leaves every residual a shared component to agree on.
+
+**Scale.** Centred distances run roughly twice raw cosine — median pairwise
+distance 1.02 centred against 0.45 raw on the reference corpus. A threshold
+carried over from a raw-cosine configuration is far too tight.
+
+**The mean is state.** It is computed from the full collected membership of each
+batch run, persisted in `c:state`, and **recomputed rather than accumulated**,
+for the same reproducibility reason as centroids. Storage is unaffected: signals
+persist raw and the projection is re-derived on read.
+
+**Consistency across a run.** A batch establishes the mean, projects every
+collected signal with it, recomputes every centroid in that same space, and
+publishes mean and centroids together in one transaction. The Draft phase
+therefore always centres an arriving signal against the same mean version the
+stored centroids were built with.
+
+**Cold start.** Before the first batch run there is no mean, and geometry is
+raw. This is harmless: a story can only exist if a batch has run, so the Draft
+phase has no centroid to compare against and every signal is an outlier
+regardless of threshold.
 
 ---
 
 ## Tiered Window Strategy
 
-The system maintains three temporal tiers to balance performance and semantic accuracy:
-
-| Tier | Name | Size (Default) | Role |
+| Tier | Name | Default | Role |
 |---|---|---|---|
-| **Tier 1** | Ingestion | 1 Signal | Immediate "best-guess" assignment to the nearest existing story centroid. |
-| **Tier 2** | Batch Window | Last `BatchWindow` (default: 24h) | Periodic maintenance over existing stories: promote, split, merge, recentre. See [Maintenance Pass](#maintenance-pass). |
-| **Tier 3** | Active Context | Last 30 Days | All Active/Dormant story centroids used as anchors for mapping batch results. |
+| **Tier 1** | Ingestion | 1 signal | Immediate provisional assignment to the nearest story. |
+| **Tier 2** | Batch Window | `BatchWindow`, 24h | Bounds outlier retention and lifecycle transitions for the maintenance pass. |
+| **Tier 3** | Active Context | `ActiveContextWindow`, 30d | Which stories may act as Draft anchors, and which members define `RecentCentroid`. |
 
-The batch window bounds outlier retention and lifecycle transitions. Story membership itself is read in full each run, because the lifetime centroid is the mean of every member.
+Story membership itself is read **in full** on every run, not windowed: the
+lifetime centroid is the mean of every member, so a windowed read would compute a
+centre that slides as old signals age out.
 
 ---
 
-## Story Lifecycle & Mapping
-
-### States
+## Story Lifecycle
 
 ```
 Outlier ──► Active ──► Dormant ──► Archived (terminal)
@@ -77,248 +183,364 @@ Outlier ──► Active ──► Dormant ──► Archived (terminal)
                 └──────────┘
 ```
 
-- **Outlier**: Signal has no story match yet; held pending the next batch run.
-- **Active**: Story is receiving signals or was last seen within `SilenceWindow`.
-- **Dormant**: No new signals for `SilenceWindow`. Membership locked. Centroid retained. Can reactivate.
-- **Archived**: No new signals for `ArchiveWindow`. Signal data and centroid are **retained**. Terminal state — no reactivation. New signals on the same topic will form a fresh story.
+- **Outlier** — no story match yet. Held in the `o:` bucket for the next
+  maintenance pass, which may promote it into a new story, admit it into an
+  existing one, or evict it at `OutlierTTL`.
+- **Active** — receiving signals, or last seen within `SilenceWindow`.
+- **Dormant** — no new signals for `SilenceWindow`. May be a merge target
+  (absorbing signals reactivates it) and may reactivate through Draft
+  assignment. Centroid retained.
+- **Archived** — no new signals for `ArchiveWindow`. Terminal: excluded from
+  collection, never an anchor, never reactivated. New signals on the same topic
+  form a fresh story. **Signal data and centroid are retained** — only the state
+  field changes, and `SignalsOf` still iterates the members.
 
-### 1. Real-time Ingestion (Draft Phase)
-
-When a signal arrives:
-0.  **Locate any existing copy**: Consult the `l:{signalID}` location index. If the signal already belongs to a story — including one a batch run moved it to — the ingest is a strict no-op returning that story ID (see [Signal Location Index](#key-schema)).
-1.  **Centroid Match**: Find the nearest **Active** or **Dormant** story centroid via Cosine Similarity.
-2.  **Assignment**: Assign the signal to that story if the distance is within the per-story adaptive threshold:
-
-    ```
-    T_assign(story) = mean_distance(story) + AssignmentK × σ(story)
-    ```
-
-    where distances are from each signal in the active window to its story centroid.
-
-    Before the first batch run completes there is no measured σ_global; `InitialSigmaGlobal` (default: 0.25) stands in until one is seeded. Every story is in cold-start at that point, so this single value determines whether early signals join a story or are held as outliers for the first batch to resolve.
-
-    **σ_global** is the exponential moving average of per-signal centroid distances across all Active stories, updated at the end of each batch run:
-    ```
-    σ_global ← EMAAlpha × σ_global_prev + (1 − EMAAlpha) × mean_distance_all_active_stories
-    ```
-    with `EMAAlpha = 0.1` (configurable). It is persisted in `c:state` (see [Key Schema](#key-schema)) and bootstrapped from the first completed batch run that contains at least one Active story.
-
-    Before a story accumulates `ColdStartMinSignals` signals (default: 5), the per-story σ is unreliable; fall back to `AssignmentK × σ_global`.
-
-    **Tightness trap prevention**: To guard against new stories whose first few signals are nearly identical (driving σ(story) ≈ 0 and collapsing the threshold), σ(story) is floored at `SigmaFloor × σ_global` (default `SigmaFloor = 0.1`). This floor applies even after the cold-start period ends.
-
-3.  **Outlier**: If no story is within threshold, write the signal to the outlier bucket (`o:{signalID}`) and hold it for the next batch run.
-
-**Centroid currency**: Centroids are recalculated only at the end of each batch run. During the Draft phase the system uses the centroid from the last completed batch. For a `BatchInterval` of 30 minutes, assignment decisions may use a centroid up to 30 minutes stale. This lag is accepted: Draft assignments are explicitly provisional, and the next batch run corrects any misassignments.
-
-**Dormant story thresholds**: The `T_assign` formula requires `mean_distance(story)` and `σ(story)`. For Dormant stories — which have zero signals in the current `BatchWindow` — these statistics are undefined from live data. To allow Dormant stories to participate in Draft assignment (and thus reactivate when semantically relevant signals arrive), `mean_distance` and `σ` are **frozen in story metadata on the Dormant transition** and reused for threshold calculation until the story becomes Active again. On reactivation (transition back to Active), the frozen values are **cleared from metadata** and the story re-enters the cold-start period: it uses `AssignmentK × σ_global` until it accumulates `ColdStartMinSignals` signals, at which point live per-story statistics take over. This prevents a story that reactivated around a different topic distribution from inheriting stale thresholds.
-
-### 2. Batch Re-clustering (Refinement Phase)
-
-Triggered when either condition fires first:
-- `BatchInterval` has elapsed since the last run (default: 30m).
-
-Steps:
-1.  **Collect**: Gather all signals with `At ≥ now − BatchWindow`, plus all outlier signals with `At ≥ lastBatchTimestamp − OutlierTTL`. Outlier signals older than that threshold are evicted (deleted from the `o:` prefix) and dropped — they have failed to cluster across enough successive batch runs that retaining them would only grow the outlier bucket indefinitely. Using `lastBatchTimestamp` rather than wall-clock `now` as the reference point prevents mass eviction after a maintenance pause: if the system is offline for an extended period, `lastBatchTimestamp` does not advance, so outliers are not penalised for time the batch goroutine was not running.
-2.  **Maintain**: run the maintenance operations over existing stories. See [Maintenance Pass](#maintenance-pass).
-5.  **Apply**: Persist the resulting updates (1-to-1, merge, split, new story) and emit events.
-6.  **Promote outliers**: Any outlier signal that ended up in a batch cluster is migrated from `o:{signalID}` to `s:{storyID}:s:{signalID}`.
-
-### Cluster Mapping
-
-Mapping is a **two-phase** process. The Hungarian algorithm finds optimal 1-to-1 continuity links; a separate post-assignment scan detects splits and merges that a strict 1-to-1 constraint would suppress.
-
-For each pair $(C_B, S_P)$ compute:
-
-```
-Jaccard(C_B, S_P) = |signals(C_B) ∩ signals(S_P)| / |signals(C_B) ∪ signals(S_P)|
-```
-
-> **Superseded by spec 006.** The Jaccard/Hungarian mapping engine described in
-> this section no longer exists. Stories are maintained rather than re-derived;
-> see [Maintenance Pass](#maintenance-pass).
-
-**Phase 1 — Primary Continuity (Hungarian assignment)**
-
-Build a cost matrix (cost = 1 − Jaccard) restricted to pairs where Jaccard ≥ `MappingMinJaccard` (default: 0.6). Solve with the Hungarian algorithm to find the optimal 1-to-1 pairing — each $C_B$ is paired with at most one $S_P$ and vice versa. Pairs below `MappingMinJaccard` are left unmatched by construction.
-
-| Phase 1 outcome | Action |
-|---|---|
-| Matched pair | **Update** $S_P$: recalculate centroid and radius. |
-
-**Phase 2 — Split and Merge Detection (post-assignment Jaccard scan)**
-
-After Phase 1, scan the full Jaccard matrix for secondary overlaps that the 1-to-1 constraint suppressed. In a split, the Hungarian algorithm assigns $S_P$ to its strongest match $C_B$ and leaves the weaker child $C_B'$ unmatched; in a merge, it assigns $C_B$ to its strongest match $S_P$ and leaves $S_P'$ unmatched.
-
-Phase 2 operates over the **full unmatched set**, not just individual pairs, enabling N-way outcomes:
-- **N-way split**: A single $S_P$ may overlap with multiple unmatched batch clusters $C_{B1}', C_{B2}', \ldots$ — each child that independently satisfies the conditions below is promoted as a separate new story.
-- **N-way merge**: A single matched $C_B$ may overlap with multiple unmatched persistent stories $S_{P1}', S_{P2}', \ldots$ — all qualifying stories are merged into $S_P$ simultaneously, retaining the earliest creation time across all merged stories.
-
-| Phase 2 condition | Action |
-|---|---|
-| Unmatched $C_B'$ with Jaccard($C_B'$, $S_P$) ≥ `SplitMinJaccard` (default: 0.3) for an already-matched $S_P$, and combined coverage of $C_B$ + $C_B'$ over $S_P$ > 0.7 | **Split** $S_P$ (only if Active): retain $S_P$ for $C_B$, promote $C_B'$ as a new story. For N-way splits, each qualifying unmatched cluster produces a separate new story; the condition is evaluated independently per child. |
-| Unmatched $S_P'$ with Jaccard($C_B$, $S_P'$) ≥ `SplitMinJaccard` for an already-matched $C_B$, and combined coverage of $S_P$ + $S_P'$ from $C_B$ > 0.7 | **Merge** $S_P'$ into $S_P$. The **surviving StoryID is that of the story with the earliest creation time** across all merging stories; if $S_P'$ is older than $S_P$, then $S_P'$ becomes the survivor and $S_P$ is retired instead — the convention is consistent: the oldest story's identity persists. A **merge is a key-space migration**: all signal keys are moved from the retired story's prefix to the surviving story's prefix, including signals older than `BatchWindow`. This is an identity-level operation and is **exempt from the re-assignment stability rule** — that rule governs batch-derived label changes, not story consolidation. |
-| $C_B$ still unmatched after both phases, signal count ≥ `MinClusterSize` | **Create** a new persistent story. |
-| $C_B$ still unmatched after both phases, signal count < `MinClusterSize` | Retain signals as outliers. |
-
-### 3. Stability & Re-assignment
-
-> **Superseded by spec 006.** Individual signals are never reassigned. Membership changes only through a split or a merge, each of which moves a whole group and emits an event; `EventSignalReassigned` now accompanies outlier promotion, split migration, and merge migration.
-
-The `StabilityWindow` config field is **removed**; `BatchWindow` is the authoritative and consistent scope for re-assignment.
-
-**Emptied stories are retired.** When a batch run reassigns (or demotes) every signal of a persistent story — for example a story created from a premature partial merge whose signals are later reclustered into separate stories — the story is left with no data under its `s:{storyID}:` prefix. The Apply phase deletes such a story's metadata and time-index entry, increments `StoriesRetired`, and emits `EventStoryRetired`. A story that retains any historical signals outside `BatchWindow` is untouched: those signals were never part of the clustering input, so the retirement scan sees them and the story survives.
-
-### Lifecycle Rules
-
-- A **Dormant** story may be the *target* of a merge (absorbing an active story reactivates it) but may not be *split*. If a split is detected on a Dormant story, the split is suppressed: the story remains intact and the diverging signals are promoted as a new story instead.
-- **Archived** stories are excluded from cluster mapping entirely. The batch Apply phase skips them when building the $S_P$ candidate set; any new signals on the same topic will form a new story via the unmatched-$C_B$ path.
-- **Noise retention**: no longer applicable. There is no noise label; a signal assigned to a story stays there until the story splits or merges.
+**Dormant thresholds.** `T_assign` needs `MeanDistance` and `Sigma`, which are
+undefined for a story with no live window traffic. Both are therefore **frozen
+in metadata on the Dormant transition** and used for threshold calculation until
+reactivation, at which point they are **cleared** and the story re-enters
+cold-start. That prevents a story reactivating around a different topic
+distribution from inheriting stale thresholds.
 
 ---
 
-## Persistence: Prefix-based KV Store
+## Draft Phase (real-time ingest)
 
-The library interacts with a minimal `Store` interface.
+For each arriving signal:
+
+0. **Locate any existing copy.** Consult `l:{signalID}`. If the signal already
+   belongs to a story — including one a batch run moved it to — the ingest is a
+   strict no-op returning that story ID.
+1. **Project** the embedding into centred space.
+2. **Find the nearest anchor.** Scan the `t:` time index from
+   `now − ActiveContextWindow` and compare against each candidate's
+   `RecentCentroid`. Archived stories are skipped. Cost is proportional to
+   candidate stories, not to stored signals.
+3. **Test the adaptive threshold.**
+
+   ```
+   T_assign(story) = MeanDistance(story) + AssignmentK × σ(story)
+   ```
+
+   with these rules:
+
+   - **Cold start.** Below `ColdStartMinSignals` members the per-story σ is not
+     trusted; the threshold is `AssignmentK × σ_global`.
+   - **σ floor.** σ is floored at `SigmaFloor × σ_global`, so a story whose
+     first few signals are nearly identical cannot collapse its own threshold to
+     zero.
+   - **Ceiling.** The result is clamped to `AssignThreshold`, so a story that has
+     drifted wide cannot keep widening its own catchment.
+   - **Dormant.** Uses the frozen statistics described above.
+   - **Before the first batch.** σ_global has never been measured, so
+     `InitialSigmaGlobal` stands in.
+
+4. **Assign or bucket.** Within threshold, the signal is written under the
+   story, any stale outlier copy is dropped, the location index is updated,
+   `LastSignalAt` advances monotonically, and `EventDraftAssigned` is emitted.
+   Otherwise the signal is written to `o:{signalID}`.
+
+**Centroid currency.** Centroids are recomputed only at the end of a batch run,
+so a Draft decision may use a centroid up to `BatchInterval` old. Accepted:
+Draft assignments are explicitly provisional, and the next maintenance pass
+corrects the structure.
+
+---
+
+## Maintenance Pass
+
+Runs every `BatchInterval` on a background goroutine. Collection is read-only;
+every decision is computed from state already in hand and applied in a single
+write transaction.
+
+**Collect.** Every member of every non-Archived story, read in full, plus
+outliers newer than `lastBatch − OutlierTTL`. Older outliers are returned for
+eviction. The reference is `lastBatch`, not wall-clock `now`, so a maintenance
+pause does not cause mass eviction: if the goroutine was not running,
+`lastBatch` did not advance, and outliers are not penalised for that time.
+
+**Establish geometry.** Compute the corpus mean from the collected signals and
+project all of them.
+
+### Operations, in order
+
+| # | Operation | Rule |
+|---|---|---|
+| 1 | **Evict** | Delete outliers older than `lastBatch − OutlierTTL`, with their location index entries. |
+| 2 | **Promote** | Group remaining outliers by nearest-centroid growth; each group that fits inside a ball of radius `AssignThreshold` and holds at least `MinStorySize` signals becomes a new story. |
+| 3 | **Admit** | Outliers no group claimed join the nearest existing story whose adaptive threshold covers them. |
+| 4 | **Split** | A story whose best two-way partition has part centroids more than `SplitThreshold` apart, both parts at least `MinStorySize`, divides in two. At most one split per story per run. |
+| 5 | **Merge** | Mutually-close stories within `MergeThreshold` unify, provided the union is one step 4 would leave whole. Oldest `CreatedAt` survives. |
+| 6 | **Recentre** | Recompute both centroids, radius, `MeanDistance`, σ, and `SignalCount` for every surviving story; retire any left empty. |
+| 7 | **Lifecycle** | Active → Dormant → Archived on `SilenceWindow` / `ArchiveWindow`; update σ_global and persist the mean. |
+
+Order matters. Promotion precedes admission so a fresh group competes for the
+same outliers. Admission precedes split so a story widened by new members is cut
+in the same run rather than staying diffuse until the next. Split precedes merge
+so both see consistent post-split centroids.
+
+### Promotion: growth with compaction
+
+Growth seeds on the outlier with the most neighbours within `AssignThreshold`,
+then repeatedly admits whichever candidate is nearest the **running** centroid
+while it stays within the threshold. The closing **compaction** then drops any
+member the finished centroid left outside the threshold, recentring until every
+survivor is inside.
+
+The compaction is what makes non-chaining a *guarantee* rather than an
+observation: whatever path the centroid took while growing, every surviving
+member ends within `AssignThreshold` of the final centre, so the group's diameter
+is bounded by `maxAngularSeparation(AssignThreshold)` and a ladder of
+near-neighbours cannot walk out of it.
+
+Connected components are forbidden — they are the transitive linkage that chains
+a corpus into one blob. Cliques were the previous rule and were measurably too
+strict; see [`HISTORY.md`](HISTORY.md#7-mutual-neighbour-cliques-for-outlier-promotion).
+
+### Admission
+
+The Draft phase runs once, at ingest. A signal arriving before the batch that
+creates its story is bucketed and never re-tested, so it would expire even when
+an established story covered it perfectly — 342 of 596 reference-corpus signals
+were stranded this way before admission existed.
+
+Admission re-applies the Draft test against stories that now exist: nearest
+`RecentCentroid`, same adaptive threshold formula. Every threshold and centroid
+is computed **once, from pre-admission membership**, so the outcome is
+independent of the order outliers are visited and no admission can widen a story
+enough to admit the next.
+
+This is not the per-signal reassignment the stability rule forbids. That rule
+protects story *membership* from being reshuffled run to run; an outlier has no
+membership to disturb, and admission never moves a signal between stories.
+
+### Split: gate, then decision
+
+Testing every story's best partition each run is wasteful, so a **necessary
+condition** runs first: attempt a split only when `4r − 2r² > SplitThreshold`,
+where *r* is the story radius.
+
+The bound is **not** the Euclidean `2r`. Cosine distance is not a metric, and
+`1 − cos` grows quadratically in the angle, so two members each at distance *r*
+from the centroid can be `1 − cos(2·arccos(1−r))` apart, which expands to
+`4r − 2r²`. At *r* = 0.122 that is 0.458 against the 0.245 a Euclidean bound
+predicts, so `2r` would skip stories that genuinely split.
+
+Past the gate, the story is partitioned by a two-medoid Lloyd loop seeded on its
+two most distant members, bounded to ten iterations. The split is accepted only
+if both parts hold at least `MinStorySize` members and the two part centroids are
+more than `SplitThreshold` apart. A story with no internal gap is left whole:
+cutting it would produce halves inside the hysteresis band with nothing to
+reunite them.
+
+The larger part keeps the story ID so identity survives for the majority of
+holders; ties go to the part holding the older signal.
+
+### Merge: the exact inverse of split
+
+Candidate groups are **cliques** over story centroids within `MergeThreshold` —
+every member within threshold of every other. Story-level chaining is real: a
+ladder of 12 stories each 0.005 from its neighbour once merged into one whose
+ends were 0.55 apart.
+
+Each candidate group is then compacted until the story it would produce is one
+the split step would leave whole, dropping the member furthest from the union
+centroid each round. If no subset of two or more survives, no merge happens.
+
+The test is `splitStory` on the union, **not** the split radius gate. The gate is
+only a necessary condition for splitting, so using it here rejects unions no
+split would ever touch — at `SplitThreshold` 0.55 it demands a union radius under
+0.15, and no merge fires at all
+([`HISTORY.md`](HISTORY.md#9-radius-gate-as-the-merge-admission-test)).
+
+The **oldest `CreatedAt` survives**; ties break on story ID. A merge is a
+key-space migration: every signal key moves from the retired prefix to the
+survivor's, **including signals older than `BatchWindow`**. This is an
+identity-level operation and the documented exception to the membership rule.
+
+### Thresholds and hysteresis
+
+`MergeThreshold` (0.40) and `SplitThreshold` (0.55) are the two edges of one
+hysteresis band, and `SplitThreshold` must be strictly greater — `validate()`
+rejects a collapsed band. Merge tests one historically-given partition; split
+*searches* for the best one. A search can beat a fixed arrangement on the same
+signals, so with a shared value a merge and a split undo each other along
+different seams and story IDs churn while the data is unchanged.
+
+`AssignThreshold` (0.50) governs a different comparison — one point against one
+centroid, rather than two centroids against each other — and so keeps its own
+value. `validate()` requires `MergeThreshold < AssignThreshold`: stories may not
+merge at a distance wider than a signal may sit from a centroid.
+
+### Membership stability
+
+No signal is relocated individually. Story membership changes only through a
+split or a merge, each of which moves a whole group and emits an event. An
+individual misassignment is therefore not individually correctable — it is
+repaired only when enough similar signals accumulate to form a group clearing
+`MinStorySize`, which is exactly when the error is worth acting on.
+
+**Emptied stories are retired.** A story left with nothing under its
+`s:{storyID}:` prefix — emptied by a merge of its last signals — has its
+metadata and time-index entry deleted, increments `StoriesRetired`, and emits
+`EventStoryRetired`.
+
+### Determinism
+
+A run is a pure function of the stored state. Nothing depends on map iteration
+order: story and signal sets are sorted by ID before any decision, ties break on
+ID, and both the mean and every centroid are recomputed from full membership
+rather than accumulated. A second run over unchanged data changes nothing —
+asserted by `TestStability_IdempotentRerun` and, on the real corpus, by the
+closing no-op pass of `TestStreaming_IncrementalArrivalsAreStable`.
+
+**Convergence takes one extra pass, not zero.** Promotion creates stories and
+moves σ_global, so an outlier that no story covered when a pass began may be
+covered by the next pass — measured, exactly one extra pass absorbs the
+stragglers (three signals promoted, one admitted on a 400-signal store), after
+which the store is a hard fixpoint that repeated passes do not touch. Absorption
+only ever *adds* assignments; a settling pass never moves a signal between
+stories. `TestStreaming_IncrementalArrivalsAreStable` asserts both halves.
+
+**The scope of that guarantee is one store.** Two *fresh* ingests of the same
+corpus into two empty stores can differ slightly, because a new story's ID comes
+from `uuid.New()` and decisions are ordered by story ID — so which of two
+otherwise equivalent stories is visited first varies. Measured on the streaming
+suite, this moves total churn between 0.4% and 1.0% run to run. Deriving new
+story IDs from their founding signals would close the gap and is the obvious fix
+if cross-store reproducibility ever matters.
+
+### Global calibration
+
+σ_global is the exponential moving average of per-signal centroid distances
+across all Active stories, updated at the end of each run:
+
+```
+σ_global ← EMAAlpha × σ_global_prev + (1 − EMAAlpha) × mean_distance_all_active
+```
+
+It is persisted in `c:state` and bootstrapped from the first run containing at
+least one Active story. Until then `InitialSigmaGlobal` stands in.
+
+---
+
+## Persistence
+
+The library talks to a minimal prefix-scannable KV store through `Store` and
+`Tx`. Implementations must provide **lexicographic byte ordering** — what bbolt,
+LevelDB, and most embedded stores give by default — because the range scans
+depend on it. `MemStore` ships for tests and small deployments.
 
 ### Key Schema
 
-| Purpose | Key Pattern | Value |
+| Purpose | Key | Value |
 |---|---|---|
-| Calibrator State | `c:state` | JSON: $\sigma_{global}$, dimensionality, last batch timestamp |
-| Story Metadata | `s:{storyID}:m` | JSON: centroid, radius, state, timestamps, frozen_mean_distance, frozen_sigma |
-| Signal Data | `s:{storyID}:s:{signalID}` | Encoded `Signal[T]` |
-| Outlier Signal | `o:{signalID}` | Encoded `Signal[T]` |
-| Signal Location Index | `l:{signalID}` | `s:{storyID}` (story member) or `o` (outlier) |
-| Story Time Index | `t:{unix_sec}:{storyID}` | empty |
+| Calibration state | `c:state` | JSON: σ_global, dimensionality, last batch timestamp, corpus mean |
+| Story metadata | `s:{storyID}:m` | JSON: both centroids, radius, state, timestamps, live and frozen statistics |
+| Signal data | `s:{storyID}:s:{signalID}` | Encoded `Signal[T]` |
+| Outlier signal | `o:{signalID}` | Encoded `Signal[T]` |
+| Signal location index | `l:{signalID}` | `s:{storyID}` for a story member, `o` for an outlier |
+| Story time index | `t:{unix_sec}:{storyID}` | empty |
 
-**Story Time Index**: Written/updated on every story metadata write. Deleted and re-inserted on each update so the timestamp stays current. A range scan from `t:{cutoff}:` to `t:{now}:` efficiently retrieves all recently active stories for Tier 3 without a full metadata scan.
+**Story time index.** Deleted and re-inserted on every metadata write so the
+timestamp stays current. A range scan from `t:{cutoff}:` retrieves recently
+active stories for Tier 3 without a full metadata scan.
 
-**Signal Location Index**: Written when a signal is stored and updated by every batch move (including merge migrations), and deleted on outlier eviction. `Ingest` consults it before the centroid match: a copy that lives in *any* story is a strict no-op, returning the stored story ID. This closes a duplicate-creation window where a signal ingested once, then re-moved to a different story by a batch run, would be re-ingested into a second copy under the nearest story.
+**Signal location index.** Written when a signal is stored, updated by every
+batch move including merge migrations, deleted on eviction. `Ingest` consults it
+before the centroid match: a copy living in *any* story is a strict no-op. This
+closes a duplicate-creation window where a signal ingested once, then moved by a
+batch run, would be re-ingested as a second copy under the nearest story.
 
-**Signal retention**: Signal data is retained for all story states, including Archived. No signal keys are deleted on archival; only the metadata state field changes.
-
-**Deletion/Merge**: Performed using range deletes on the `s:{storyID}:` prefix.
+**Signal retention.** Signal data is retained in all story states, Archived
+included. No signal keys are deleted on archival.
 
 ---
 
 ## Concurrency Model
 
-### Ingest vs. Batch Apply
+The store is assumed to permit one write transaction at a time, so an Apply phase
+rewriting thousands of keys would otherwise block every concurrent `Ingest` for
+its full duration.
 
-The underlying KV store is assumed to permit only one write transaction at a time. A Batch `Apply` phase that rewrites thousands of signal keys (moving signals between stories, updating indices) will block all concurrent `Ingest` calls for its full duration, causing latency spikes proportional to batch size.
+1. The batch goroutine sets an atomic `applyInProgress` flag around **only the
+   write transaction**. Collection is read-only and clustering touches no store,
+   so writers are not stalled for those phases.
+2. `Ingest` calls arriving while the flag is set write to `ingestBuffer`, an
+   in-memory channel bounded to `IngestBufferCap`, instead of to the store. If
+   the buffer is full, `Ingest` blocks until space frees or `ctx` is cancelled —
+   back-pressure without loss.
+3. The caller still receives a provisional story ID, computed against
+   `draftSnapshot`: an immutable copy of the story metadata the batch already
+   collected, published for the Apply window. This lookup **must not touch the
+   store** — the `Store` contract does not promise `View` may run concurrently
+   with `Update`, and a single-lock backend would block the caller for the whole
+   Apply, the exact stall the buffer exists to prevent.
+4. Once Apply commits, the flag clears and the goroutine drains the buffer by
+   re-ingesting each signal for real. **That placement is authoritative**, not
+   the provisional ID.
 
-**Strategy — In-memory Ingest Buffer during Apply**
+**Crash semantics: at-most-once.** `ingestBuffer` is in-memory. A crash after
+Apply commits but before the drain completes loses the buffered signals. Callers
+needing more should keep a write-ahead log or rely on idempotent re-ingestion —
+deterministic UUID v5 IDs make a repeat ingest a no-op, though
+`EventDraftAssigned` is not re-emitted for an already-stored signal.
 
-1. When the Batch goroutine begins its `Apply` phase it sets an atomic `applyInProgress` flag.
-2. `Ingest` calls that arrive while `applyInProgress` is set write their signals to an in-memory staging channel (`ingestBuffer`, bounded to `IngestBufferCap` signals, default: 10,000) instead of directly to the KV store. The caller still receives a provisional story ID, computed against an in-memory snapshot of the story metadata the batch collected. The lookup deliberately does not read the KV store: the `Store` interface does not require `View` to run concurrently with `Update`, so on a single-lock backend a store read here would block the caller for the whole Apply.
-3. Once the `Apply` transaction commits, the batch goroutine drains `ingestBuffer` into the store in a follow-up write transaction before clearing `applyInProgress`.
-4. If `ingestBuffer` is full, `Ingest` blocks until space is available (or `ctx` is cancelled). This provides natural back-pressure without data loss.
-
-Ordering guarantee: all signals from the batch window precede all buffer-drain signals in the KV store, which is consistent with their temporal ordering and means Draft assignments made against the staged signals remain valid.
-
-**Crash semantics (at-most-once)**: The `ingestBuffer` is in-memory and not persisted. A process crash after the Apply transaction commits but before the buffer-drain write completes will lose all buffered signals. This is an explicit **at-most-once** delivery guarantee for signals received during Apply. Callers requiring stronger guarantees should implement their own write-ahead log or rely on idempotent re-ingestion: UUID v5 signal IDs ensure that re-ingesting the same signal is a KV-level no-op, though `EventDraftAssigned` will not be re-emitted for already-stored signals.
+**Batch failures** leave the store untouched and return an empty summary; the
+next tick retries. `Config.OnBatchError` is the only way to observe one.
 
 ---
 
 ## Public API
 
-> **Default tuning**: values are calibrated for low-to-medium frequency news ingestion (1–10 signals/day per topic). High-frequency sources (social media, metrics) should reduce `BatchWindow` (e.g. 30m), `BatchInterval` (e.g. 5m), `SilenceWindow` (e.g. 6h), `ArchiveWindow` (e.g. 7d), and raise `MinClusterSize` (e.g. 5–10) accordingly.
+Full knob-by-knob configuration reference lives in
+[`README.md`](README.md#configuration-reference).
 
 ```go
-type Config[T any] struct {
-    Dir              string
-    Namespace        uuid.UUID     // UUID v5 namespace root for Signal IDs; zero → TrackerNamespace
-    BatchWindow      time.Duration // Time span of signals fed to each batch run (default: 24h)
-    BatchInterval    time.Duration // Run batch every this duration (default: 30m)
-    SilenceWindow    time.Duration // Active -> Dormant (default: 7d)
-    ArchiveWindow    time.Duration // Dormant -> Archived (default: 30d)
-    // StabilityWindow removed: re-assignment scope is BatchWindow (see Stability & Re-assignment).
-    BatchSampleCap              int           // Deprecated (spec 006): unused
-    SampleGuaranteeMaxFraction  float64       // Max fraction of BatchSampleCap reserved for per-story minimums; remainder is proportional (default: 0.5)
-    OutlierTTL                  time.Duration // Max age of an outlier signal (relative to last batch run) before eviction (default: 2 × BatchWindow)
-    AssignThreshold  float64       // Max centroid distance for a signal to join a story (default: 0.28)
-    MergeThreshold   float64       // Centroid distance at or below which two stories merge (default: 0.22)
-    SplitThreshold   float64       // Best-partition distance above which a story splits (default: 0.30)
-    MinStorySize     int           // Signals required for a group to be a story (default: 3)
-    MinClusterSize   int           // Deprecated (spec 006): unused
-    MinSamples       int           // Deprecated (spec 006): unused
-    AssignmentK      float64       // σ multiplier for per-story assignment radius (default: 2.0)
-    InitialSigmaGlobal float64     // σ_global stand-in before the first batch run measures one (default: 0.25)
-    ColdStartMinSignals int        // Signals needed before per-story σ is trusted; uses σ_global below (default: 5)
-    SigmaFloor       float64       // Floor for per-story σ as a fraction of σ_global (default: 0.1)
-    EMAAlpha         float64       // EMA decay for σ_global updates (default: 0.1)
-    MappingMinJaccard float64      // Jaccard threshold for primary cluster continuation (default: 0.6)
-    SplitMinJaccard  float64       // Jaccard threshold for secondary split/merge detection (default: 0.3)
-    IngestBufferCap  int           // Max signals buffered in memory during batch Apply (default: 10_000)
-    EventBufferSize  int           // Per-subscriber channel buffer depth (default: 512)
-    Codec            Codec[T]
-}
-
-// NewTracker opens (or creates) the store and initializes the tiered windows.
+// Lifecycle.
 func NewTracker[T any](cfg Config[T]) (*Tracker[T], error)
-
-// Ingest processes a signal and returns its initial (draft) StoryID.
-// Returns ErrDimensionMismatch if the embedding length differs from the first ingested signal.
-// Goroutine-safe.
-func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (storyID uuid.UUID, err error)
-
-// Subscribe returns a channel of real-time and batch-refined events.
-// Events are dropped (and EventBufferOverflow emitted) if the channel fills.
-// Each call returns an independent channel.
-func (t *Tracker[T]) Subscribe() <-chan StoryEvent[T]
-
-// Close flushes any pending batch run and closes the store.
 func (t *Tracker[T]) Close() error
 
-// Story returns current metadata for a single story.
-func (t *Tracker[T]) Story(id uuid.UUID) (StoryMeta, error)
+// Ingest processes one signal and returns its provisional story ID.
+// Returns ErrDimensionMismatch on an embedding length that differs from the
+// first ingested signal. Goroutine-safe.
+func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) (uuid.UUID, error)
 
-// Stories iterates over stories in the given state. Pass StoryStateAny to iterate all.
-func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta]
+// SignalID derives the UUID v5 signal ID for a domain key under the
+// configured namespace. Prefer it over calling uuid.NewSHA1 directly.
+func (t *Tracker[T]) SignalID(domainKey string) uuid.UUID
 
-// SignalsOf iterates over all signals for a story across all states.
-// Signal data is retained through archival, so Archived stories are fully iterable.
-func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error]
+// Events. Each Subscribe call returns an independent channel, closed on Close.
+// A full channel receives EventBufferOverflow in place of dropped events.
+func (t *Tracker[T]) Subscribe() <-chan StoryEvent[T]
+
+// Reads.
+func (t *Tracker[T]) Story(id uuid.UUID) (StoryMeta, error)          // ErrNotFound if absent
+func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta]   // StoryStateAny for all
+func (t *Tracker[T]) SignalsOf(id uuid.UUID) iter.Seq2[Signal[T], error]
+func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error)         // story member or outlier
+
+// Shipped helpers.
+type JSONCodec[T any] struct{} // default Codec
+func NewMemStore() *MemStore   // in-memory Store
 ```
 
 ### Events
 
 ```go
-type EventKind uint8
-
 const (
-    EventDraftAssigned    EventKind = iota // real-time: signal -> story (may change)
-    EventSignalReassigned                  // batch: signal moved to a different story
-    EventStoryCreated                      // new story persisted after batch run
-    EventStorySplit                        // one story became two
-    EventStoryMerged                       // two stories became one (StoryID2 is the retired ID)
-    EventStoryRetired                      // batch emptied the story; its record was deleted
-    EventStoryDormant                      // story crossed SilenceWindow
-    EventStoryArchived                     // story crossed ArchiveWindow; membership locked, signals retained
-    EventBatchComplete                     // one per batch run; Count fields summarise the run (see StoryEvent)
-    EventBufferOverflow                    // subscriber channel full; event(s) were dropped
+    EventDraftAssigned    EventKind = iota // real-time: signal provisionally assigned
+    EventSignalReassigned                  // batch: signal moved into or between stories
+    EventStoryCreated                      // new story persisted
+    EventStorySplit                        // one story became two; StoryID2 is the child
+    EventStoryMerged                       // two became one; StoryID2 is the retired ID
+    EventStoryRetired                      // batch emptied the story; record deleted
+    EventStoryDormant                      // crossed SilenceWindow
+    EventStoryArchived                     // crossed ArchiveWindow
+    EventBatchComplete                     // one per run; BatchSummary populated
+    EventBufferOverflow                    // subscriber channel full; events dropped
 )
 
-type StoryEvent[T any] struct {
-    Kind     EventKind
-    StoryID  uuid.UUID // primary story
-    StoryID2 uuid.UUID // secondary: merged-away story (Merged) or new child story (Split)
-    SignalID uuid.UUID // set for per-signal events (DraftAssigned, SignalReassigned)
-    At       time.Time
-    // BatchSummary is populated only for EventBatchComplete.
-    BatchSummary *BatchSummary
-}
-
-// BatchSummary carries aggregate counts for a completed batch run.
-// Subscribers that cannot handle high per-signal event rates (e.g. EventBufferSize = 512)
-// should consume EventBatchComplete for coarse-grained progress and selectively query
-// the store for details, rather than relying on individual EventSignalReassigned events.
-// An N-way merge of K stories or a batch run that reassigns thousands of signals will
-// emit K EventStoryMerged + one EventBatchComplete; the per-signal EventSignalReassigned
-// events for that batch are emitted before EventBatchComplete and may trigger
-// EventBufferOverflow on slow subscribers. Sizing EventBufferSize to at least
-// BatchSampleCap / average_signals_per_story avoids overflow under normal conditions.
 type BatchSummary struct {
     StoriesCreated    int
     StoriesMerged     int
@@ -327,86 +549,46 @@ type BatchSummary struct {
     SignalsReassigned int
     OutliersEvicted   int
     OutliersPromoted  int
+    OutliersAdmitted  int
 }
 ```
+
+`EventSignalReassigned` accompanies outlier promotion, admission, split
+migration, and merge migration. A run touching many signals emits many of them
+before `EventBatchComplete`, so subscribers that cannot keep up should consume
+`EventBatchComplete` for coarse progress and query the store for detail, or raise
+`EventBufferSize`.
+
+---
+
+## Measured Behaviour
+
+Reference corpus: 596 real news embeddings, dimension 3072, roughly 20–30 topics
+(`testdata/corpus_embeddings.txt`, gated behind the `CORPUS` environment
+variable).
+
+| Property | Result |
+|---|---|
+| Stories found | 32, largest 28, 234 signals assigned |
+| Repeat runs over unchanged data | Byte-identical membership across 5 runs |
+| Streaming, 400 seed then 50 / 20 / 5 at a time | **0% churn** — not one of 645, 1690, or 6874 carried assignments moved |
+| Streaming, 300 seed then 50 at a time | 0.4–1.0% churn — 3 to 8 of 791 carried assignments moved |
+| Largest story during streaming | Pinned at 24–27 throughout |
+| Story count during streaming | Grows 14 → 37 as new topics arrive |
+| Passes to a fixpoint after an arrival | 1 extra pass, then nothing changes ever |
+
+The remaining signals stay in the outlier bucket. On news data much of that is
+genuine — isolated stories of one or two articles — and the rest is the coverage
+side of the `MeanRemoval` / `AssignThreshold` trade-off documented in
+[`README.md`](README.md#tuning).
 
 ---
 
 ## Non-Goals
+
 - Distributed operation (single-node, embedded).
-- Approximate Nearest Neighbor (ANN) indexing (brute-force centroids is $O(stories)$ and fast enough for the expected story count).
-- Built-in embedding generation (caller provided).
-
-
-## Maintenance Pass
-
-Replaces batch re-clustering as of spec 006. HDBSCAN was removed: it builds an
-MST over mutual-reachability distances, which is single linkage with a density
-correction, and news embeddings chain through it. On a 596-signal corpus,
-transitive grouping at cosine distance 0.25 put 324 signals into one component
-while nearest-centroid grouping at the same threshold produced a largest group
-of 22. Re-clustering also discarded story identity every run, which is what the
-Jaccard/Hungarian mapping engine existed to reconstruct.
-
-### Operations, in order
-
-| # | Operation | Rule |
-|---|---|---|
-| 1 | Evict | Outliers older than `lastBatch − OutlierTTL`. |
-| 2 | Promote | Groups of outliers that are mutually within `AssignThreshold` and number at least `MinStorySize` become new stories. |
-| 3 | Split | A story whose best two-way partition has part centroids more than `SplitThreshold` apart, with both parts at least `MinStorySize`, divides in two. |
-| 4 | Merge | Stories whose centroids are within `MergeThreshold` unify; oldest `CreatedAt` survives. |
-| 5 | Recentre | Recompute both centroids, radius, mean distance, σ, and σ_global. |
-| 6 | Lifecycle | Active → Dormant → Archived on the existing windows. |
-
-Promotion uses **mutual-neighbour cliques, not connected components**:
-components are the transitive linkage that chains. Every member of a promoted
-story is within `AssignThreshold` of every other, so it is compact from birth.
-
-### Thresholds
-
-`MergeThreshold` (0.22) and `SplitThreshold` (0.30) are the two edges of one
-hysteresis band, and `SplitThreshold` must be strictly greater. Merge tests one
-historically-given partition; split searches for the best partition. A search
-can beat a fixed arrangement on the same signals, so with a single shared value
-a merge and a split undo each other along different seams and story IDs churn
-while the data is unchanged. `validate()` rejects a collapsed band.
-
-`AssignThreshold` (0.28) governs a different comparison — one point against a
-centroid, rather than two centroids against each other — and so keeps its own
-value. It also clamps the adaptive per-story threshold, so a story that has
-drifted wide cannot keep widening its own catchment.
-
-### The split radius gate
-
-Testing every story's partition each run is wasteful, so a necessary condition
-runs first: attempt a split only when `4r − 2r² > SplitThreshold`, where *r* is
-the story radius.
-
-The bound is **not** the Euclidean `2r`. Cosine distance is not a metric and
-`1 − cos` grows quadratically in the angle, so two members each at cosine
-distance *r* from the centroid can be `1 − cos(2·arccos(1−r))` apart, which
-expands to `4r − 2r²`. At *r* = 0.122 that is 0.458 against the 0.245 a
-Euclidean bound predicts, so `2r` would skip stories that genuinely split.
-
-### Centroids
-
-Each story carries two. `Centroid` is the unweighted mean of **all** members and
-is the identity geometry: merge, split, radius, and σ measure against it.
-`RecentCentroid` covers members within `ActiveContextWindow` and is what Draft
-admission compares against, so a developing story keeps admitting its own
-current coverage while its identity stays anchored.
-
-Both are **recomputed from members every run**, never accumulated. A running
-mean or EMA depends on arrival order and elapsed run count, so two stores
-holding identical signals would carry different centroids and every threshold
-comparison downstream would differ with them.
-
-### Membership stability
-
-No signal is relocated individually. Membership changes only through split or
-merge, each of which moves a whole group and emits an event. An individual
-misassignment is therefore not individually correctable — it is repaired only
-when enough similar signals accumulate to form a group that clears
-`MinStorySize`, which is exactly when the error is worth acting on. Churning one
-signal between stories every run is the instability this design removes.
+- Approximate nearest-neighbour indexing — brute force over centroids is
+  O(stories) and fast enough for the expected story count.
+- Built-in embedding generation (caller-provided).
+- Correcting an individual misassigned signal, by design; see Membership
+  stability.

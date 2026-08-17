@@ -5,15 +5,22 @@
 // Ingestion is two-phase:
 //
 //   - Real-time Draft phase: each signal is immediately assigned to the
-//     nearest story centroid via cosine similarity.
-//   - Periodic Refinement phase: a background batch run applies HDBSCAN
-//     to re-cluster recent signals, resolving splits, merges, and
-//     misassignments from the Draft phase.
+//     nearest story centroid, or held as an outlier when no story covers it.
+//   - Periodic maintenance phase: a background batch run maintains the
+//     existing stories rather than re-deriving them, promoting groups of
+//     outliers, admitting outliers into stories that cover them, splitting
+//     stories that have diverged, and merging those that have converged.
+//     Story identity therefore survives every run.
 //
-// Signal IDs are UUID v5. Callers should derive them using the exported
-// TrackerNamespace:
+// Distances are measured in centred space: the corpus mean is subtracted from
+// every embedding before any comparison, which is what keeps anisotropic text
+// embeddings from collapsing into a single story. Every threshold in Config is
+// a centred-space distance. See DESIGN.md.
 //
-//	id := uuid.NewSHA1(story.TrackerNamespace, []byte(domainKey))
+// Signal IDs are UUID v5, derived from a caller domain key. Prefer
+// Tracker.SignalID, which honours a configured Config.Namespace:
+//
+//	id := tracker.SignalID(domainKey)
 //
 // Create a Tracker by supplying a Config with at least a Store and Codec:
 //

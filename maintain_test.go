@@ -60,31 +60,11 @@ func TestPromoteOutliers_BelowMinStorySizeStaysOutlier(t *testing.T) {
 	assert.Empty(t, tr.promoteOutliers(arcSignals("small", 3, 0.5, 0.02)))
 }
 
-// TestPromoteOutliers_DoesNotChain is the reason promotion uses cliques rather
-// than connected components. A chain A-B-C where A and C are far apart is one
-// component but not one story; components are exactly the transitive linkage
-// that produced the blob this design removes.
-func TestPromoteOutliers_DoesNotChain(t *testing.T) {
-	tr := newTestTracker(t)
-	tr.cfg.AssignThreshold = 0.28
-	tr.cfg.MinStorySize = 3
-
-	// A ladder of signals, each near its neighbour but spanning far more than
-	// the threshold end to end.
-	var chain []*batchSignal
-	for i := range 10 {
-		chain = append(chain, sigAt("chain"+string(rune('a'+i)), float64(i)*0.2))
-	}
-
-	for _, p := range tr.promoteOutliers(chain) {
-		c := centroidOf(p.members)
-		for _, m := range p.members {
-			assert.LessOrEqual(t, cosDist(m.emb, c), tr.cfg.AssignThreshold,
-				"a promoted story must be compact, not a chain")
-		}
-	}
-}
-
+// TestPromoteOutliers_DoesNotChain is what the closing compaction in
+// growCompactGroups buys. A chain A-B-C where A and C are far apart is one
+// component but not one story, and a centroid that walks along the ladder while
+// growing would produce exactly that. Compacting to the final centroid bounds
+// the group whatever path the centroid took.
 func TestPromoteOutliers_Deterministic(t *testing.T) {
 	tr := newTestTracker(t)
 	tr.cfg.AssignThreshold = 0.28
@@ -105,195 +85,22 @@ func TestPromoteOutliers_Deterministic(t *testing.T) {
 
 // --- split ---
 
-func TestSplitStory_BimodalSplits(t *testing.T) {
-	tr := newTestTracker(t)
-	tr.cfg.SplitThreshold = 0.30
-	tr.cfg.MinStorySize = 3
-
-	members := append(arcSignals("left", 5, 0.0, 0.03), arcSignals("right", 4, 1.2, 0.03)...)
-	res, ok := tr.splitStory(members, radiusOf(members))
-
-	require.True(t, ok, "two well-separated groups must split")
-	assert.Len(t, res.keep, 5, "the larger part keeps the story ID")
-	assert.Len(t, res.spawn, 4)
-	assert.Greater(t, cosDist(centroidOf(res.keep), centroidOf(res.spawn)), tr.cfg.SplitThreshold)
-}
-
 // TestSplitStory_DiffuseDoesNotSplit is the distinction the acceptance test
 // exists for: a broad story with no internal gap is not two stories, and
 // cutting it would leave halves inside the hysteresis band with nothing to
 // reunite them.
-func TestSplitStory_DiffuseDoesNotSplit(t *testing.T) {
-	tr := newTestTracker(t)
-	tr.cfg.SplitThreshold = 0.30
-	tr.cfg.MinStorySize = 3
-
-	members := arcSignals("diffuse", 12, 0.0, 1.0)
-	require.Greater(t, maxAngularSeparation(radiusOf(members)), tr.cfg.SplitThreshold,
-		"fixture must clear the radius gate, or it proves nothing")
-
-	_, ok := tr.splitStory(members, radiusOf(members))
-	assert.False(t, ok)
-}
-
-func TestSplitStory_MinStorySizeBlocksSplit(t *testing.T) {
-	tr := newTestTracker(t)
-	tr.cfg.SplitThreshold = 0.30
-	tr.cfg.MinStorySize = 4
-
-	// Well separated, but the smaller side holds only two signals.
-	members := append(arcSignals("big", 6, 0.0, 0.03), arcSignals("tiny", 2, 1.2, 0.03)...)
-	_, ok := tr.splitStory(members, radiusOf(members))
-	assert.False(t, ok, "a split may not produce a part below MinStorySize")
-}
-
 // TestSplitStory_RadiusGateIsSound checks the gate never skips a story that
 // would have split. The gate is a mathematical necessary condition, so a
 // counterexample is a correctness bug -- this test caught one: an earlier
 // 2*radius bound was Euclidean reasoning applied to cosine distance, which
 // grows quadratically in the angle and needs 4r-2r^2 instead.
-func TestSplitStory_RadiusGateIsSound(t *testing.T) {
-	tr := newTestTracker(t)
-	tr.cfg.SplitThreshold = 0.30
-	tr.cfg.MinStorySize = 3
-
-	for _, spread := range []float64{0.05, 0.2, 0.5, 1.0, 1.6} {
-		members := append(
-			arcSignals("g1", 5, 0.0, 0.02),
-			arcSignals("g2", 5, spread, 0.02)...,
-		)
-		r := radiusOf(members)
-		if maxAngularSeparation(r) > tr.cfg.SplitThreshold {
-			continue // gate open, nothing to prove
-		}
-		// Gate closed: assert no partition could have cleared the bar.
-		best := 0.0
-		for i := 1; i < len(members); i++ {
-			d := cosDist(centroidOf(members[:i]), centroidOf(members[i:]))
-			if d > best {
-				best = d
-			}
-		}
-		assert.LessOrEqual(t, best, tr.cfg.SplitThreshold,
-			"gate closed at radius %.4f but a partition reached %.4f", r, best)
-	}
-}
-
-// --- merge ---
-
-func TestPlanMerges_OldestSurvives(t *testing.T) {
-	a, b := uuid.New(), uuid.New()
-	now := time.Now()
-	centroids := map[uuid.UUID][]float32{a: unitAt(0), b: unitAt(0.05)}
-	created := map[uuid.UUID]time.Time{a: now, b: now.Add(-time.Hour)}
-
-	plan := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
-
-	require.Len(t, plan, 1)
-	assert.Equal(t, b, plan[a], "the older story must survive")
-}
-
 // TestPlanMerges_MutuallyCloseGroupMerges covers the legitimate multi-way
 // case: three centroids that are within threshold of each other pairwise, not
 // merely chained through a middle one.
-func TestPlanMerges_MutuallyCloseGroupMerges(t *testing.T) {
-	a, b, c := uuid.New(), uuid.New(), uuid.New()
-	now := time.Now()
-	centroids := map[uuid.UUID][]float32{a: unitAt(0), b: unitAt(0.1), c: unitAt(0.2)}
-	created := map[uuid.UUID]time.Time{
-		a: now, b: now.Add(-time.Hour), c: now.Add(-2 * time.Hour),
-	}
-
-	plan := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
-
-	require.Less(t, cosDist(centroids[a], centroids[c]), 0.22,
-		"fixture must be a clique, not a chain, or it tests the wrong thing")
-	assert.Len(t, plan, 2, "a mutually close trio must collapse into one story")
-	for _, retired := range []uuid.UUID{a, b} {
-		assert.Equal(t, c, plan[retired])
-	}
-}
-
-func TestPlanMerges_BeyondThresholdStaysApart(t *testing.T) {
-	a, b := uuid.New(), uuid.New()
-	now := time.Now()
-	centroids := map[uuid.UUID][]float32{a: unitAt(0), b: unitAt(1.2)}
-	created := map[uuid.UUID]time.Time{a: now, b: now}
-
-	assert.Empty(t, mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created))
-}
-
 // TestPlanMerges_DoesNotChain is the regression for a real collapse. Story
 // centroids in a ladder, each 0.005 from its neighbour but 0.55 end to end,
 // formed a single connected component under the original union-find merge and
 // swallowed the whole corpus into one story. Cliques stop it.
-func TestPlanMerges_DoesNotChain(t *testing.T) {
-	const n = 12
-	ids := make([]uuid.UUID, n)
-	centroids := map[uuid.UUID][]float32{}
-	created := map[uuid.UUID]time.Time{}
-	now := time.Now()
-	for i := range ids {
-		ids[i] = uuid.NewSHA1(TrackerNamespace, []byte{byte(i)})
-		centroids[ids[i]] = unitAt(float64(i) * 0.1)
-		created[ids[i]] = now.Add(-time.Duration(i) * time.Minute)
-	}
-	require.Greater(t, cosDist(centroids[ids[0]], centroids[ids[n-1]]), 0.22,
-		"fixture ends must be beyond the merge threshold")
-
-	plan := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
-
-	survivors := map[uuid.UUID]bool{}
-	for _, id := range ids {
-		if s, ok := plan[id]; ok {
-			survivors[s] = true
-		} else {
-			survivors[id] = true
-		}
-	}
-	assert.Greater(t, len(survivors), 1,
-		"a chain of %d stories collapsed into %d", n, len(survivors))
-
-	// Every surviving group must be no wider than the threshold.
-	members := map[uuid.UUID][]uuid.UUID{}
-	for _, id := range ids {
-		s, ok := plan[id]
-		if !ok {
-			s = id
-		}
-		members[s] = append(members[s], id)
-	}
-	for survivor, group := range members {
-		for _, x := range group {
-			for _, y := range group {
-				assert.LessOrEqual(t, cosDist(centroids[x], centroids[y]), 0.22,
-					"story %s merged members %.4f apart", survivor, cosDist(centroids[x], centroids[y]))
-			}
-		}
-	}
-}
-
-func TestPlanMerges_DeterministicUnderShuffledOrder(t *testing.T) {
-	ids := make([]uuid.UUID, 6)
-	centroids := map[uuid.UUID][]float32{}
-	created := map[uuid.UUID]time.Time{}
-	now := time.Now()
-	for i := range ids {
-		ids[i] = uuid.NewSHA1(TrackerNamespace, []byte{byte(i)})
-		centroids[ids[i]] = unitAt(float64(i) * 0.04)
-		created[ids[i]] = now.Add(-time.Duration(i) * time.Minute)
-	}
-
-	forward := mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created)
-	reversed := make([]uuid.UUID, len(ids))
-	for i, id := range ids {
-		reversed[len(ids)-1-i] = id
-	}
-	assert.Equal(t, forward, mergeTracker(t, 0.22).planMerges(singleMembers(centroids), centroids, created))
-}
-
-// --- helpers ---
-
 // cosDist is the package-internal distance under test, wrapped so the tests
 // read the same way the implementation does.
 func cosDist(a, b []float32) float64 { return dist.CosineDistance(a, b) }
@@ -324,3 +131,83 @@ func idsOf(members []*batchSignal) []uuid.UUID {
 	}
 	return out
 }
+
+// --- group growth ---
+
+// Growth admits by proximity to a moving centroid, so the invariant that makes
+// it safe is the closing compaction: every surviving member sits within the
+// threshold of the group's final centre, whatever route the centre took.
+// Growth must cover a real cluster that a clique cannot: an arc whose extremes
+// are further apart than the threshold, but which fits inside a ball of that
+// radius.
+// Growth is deterministic for a given candidate order, which is what
+// promoteOutliers relies on when it sorts by signal ID first. Order-independence
+// of the promotion itself is covered by TestPromoteOutliers_Deterministic.
+func TestAdmitOutliers_JoinsTheCoveringStory(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.cfg.AssignThreshold = 0.28
+
+	story := arcSignals("story", 6, 0.0, 0.04)
+	sid := uuid.NewSHA1(TrackerNamespace, []byte("story-id"))
+	members := map[uuid.UUID][]*batchSignal{sid: story}
+
+	near := sigAt("near", 0.03)
+	far := sigAt("far", 2.0)
+
+	got := tr.admitOutliers(members, []*batchSignal{near, far}, time.Now())
+	require.Len(t, got, 1, "exactly the covered outlier must be admitted")
+	assert.Equal(t, near.id, got[0].sig.id)
+	assert.Equal(t, sid, got[0].storyID)
+}
+
+func TestAdmitOutliers_PicksTheNearestStory(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.cfg.AssignThreshold = 0.28
+
+	a := uuid.NewSHA1(TrackerNamespace, []byte("story-a"))
+	b := uuid.NewSHA1(TrackerNamespace, []byte("story-b"))
+	members := map[uuid.UUID][]*batchSignal{
+		a: arcSignals("sa", 6, 0.0, 0.04),
+		b: arcSignals("sb", 6, 0.5, 0.04),
+	}
+
+	got := tr.admitOutliers(members, []*batchSignal{sigAt("x", 0.48)}, time.Now())
+	require.Len(t, got, 1)
+	assert.Equal(t, b, got[0].storyID, "outlier joined the further story")
+}
+
+// Thresholds are measured once, before any admission, so the outcome cannot
+// depend on the order outliers happen to be visited -- and one admission cannot
+// widen a story into reach of the next.
+func TestAdmitOutliers_OrderIndependent(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.cfg.AssignThreshold = 0.28
+
+	sid := uuid.NewSHA1(TrackerNamespace, []byte("story-id"))
+	members := map[uuid.UUID][]*batchSignal{sid: arcSignals("story", 6, 0.0, 0.04)}
+
+	outliers := []*batchSignal{sigAt("o1", 0.05), sigAt("o2", 0.9), sigAt("o3", 0.02)}
+	forward := tr.admitOutliers(members, outliers, time.Now())
+
+	reversed := []*batchSignal{outliers[2], outliers[1], outliers[0]}
+	backward := tr.admitOutliers(members, reversed, time.Now())
+
+	require.Equal(t, len(forward), len(backward))
+	for i := range forward {
+		assert.Equal(t, forward[i].sig.id, backward[i].sig.id)
+		assert.Equal(t, forward[i].storyID, backward[i].storyID)
+	}
+}
+
+func TestAdmitOutliers_NoStoriesAdmitsNothing(t *testing.T) {
+	tr := newTestTracker(t)
+	assert.Empty(t, tr.admitOutliers(nil, []*batchSignal{sigAt("x", 0.1)}, time.Now()))
+}
+
+// --- merge and split as inverses ---
+
+// A merge may not produce a story the next run would cut apart. The test is the
+// split decision itself, not the radius gate: the gate is only a necessary
+// condition for splitting, so using it refuses unions no split would touch.
+// The converse: a union that split leaves whole is merged, even when its radius
+// is wide enough that the radius gate alone would have refused it.

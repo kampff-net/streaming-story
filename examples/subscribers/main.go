@@ -39,12 +39,10 @@ func main() {
 		Codec:           NewsCodec{},
 		BatchInterval:   500 * time.Millisecond,
 		EventBufferSize: 128,
-		// With 3-point clusters, MinSamples=MinClusterSize=3 makes every core
-		// distance reach into the neighbouring cluster and flattens the mutual
-		// reachability graph, merging everything into one story. MinSamples=2
-		// keeps core distances within-cluster so a small demo separates
-		// cleanly into two stories plus a genuine outlier.
-		MinSamples: 2,
+		// A demo corpus is far narrower than a real one, so leave more of the
+		// corpus mean in place: full centring would turn a handful of tight
+		// clusters into noise. See Config.MeanRemoval.
+		MeanRemoval: 0.6,
 	}
 
 	tracker, err := story.NewTracker(cfg)

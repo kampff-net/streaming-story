@@ -12,7 +12,6 @@
 | 003 | Two-Phase Cluster Mapping & Lifecycle | ⛔ `SUPERSEDED` by 006 | 2026-08-11 | 2026-08-11 | [spec.md](003_cluster_mapping_lifecycle/spec.md) |
 | 004 | KV Storage Schema & Persistence Layer | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](004_storage_persistence_layer/spec.md) |
 | 005 | Event Streaming & Iterators API | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](005_event_streaming_iterators/spec.md) |
-| 006 | Centroid-Based Incremental Clustering | 🚧 `IMPLEMENTING` | 2026-08-16 | 2026-08-16 | [spec.md](006_centroid_incremental_clustering/spec.md) |
 
 > Spec 006 supersedes the batch re-clustering pipeline in 002 and the cluster
 > mapping engine in 003. Both remain listed for the history.
@@ -21,6 +20,14 @@
 
 | # | Feature | Status | Created | Updated | Spec |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| 006 | Centroid-Based Incremental Clustering | ✅ `COMPLETED` | 2026-08-16 | 2026-08-17 | [spec.md](006_centroid_incremental_clustering/spec.md) |
+
+> Implemented, then revised in four places once measured against the reference
+> corpus: centred geometry, promotion by centroid growth, outlier admission, and
+> the merge admission test. §2.10 of the spec summarises them; superseded
+> approaches are in [HISTORY.md](../HISTORY.md). Two items remain open, both
+> outside this repository or deferred: `magic-giant` config plumbing and a
+> benchmark re-run.
 
 ## Proposed
 
