@@ -22,6 +22,10 @@
 //
 //	id := tracker.SignalID(domainKey)
 //
+// Story IDs are UUID v5 as well, derived from the signals a story was founded
+// on rather than drawn at random, so replaying a signal stream against a fresh
+// store reproduces the same story IDs.
+//
 // Create a Tracker by supplying a Config with at least a Store and Codec:
 //
 //	t, err := story.NewTracker(story.Config[MyData]{

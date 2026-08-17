@@ -1,6 +1,7 @@
 package story
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kvsh.ch/streaming-story/internal/dist"
+	"go.kvsh.ch/streaming-story/internal/keys"
 )
 
 // unitAt returns a unit vector at the given angle in the first two dimensions,
@@ -211,3 +213,103 @@ func TestAdmitOutliers_NoStoriesAdmitsNothing(t *testing.T) {
 // condition for splitting, so using it refuses unions no split would touch.
 // The converse: a union that split leaves whole is merged, even when its radius
 // is wide enough that the radius gate alone would have refused it.
+
+// --- deterministic story IDs ---
+
+// deriveIn runs deriveStoryID inside a transaction on the tracker's store.
+func deriveIn(t *testing.T, tr *Tracker[string], seed string, members []*batchSignal, taken map[uuid.UUID]time.Time) uuid.UUID {
+	t.Helper()
+	var got uuid.UUID
+	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+		var err error
+		got, err = deriveStoryID(tx, tr.cfg.Namespace, seed, members, taken)
+		return err
+	}))
+	return got
+}
+
+// occupy writes a placeholder metadata record so an ID reads as taken.
+func occupy(t *testing.T, tr *Tracker[string], id uuid.UUID) {
+	t.Helper()
+	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+		return tx.Put(keys.StoryMeta(id), []byte("{}"))
+	}))
+}
+
+// A story ID is a function of its founding members, not of the order they were
+// collected in, and not of the tracker instance that ran the pass.
+func TestDeriveStoryID_DependsOnMembersOnly(t *testing.T) {
+	members := arcSignals("derive", 5, 0.3, 0.04)
+	reversed := make([]*batchSignal, len(members))
+	for i, m := range members {
+		reversed[len(members)-1-i] = m
+	}
+
+	first := deriveIn(t, newTestTracker(t), "promote", members, nil)
+	assert.Equal(t, first, deriveIn(t, newTestTracker(t), "promote", reversed, nil),
+		"member order changed the derived ID")
+
+	assert.NotEqual(t, first, deriveIn(t, newTestTracker(t), "promote", members[:4], nil),
+		"a different member set produced the same ID")
+}
+
+// Promotion and split are separate births, so the same member set reaching
+// story status by either route must not claim one ID.
+func TestDeriveStoryID_SeedSeparatesBirthRoutes(t *testing.T) {
+	tr := newTestTracker(t)
+	members := arcSignals("seed", 4, 0.3, 0.04)
+	parent := uuid.NewSHA1(TrackerNamespace, []byte("parent"))
+
+	promoted := deriveIn(t, tr, "promote", members, nil)
+	split := deriveIn(t, tr, "split:"+parent.String(), members, nil)
+	assert.NotEqual(t, promoted, split)
+}
+
+// An ID already held by a live story is rejected and rederived, so a split
+// spawning the member set of an existing story cannot silently fold into it.
+// The rederivation is itself deterministic.
+func TestDeriveStoryID_SaltsPastOccupiedIDs(t *testing.T) {
+	members := arcSignals("salt", 4, 0.3, 0.04)
+
+	base := deriveIn(t, newTestTracker(t), "promote", members, nil)
+
+	stored := newTestTracker(t)
+	occupy(t, stored, base)
+	next := deriveIn(t, stored, "promote", members, nil)
+	assert.NotEqual(t, base, next, "an occupied ID was handed out again")
+	assert.Equal(t, next, deriveIn(t, stored, "promote", members, nil),
+		"rederivation past an occupied ID is not reproducible")
+
+	// A story created earlier in the same run holds its ID before any
+	// metadata exists for it, so the in-run set must be honoured too.
+	inRun := deriveIn(t, newTestTracker(t), "promote", members,
+		map[uuid.UUID]time.Time{base: time.Now()})
+	assert.Equal(t, next, inRun, "the in-run set and the store disagree on what is taken")
+}
+
+// The end-to-end property: replaying a signal stream against a fresh store
+// reproduces the story IDs of the original run, so recorded output can be
+// diffed against a replay.
+func TestStoryIDs_SurviveReplay(t *testing.T) {
+	run := func() map[uuid.UUID][]uuid.UUID {
+		tr := newTestTracker(t)
+		tr.dim.Store(2)
+		now := time.Now()
+		for i := range 6 {
+			ingestAt(t, tr, fmt.Sprintf("replay-a-%d", i), 0.0+float64(i)*0.01, now)
+		}
+		for i := range 6 {
+			ingestAt(t, tr, fmt.Sprintf("replay-b-%d", i), 2.0+float64(i)*0.01, now)
+		}
+		tr.runBatch()
+		return storySnapshot(t, tr)
+	}
+
+	first, second := run(), run()
+	require.NotEmpty(t, first)
+	require.Equal(t, len(first), len(second))
+	for id, sigs := range first {
+		require.Contains(t, second, id, "replay minted a different story ID")
+		assert.ElementsMatch(t, sigs, second[id], "story %s has different members on replay", id)
+	}
+}

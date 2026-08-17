@@ -1,8 +1,10 @@
 package story
 
 import (
+	"bytes"
 	"math"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +20,65 @@ import (
 // promotion is a group of outliers that has earned story status.
 type promotion struct {
 	members []*batchSignal
+}
+
+// deriveStoryID derives a new story's ID from the signals that founded it, as
+// UUID v5 under the tracker namespace. Story IDs are therefore a function of
+// the input stream alone: replaying the same signals against a fresh store
+// reproduces the same IDs, so a recorded run can be diffed against a replay.
+//
+// seed separates the two ways a story is born, promotion out of the outlier
+// bucket and a split off a parent, so one member set reaching story status by
+// different routes does not claim a single ID.
+//
+// An ID already in use is rejected and rederived with the next salt. A split
+// can spawn exactly the member set some live story was founded on, and reusing
+// that ID would silently fold the two together. Salting stays deterministic:
+// a replay meets the same occupied IDs in the same order and takes the same
+// number of steps. taken carries the stories of this run that hold an ID
+// without having written metadata yet.
+func deriveStoryID(
+	tx Tx,
+	ns uuid.UUID,
+	seed string,
+	members []*batchSignal,
+	taken map[uuid.UUID]time.Time,
+) (uuid.UUID, error) {
+
+	ids := make([]uuid.UUID, len(members))
+	for i, m := range members {
+		ids[i] = m.id
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return bytes.Compare(ids[i][:], ids[j][:]) < 0
+	})
+
+	for salt := 0; ; salt++ {
+		name := make([]byte, 0, len(seed)+1+16*len(ids)+8)
+		name = append(name, seed...)
+		name = append(name, 0)
+		for _, id := range ids {
+			name = append(name, id[:]...)
+		}
+		if salt > 0 {
+			name = append(name, 0)
+			name = strconv.AppendInt(name, int64(salt), 10)
+		}
+
+		id := uuid.NewSHA1(ns, name)
+		if _, ok := taken[id]; ok {
+			continue
+		}
+		// Archived stories are left out of the batch's story map, so the
+		// store is the authority on whether an ID is free.
+		val, err := tx.Get(keys.StoryMeta(id))
+		if err != nil {
+			return uuid.Nil, err
+		}
+		if val == nil {
+			return id, nil
+		}
+	}
 }
 
 // promoteOutliers groups outliers into new stories by nearest-centroid growth,
@@ -203,7 +264,10 @@ func (t *Tracker[T]) applyMaintenance(
 			created[id] = rec.CreatedAt
 		}
 		for _, p := range t.promoteOutliers(outliers) {
-			sid := uuid.New()
+			sid, err := deriveStoryID(tx, t.cfg.Namespace, "promote", p.members, created)
+			if err != nil {
+				return err
+			}
 			for _, m := range p.members {
 				if err := moveSignal(tx, keys.Outlier(m.id), keys.Signal(sid, m.id)); err != nil {
 					return err
@@ -260,7 +324,10 @@ func (t *Tracker[T]) applyMaintenance(
 			if !ok {
 				continue
 			}
-			child := uuid.New()
+			child, err := deriveStoryID(tx, t.cfg.Namespace, "split:"+sid.String(), res.spawn, created)
+			if err != nil {
+				return err
+			}
 			for _, m := range res.spawn {
 				if err := moveSignal(tx, keys.Signal(sid, m.id), keys.Signal(child, m.id)); err != nil {
 					return err
