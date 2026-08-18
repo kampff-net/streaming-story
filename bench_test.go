@@ -2,7 +2,9 @@ package story
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,6 +58,58 @@ func BenchmarkBatch(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		tr.runBatch()
+	}
+}
+
+// BenchmarkBatchFacets measures a full batch cycle as a function of how many
+// facets each signal carries. A signal is named by one marker per facet, so a
+// batch that decoded per marker decoded the record once per facet; this is what
+// the signal cache in collectBatch removes, and multi-facet is the only shape
+// that shows it.
+func BenchmarkBatchFacets(b *testing.B) {
+	for _, facets := range []int{1, 3} {
+		b.Run(fmt.Sprintf("F%d", facets), func(b *testing.B) {
+			const signals = 400
+
+			rng := rand.New(rand.NewSource(7))
+			now := time.Now()
+
+			tr, err := NewTracker[string](Config[string]{
+				Store:         newMemStore(),
+				Codec:         JSONCodec[string]{},
+				BatchInterval: time.Hour,
+				MinStorySize:  3,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = tr.Close() })
+
+			// A payload with some bulk: the decode the cache saves is dominated
+			// by the data, not by the vector.
+			payload := strings.Repeat("lorem ipsum dolor sit amet consectetur ", 40)
+
+			for i := range signals {
+				embs := make([]Embedding, facets)
+				for f := range embs {
+					embs[f] = benchBlob(rng, ((i+f)%4)*2)
+				}
+				sig := Signal[string]{
+					ID:         uuid.New(),
+					At:         now.Add(-time.Duration(i) * time.Second),
+					Embeddings: embs,
+					Data:       payload,
+				}
+				if _, err := tr.Ingest(context.Background(), sig); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.ResetTimer()
+			for b.Loop() {
+				tr.runBatch()
+			}
+		})
 	}
 }
 

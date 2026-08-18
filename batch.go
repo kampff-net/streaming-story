@@ -138,6 +138,33 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 		evict   []uuid.UUID
 	)
 
+	// A signal with several facets is named by several markers, so a batch
+	// that decoded per marker decoded it once per facet. Cache what a
+	// batchFacet actually needs and nothing else: holding the whole record
+	// would keep every payload in the batch alive for the length of the
+	// collect, and the payload is the bulk of it.
+	type cachedSignal struct {
+		at   time.Time
+		embs []Embedding
+	}
+	sigCache := make(map[uuid.UUID]*cachedSignal)
+	getSignal := func(sigID uuid.UUID) (*cachedSignal, bool, error) {
+		if s, ok := sigCache[sigID]; ok {
+			return s, s != nil, nil
+		}
+		sig, found, err := t.readCanonicalSignal(tx, sigID)
+		if err != nil {
+			return nil, false, err
+		}
+		if !found {
+			sigCache[sigID] = nil
+			return nil, false, nil
+		}
+		c := &cachedSignal{at: sig.At, embs: sig.Embeddings}
+		sigCache[sigID] = c
+		return c, true, nil
+	}
+
 	err := tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
 		id, ok := keys.ParseStoryMeta(key)
 		if !ok {
@@ -162,11 +189,11 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 			if !ok {
 				return nil
 			}
-			sig, found, err := t.readCanonicalSignal(tx, sigID)
+			sig, found, err := getSignal(sigID)
 			if err != nil {
 				return err
 			}
-			if !found || facet >= len(sig.Embeddings) {
+			if !found || facet >= len(sig.embs) {
 				// A marker with no record behind it, or naming a facet the
 				// record does not have. Skip rather than fail: the store
 				// invariant test is what catches this, and a batch run must
@@ -174,10 +201,10 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 				return nil
 			}
 			signals = append(signals, batchFacet{
-				id:      sig.ID,
+				id:      sigID,
 				facet:   facet,
-				at:      sig.At,
-				emb:     sig.Embeddings[facet],
+				at:      sig.at,
+				emb:     sig.embs[facet],
 				storyID: id,
 			})
 			return nil
@@ -195,24 +222,24 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 		if !ok {
 			return nil
 		}
-		sig, found, err := t.readCanonicalSignal(tx, sigID)
+		sig, found, err := getSignal(sigID)
 		if err != nil {
 			return err
 		}
-		if !found || facet >= len(sig.Embeddings) {
+		if !found || facet >= len(sig.embs) {
 			return nil
 		}
 		// The TTL is a property of the signal's timestamp, so every unplaced
 		// facet of an aged signal is evicted in the same pass.
-		if sig.At.Before(t.lastBatch.Add(-t.cfg.OutlierTTL)) {
-			evict = append(evict, sig.ID)
+		if sig.at.Before(t.lastBatch.Add(-t.cfg.OutlierTTL)) {
+			evict = append(evict, sigID)
 			return nil
 		}
 		signals = append(signals, batchFacet{
-			id:      sig.ID,
+			id:      sigID,
 			facet:   facet,
-			at:      sig.At,
-			emb:     sig.Embeddings[facet],
+			at:      sig.at,
+			emb:     sig.embs[facet],
 			storyID: uuid.Nil,
 			outlier: true,
 		})
@@ -377,7 +404,7 @@ func (t *Tracker[T]) provisionalStory(emb []float32, now time.Time) uuid.UUID {
 		if s.meta.LastSignalAt.Before(cutoff) {
 			continue
 		}
-		d := dist.CosineDistance(emb, s.meta.Centroid)
+		d := dist.CosineDistance(emb, s.meta.RecentCentroid)
 		if d < bestDist {
 			bestDist, best, bestMeta = d, s.meta.ID, s.meta
 		}
