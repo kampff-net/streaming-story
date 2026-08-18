@@ -144,6 +144,62 @@ func (t *Tracker[T]) writeCanonicalSignal(tx Tx, sig Signal[T]) error {
 	return tx.Put(key, encoded)
 }
 
+// reconcileFacetCount brings the store in line with a re-delivery that carries
+// fewer facets than the stored record does.
+//
+// A signal's facet set is normally fixed at first ingest: the record is written
+// once, and the facet index in a marker key is only meaningful against it. A
+// shorter re-delivery is the one case that genuinely removes facets, and every
+// trace of them has to go in this transaction — the markers, their entries in
+// the location index, and their vectors in the record. Truncating the index
+// alone (which is all the write at the end of Ingest does) leaves markers no
+// later read can resolve and no eviction can reach.
+//
+// Only the embeddings are truncated. At and Data keep the stored values: the
+// record stays write-once for the payload, so a re-delivery still cannot
+// overwrite what a batch run has already clustered.
+func (t *Tracker[T]) reconcileFacetCount(tx Tx, id uuid.UUID, want int) error {
+	stored, found, err := t.readCanonicalSignal(tx, id)
+	if err != nil || !found {
+		return err
+	}
+	if want >= len(stored.Embeddings) {
+		return nil
+	}
+
+	locs, _, err := readSignalLocSet(tx, id)
+	if err != nil {
+		return err
+	}
+	for facet := want; facet < len(stored.Embeddings); facet++ {
+		if err := dropFacetOutlier(tx, id, facet); err != nil {
+			return err
+		}
+		if facet >= len(locs) {
+			continue
+		}
+		if sid := locs[facet].StoryID; sid != uuid.Nil {
+			if err := unplaceFacet(tx, sid, id, facet); err != nil {
+				return err
+			}
+		}
+		locs[facet] = keys.FacetLoc{}
+	}
+	if len(locs) > want {
+		locs = locs[:want]
+	}
+	if err := writeSignalLocSet(tx, id, locs); err != nil {
+		return err
+	}
+
+	stored.Embeddings = stored.Embeddings[:want]
+	encoded, err := t.cfg.Codec.Encode(stored)
+	if err != nil {
+		return fmt.Errorf("encode signal: %w", err)
+	}
+	return tx.Put(keys.CanonicalSignal(id), encoded)
+}
+
 // readCanonicalSignal reads the canonical record for a signal. It reports
 // found=false when no record exists, which is how a caller distinguishes an
 // unknown signal from one whose facets are merely all unplaced.
@@ -166,7 +222,9 @@ func (t *Tracker[T]) readCanonicalSignal(tx Tx, id uuid.UUID) (Signal[T], bool, 
 // in the outlier bucket, or nowhere. The marker key spaces are what a scan
 // walks; the location index is the same information keyed by signal, so Ingest
 // can ask "where does this signal live" without scanning anything. Both are
-// written in the same transaction, so they cannot disagree.
+// written in the same transaction, so they cannot disagree — with one case that
+// has to be enforced rather than assumed: a re-delivery carrying fewer facets
+// shortens the index, and reconcileFacetCount removes the markers it drops.
 
 // markerValue is the payload of a facet membership or outlier key. The keys
 // carry the information; the Store contract only forbids an empty value.
@@ -244,18 +302,25 @@ func placedStories(locs []keys.FacetLoc) []uuid.UUID {
 // placed in stories are untouched: a partially placed signal keeps its record
 // and its memberships.
 func evictOutlierFacets(tx Tx, signalID uuid.UUID) error {
+	// The markers are the truth, not the location index. The index is derived
+	// state and can be shorter than the marker set — a re-delivery carrying
+	// fewer facets truncates it — so driving eviction from it silently leaves
+	// markers behind that nothing can ever resolve or remove.
+	facets, err := outlierFacetsOf(tx, signalID)
+	if err != nil {
+		return err
+	}
 	locs, hasIndex, err := readSignalLocSet(tx, signalID)
 	if err != nil {
 		return err
 	}
-	for facet, loc := range locs {
-		if !loc.IsOutlier {
-			continue
-		}
+	for _, facet := range facets {
 		if err := dropFacetOutlier(tx, signalID, facet); err != nil {
 			return err
 		}
-		locs[facet] = keys.FacetLoc{}
+		if facet < len(locs) {
+			locs[facet] = keys.FacetLoc{}
+		}
 	}
 	if hasIndex {
 		if err := writeSignalLocSet(tx, signalID, locs); err != nil {
@@ -263,6 +328,25 @@ func evictOutlierFacets(tx Tx, signalID uuid.UUID) error {
 		}
 	}
 	return gcCanonicalSignal(tx, signalID)
+}
+
+// outlierFacetsOf lists the facet indices of a signal currently held in the
+// outlier bucket. The markers are collected before any delete: mutating the
+// store from inside its own scan is not something the Store contract promises.
+func outlierFacetsOf(tx Tx, signalID uuid.UUID) ([]int, error) {
+	var facets []int
+	err := tx.ScanPrefix(keys.OutlierSignalPrefix(signalID), func(key, _ []byte) error {
+		_, facet, ok := keys.ParseOutlierFacet(key)
+		if !ok {
+			return nil
+		}
+		facets = append(facets, facet)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return facets, nil
 }
 
 // gcCanonicalSignal deletes a signal's canonical record and location index once
@@ -273,13 +357,24 @@ func evictOutlierFacets(tx Tx, signalID uuid.UUID) error {
 // It must run in the same transaction as the delete that removed the last
 // facet, or a crash between the two leaves a record nothing references.
 func gcCanonicalSignal(tx Tx, signalID uuid.UUID) error {
+	// An outlier marker holds the record alive whether or not the location
+	// index still mentions it: the markers are authoritative and the index is
+	// derived, so a truncated index must never license deleting the payload
+	// out from under a marker that still exists.
+	outliers, err := outlierFacetsOf(tx, signalID)
+	if err != nil {
+		return err
+	}
+	if len(outliers) > 0 {
+		return nil
+	}
 	locs, hasIndex, err := readSignalLocSet(tx, signalID)
 	if err != nil {
 		return err
 	}
 	if hasIndex {
 		for _, l := range locs {
-			if l.IsOutlier || l.StoryID != uuid.Nil {
+			if l.StoryID != uuid.Nil {
 				return nil
 			}
 		}

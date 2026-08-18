@@ -166,7 +166,9 @@ These five statements are the whole design. Everything below is mechanism.
 2. **A signal belongs to the union of its facets' stories** — zero, one, or many.
 3. **Geometry is over facets. Each facet is counted exactly once.**
 4. **`MinStorySize` counts distinct signals.**
-5. **The library never creates, reorders, merges, or drops a facet.**
+5. **The library never creates, reorders, merges, or drops a facet** of its
+   own accord. It drops one only where the producer withdraws it, by
+   re-delivering the signal with fewer facets (see *Re-ingest* below).
 
 Invariant 3 has a consequence worth stating out loud, because it is the one
 place a reader may expect otherwise. When two stories merge, a signal that held
@@ -455,6 +457,27 @@ facet is currently placed in a story, the whole signal is a no-op.** Only a
 signal whose every facet is unplaced is re-assigned. Choosing signal-level over
 facet-level here keeps the guarantee that a batch decision is never partially
 overwritten by a late duplicate delivery.
+
+**Shrinking re-delivery.** A signal's facet set is otherwise fixed at first
+ingest: the canonical record is written once, and a facet index in a marker key
+is only meaningful against it. The exception is a re-delivery carrying *fewer*
+facets, which withdraws the ones past its end. That withdrawal is applied ahead
+of the no-op rule above — a signal whose facets are already placed is precisely
+the case that needs it — and it removes every trace in the same transaction: the
+membership or outlier markers, their entries in the location index, and their
+vectors in the record. Only the embeddings are truncated; `At` and `Data` keep
+their stored values, so the payload stays write-once and a late duplicate still
+cannot overwrite what a batch run clustered.
+
+Truncating the location index alone is not enough, and was the original defect:
+the index is derived state, so markers left behind by a shorter index are
+resolvable by nothing and reachable by no eviction, and they outlive the record
+itself. Eviction and the canonical-record GC therefore read the **markers** as
+authoritative and treat the index purely as a cache.
+
+A re-delivery carrying *more* facets than the record is not a growth path: the
+extra facets are ignored while any facet is placed, per the no-op rule. Growing
+a signal's facet set is out of scope here.
 
 **`LastSignalAt`** advances once per touched story, monotonically, as today —
 several facets landing in one story advance it once.

@@ -154,6 +154,14 @@ func OutlierPrefix() []byte {
 	return []byte("o:")
 }
 
+// OutlierSignalPrefix returns the prefix covering every unplaced facet of one
+// signal: "o:{signalID}:". It is how a caller enumerates a signal's outlier
+// markers without trusting the location index, which is derived state and may
+// be shorter than the set of markers actually present.
+func OutlierSignalPrefix(signalID uuid.UUID) []byte {
+	return fmt.Appendf(nil, "o:%s:", signalID)
+}
+
 // parseIDFacet reads a "{signalID}:{facet}" tail. It is the shared tail format
 // of both a facet membership marker and an outlier facet key.
 func parseIDFacet(tail []byte) (uuid.UUID, int, bool) {

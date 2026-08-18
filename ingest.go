@@ -103,6 +103,15 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 			return err
 		}
 
+		// A re-delivery carrying fewer facets than the stored record drops the
+		// ones past its end. This runs ahead of the no-op check below, because
+		// a signal whose facets are already placed is exactly the case where
+		// the dropped markers would otherwise be left with nothing pointing at
+		// them.
+		if err := t.reconcileFacetCount(tx, sig.ID, len(embs)); err != nil {
+			return err
+		}
+
 		// Locate the signal's existing placement first. Re-ingestion of a
 		// signal any story already holds is a strict no-op at the signal
 		// level: batch placements are authoritative, and a duplicate delivery
