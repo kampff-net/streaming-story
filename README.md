@@ -34,8 +34,15 @@ go get go.kvsh.ch/streaming-story
 
 ## Concepts
 
-- **Signal** — one input: UUID v5 ID, timestamp, `[]float32` embedding, and an
-  opaque payload `T`. Embedding dimensionality is fixed by the first ingest.
+- **Signal** — one input: UUID v5 ID, timestamp, one or more **facet**
+  embeddings, and an opaque payload `T`. Dimensionality is fixed by the first
+  ingest and shared by every facet.
+- **Facet** — one `Embedding` of a signal, and the unit of assignment and
+  geometry. A signal that means two things carries two facets rather than one
+  averaged vector that sits between both and matches neither. A facet belongs to
+  at most one story; a signal belongs to the union of its facets' stories, so
+  membership is many-to-many. How an item is decomposed is the caller's
+  judgment — the library never creates, merges, or drops a facet.
 - **Story** — a persistent cluster. Carries `Centroid` (mean of all members, the
   identity geometry), `RecentCentroid` (mean of recent members, what admission
   compares against), radius, per-story statistics, and a lifecycle state.
@@ -85,19 +92,25 @@ func main() {
 	defer tracker.Close()
 
 	sig := story.Signal[Article]{
-		ID:        tracker.SignalID("article-12345"), // deterministic UUID v5
-		At:        time.Now(),
-		Embedding: []float32{0.12, -0.43, 0.88 /* ... */},
-		Data:      Article{Title: "Breaking News Event", Source: "Wire"},
+		ID: tracker.SignalID("article-12345"), // deterministic UUID v5
+		At: time.Now(),
+		// One vector per facet. A single-facet signal behaves exactly as a
+		// signal did before facets existed.
+		Embeddings: []story.Embedding{
+			{0.12, -0.43, 0.88 /* ... the article text      */},
+			{0.31, 0.07, -0.22 /* ... an image insight      */},
+		},
+		Data: Article{Title: "Breaking News Event", Source: "Wire"},
 	}
 
-	storyID, err := tracker.Ingest(context.Background(), sig)
+	storyIDs, err := tracker.Ingest(context.Background(), sig)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// storyID is uuid.Nil when the signal was held as an outlier, and is
-	// provisional otherwise: the next maintenance pass may move it.
-	log.Printf("provisional story: %s", storyID)
+	// storyIDs is empty when no story claimed any facet, and holds one entry
+	// per story the signal's facets reached. Placements are provisional: the
+	// next maintenance pass may move them.
+	log.Printf("provisional stories: %v", storyIDs)
 }
 ```
 
@@ -181,7 +194,25 @@ for meta := range tracker.Stories(story.StoryStateActive) { // StoryStateAny for
 ```
 
 `Story(id)` fetches one story (`ErrNotFound` if absent). `Signal(id)` fetches one
-signal whether it lives in a story or the outlier bucket.
+signal from its canonical record, regardless of where — or whether — its facets
+are placed.
+
+Membership is traversable from either end, at two levels of detail:
+
+| | identity level | facet level |
+| :--- | :--- | :--- |
+| signal → stories | `StoriesOf(signalID)` | `FacetsOfSignal(signalID)` |
+| story → signals | `SignalsOf(storyID)` | `FacetsOfStory(storyID)` |
+
+`SignalsOf` yields a member once however many facets it contributed;
+`FacetsOfStory` yields every facet, which is the multiset the centroid and
+radius are computed over. `FacetsOfSignal` reports unplaced facets with a nil
+story, so a partially placed signal is legible.
+
+`Signals()` iterates every signal in the store, placed or not, in signal-ID
+order. It is a lossless dump: replaying it through `Ingest` against a fresh
+store is a full rebuild that needs no access to the original source and no
+re-embedding.
 
 ---
 

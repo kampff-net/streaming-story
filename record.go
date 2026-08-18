@@ -121,28 +121,173 @@ func (t *Tracker[T]) writeStoryMeta(tx Tx, storyID uuid.UUID, oldLastSignalAt ti
 	return nil
 }
 
-// readSignalLoc reads the location-index entry for a signal. It reports
-// whether an entry exists (hasIndex), whether the signal lives in the outlier
-// bucket (isOutlier), and, for story membership, the owning story ID.
-func readSignalLoc(tx Tx, signalID uuid.UUID) (storyID uuid.UUID, isOutlier, hasIndex bool, err error) {
-	b, err := tx.Get(keys.SignalLoc(signalID))
+// The canonical signal record: the one authoritative copy of a signal, held
+// independently of where its facets are placed.
+
+// writeCanonicalSignal stores the signal at its canonical key if no copy is
+// there yet. The record is written once and never rewritten: a re-delivery of
+// the same signal ID must not overwrite what a batch run has already placed
+// facets against.
+func (t *Tracker[T]) writeCanonicalSignal(tx Tx, sig Signal[T]) error {
+	key := keys.CanonicalSignal(sig.ID)
+	existing, err := tx.Get(key)
 	if err != nil {
-		return uuid.Nil, false, false, err
+		return err
 	}
-	if b == nil {
-		return uuid.Nil, false, false, nil
+	if existing != nil {
+		return nil
 	}
-	storyID, isOutlier, ok := keys.ParseSignalLoc(b)
-	if !ok {
-		return uuid.Nil, false, false, nil
+	encoded, err := t.cfg.Codec.Encode(sig)
+	if err != nil {
+		return fmt.Errorf("encode signal: %w", err)
 	}
-	return storyID, isOutlier, true, nil
+	return tx.Put(key, encoded)
 }
 
-// writeSignalLoc upserts the location-index entry for a signal. Pass a nil
-// storyID with isOutlier=true to record the outlier bucket.
-func writeSignalLoc(tx Tx, signalID uuid.UUID, storyID uuid.UUID, isOutlier bool) error {
-	return tx.Put(keys.SignalLoc(signalID), keys.EncodeSignalLoc(storyID, isOutlier))
+// readCanonicalSignal reads the canonical record for a signal. It reports
+// found=false when no record exists, which is how a caller distinguishes an
+// unknown signal from one whose facets are merely all unplaced.
+func (t *Tracker[T]) readCanonicalSignal(tx Tx, id uuid.UUID) (Signal[T], bool, error) {
+	b, err := tx.Get(keys.CanonicalSignal(id))
+	if err != nil {
+		return Signal[T]{}, false, err
+	}
+	if b == nil {
+		return Signal[T]{}, false, nil
+	}
+	sig, err := t.cfg.Codec.Decode(b)
+	if err != nil {
+		return Signal[T]{}, false, fmt.Errorf("decode signal %s: %w", id, err)
+	}
+	return sig, true, nil
+}
+
+// Facet placement. A facet lives in exactly one of three states: under a story,
+// in the outlier bucket, or nowhere. The marker key spaces are what a scan
+// walks; the location index is the same information keyed by signal, so Ingest
+// can ask "where does this signal live" without scanning anything. Both are
+// written in the same transaction, so they cannot disagree.
+
+// markerValue is the payload of a facet membership or outlier key. The keys
+// carry the information; the Store contract only forbids an empty value.
+var markerValue = []byte{1}
+
+// placeFacet records that one facet of a signal belongs to a story, and clears
+// any outlier marker the facet held.
+func placeFacet(tx Tx, storyID, signalID uuid.UUID, facet int) error {
+	if err := tx.Put(keys.FacetMember(storyID, signalID, facet), markerValue); err != nil {
+		return err
+	}
+	return tx.Delete(keys.OutlierFacet(signalID, facet))
+}
+
+// unplaceFacet removes a facet's membership of a story. It does not touch the
+// canonical record: the caller decides whether the signal still has a reason to
+// exist (see gcCanonicalSignal).
+func unplaceFacet(tx Tx, storyID, signalID uuid.UUID, facet int) error {
+	return tx.Delete(keys.FacetMember(storyID, signalID, facet))
+}
+
+// holdFacetOutlier records that a facet is unplaced.
+func holdFacetOutlier(tx Tx, signalID uuid.UUID, facet int) error {
+	return tx.Put(keys.OutlierFacet(signalID, facet), markerValue)
+}
+
+// dropFacetOutlier removes a facet from the outlier bucket.
+func dropFacetOutlier(tx Tx, signalID uuid.UUID, facet int) error {
+	return tx.Delete(keys.OutlierFacet(signalID, facet))
+}
+
+// readSignalLocSet reads the per-facet location index for a signal. hasIndex
+// reports whether an entry exists at all, which distinguishes a signal that has
+// never been placed from one whose facets are all unplaced.
+func readSignalLocSet(tx Tx, signalID uuid.UUID) (locs []keys.FacetLoc, hasIndex bool, err error) {
+	b, err := tx.Get(keys.SignalLoc(signalID))
+	if err != nil {
+		return nil, false, err
+	}
+	if b == nil {
+		return nil, false, nil
+	}
+	locs, ok := keys.ParseSignalLocSet(b)
+	if !ok {
+		// A malformed index is treated as absent. It is derived state, so the
+		// next write rebuilds it rather than the read failing.
+		return nil, false, nil
+	}
+	return locs, true, nil
+}
+
+// writeSignalLocSet upserts the per-facet location index for a signal.
+func writeSignalLocSet(tx Tx, signalID uuid.UUID, locs []keys.FacetLoc) error {
+	return tx.Put(keys.SignalLoc(signalID), keys.EncodeSignalLocSet(locs))
+}
+
+// placedStories returns the distinct stories the given facet locations name,
+// sorted. It is how a signal's membership is derived from its facets'.
+func placedStories(locs []keys.FacetLoc) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(locs))
+	for _, l := range locs {
+		if !l.IsOutlier && l.StoryID != uuid.Nil {
+			ids = append(ids, l.StoryID)
+		}
+	}
+	return storyIDSet(ids...)
+}
+
+// evictOutlierFacets removes every unplaced facet of a signal from the outlier
+// bucket, clears their entries in the location index, and drops the canonical
+// record if nothing is left holding it.
+//
+// The TTL is a property of the signal's timestamp rather than of any one facet,
+// so all of a signal's unplaced facets age out together. Facets the signal has
+// placed in stories are untouched: a partially placed signal keeps its record
+// and its memberships.
+func evictOutlierFacets(tx Tx, signalID uuid.UUID) error {
+	locs, hasIndex, err := readSignalLocSet(tx, signalID)
+	if err != nil {
+		return err
+	}
+	for facet, loc := range locs {
+		if !loc.IsOutlier {
+			continue
+		}
+		if err := dropFacetOutlier(tx, signalID, facet); err != nil {
+			return err
+		}
+		locs[facet] = keys.FacetLoc{}
+	}
+	if hasIndex {
+		if err := writeSignalLocSet(tx, signalID, locs); err != nil {
+			return err
+		}
+	}
+	return gcCanonicalSignal(tx, signalID)
+}
+
+// gcCanonicalSignal deletes a signal's canonical record and location index once
+// no facet of it remains anywhere — no membership under any story, and nothing
+// in the outlier bucket. It is the lifetime rule: the payload outlives any one
+// placement, but not all of them.
+//
+// It must run in the same transaction as the delete that removed the last
+// facet, or a crash between the two leaves a record nothing references.
+func gcCanonicalSignal(tx Tx, signalID uuid.UUID) error {
+	locs, hasIndex, err := readSignalLocSet(tx, signalID)
+	if err != nil {
+		return err
+	}
+	if hasIndex {
+		for _, l := range locs {
+			if l.IsOutlier || l.StoryID != uuid.Nil {
+				return nil
+			}
+		}
+	}
+	if err := tx.Delete(keys.CanonicalSignal(signalID)); err != nil {
+		return err
+	}
+	return tx.Delete(keys.SignalLoc(signalID))
 }
 
 // Global calibration state: sigma_global and the corpus mean, loaded at open and

@@ -24,13 +24,40 @@ import (
 	"go.kvsh.ch/streaming-story/internal/geom"
 )
 
-// Point is one vector under consideration, with the identity used for
+// Point is one facet under consideration, with the identity used for
 // deterministic tie-breaking and the timestamp used to settle which of two equal
 // parts is the older.
+//
+// ID names the signal the facet belongs to, not the facet itself: several
+// Points may share an ID when one signal contributed several facets. Facet
+// distinguishes them, and (ID, Facet) is unique. Sizes are therefore counted in
+// distinct IDs — see Params.MinSize.
 type Point struct {
-	ID  uuid.UUID
-	At  time.Time
-	Vec []float32
+	ID    uuid.UUID
+	Facet int
+	At    time.Time
+	Vec   []float32
+}
+
+// less orders points deterministically by (ID, Facet), which is the total order
+// every tie-break in this package resolves against. ID alone stopped being one
+// when a signal gained the ability to contribute more than one facet.
+func less(a, b Point) bool {
+	if a.ID != b.ID {
+		return a.ID.String() < b.ID.String()
+	}
+	return a.Facet < b.Facet
+}
+
+// distinctIDs counts the distinct signals the given points belong to. It is the
+// measure every size gate uses, so that a single signal splitting itself into
+// many facets cannot satisfy a threshold meant to require many signals.
+func distinctIDs(pts []Point, idx []int) int {
+	seen := make(map[uuid.UUID]struct{}, len(idx))
+	for _, i := range idx {
+		seen[pts[i].ID] = struct{}{}
+	}
+	return len(seen)
 }
 
 // Params are the thresholds a decision is measured against. All distances are in
@@ -47,8 +74,10 @@ type Params struct {
 	// stops a merge and a split undoing each other along different seams.
 	Split float64
 
-	// MinSize is the number of points a group needs to exist, and which each
-	// side of a split needs to be worth cutting.
+	// MinSize is the number of *distinct signals* a group needs to exist, and
+	// which each side of a split needs to be worth cutting. It counts distinct
+	// Point.IDs, not points: one signal contributing MinSize facets is one
+	// signal, and must not found a story by itself.
 	MinSize int
 }
 
@@ -97,6 +126,9 @@ func Radius(pts []Point) float64 { return geom.Radius(vecsOf(pts)) }
 // collapses a corpus into one group.
 func Grow(pts []Point, p Params) [][]int {
 	n := len(pts)
+	// Facet count is a valid cheap pre-gate: distinct signals never exceed it,
+	// so too few facets means too few signals. The authoritative distinct-signal
+	// test runs on the finished group below.
 	if n < p.MinSize {
 		return nil
 	}
@@ -147,7 +179,7 @@ func Grow(pts []Point, p Params) [][]int {
 		}
 
 		group = CompactToRadius(pts, group, p.Assign)
-		if len(group) < p.MinSize {
+		if distinctIDs(pts, group) < p.MinSize {
 			// This seed anchors nothing; retire it rather than looping on it.
 			used[seed] = true
 			degree[seed] = -1
@@ -289,6 +321,12 @@ type Division struct {
 // The larger part keeps the identity, so it survives for the majority of
 // holders; ties go to the part holding the older point.
 func Split(pts []Point, radius float64, p Params) (Division, bool) {
+	// A cheap pre-gate in facet terms, deliberately not in distinct signals.
+	// Each side needs p.MinSize distinct signals and therefore at least that
+	// many facets, so fewer than 2*p.MinSize facets cannot divide — but the
+	// distinct-signal count may legitimately be lower than 2*p.MinSize, since
+	// one signal can put facets on both sides of the cut. Gating on distinct
+	// IDs here would reject exactly those splits.
 	if len(pts) < 2*p.MinSize {
 		return Division{}, false
 	}
@@ -322,7 +360,7 @@ func Split(pts []Point, radius float64, p Params) (Division, bool) {
 		a, b = na, nb
 	}
 
-	if len(left) < p.MinSize || len(right) < p.MinSize {
+	if distinctIDs(pts, left) < p.MinSize || distinctIDs(pts, right) < p.MinSize {
 		return Division{}, false
 	}
 	if dist.CosineDistance(Centroid(pts, left), Centroid(pts, right)) <= p.Split {
@@ -346,8 +384,7 @@ func TwoMedoids(pts []Point) (int, int) {
 	for i := range pts {
 		for j := i + 1; j < len(pts); j++ {
 			d := dist.CosineDistance(pts[i].Vec, pts[j].Vec)
-			if d > best || (d == best && bestA >= 0 &&
-				pts[i].ID.String() < pts[bestA].ID.String()) {
+			if d > best || (d == best && bestA >= 0 && less(pts[i], pts[bestA])) {
 				bestA, bestB, best = i, j, d
 			}
 		}
@@ -365,7 +402,7 @@ func medoidOf(pts []Point, part []int) int {
 			sum += dist.CosineDistance(pts[i].Vec, pts[j].Vec)
 		}
 		if best == -1 || sum < bestSum ||
-			(sum == bestSum && pts[i].ID.String() < pts[best].ID.String()) {
+			(sum == bestSum && less(pts[i], pts[best])) {
 			best, bestSum = i, sum
 		}
 	}

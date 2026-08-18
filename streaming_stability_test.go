@@ -88,7 +88,7 @@ func streamCorpus(t *testing.T, pts [][]float32, seed, step int) {
 		for i := from; i < to && i < len(pts); i++ {
 			id := uuid.NewSHA1(TrackerNamespace, []byte(fmt.Sprintf("corpus-%d", i)))
 			_, err := tr.Ingest(context.Background(), Signal[string]{
-				ID: id, At: now, Embedding: pts[i], Data: fmt.Sprintf("s%d", i),
+				ID: id, At: now, Embeddings: []Embedding{pts[i]}, Data: fmt.Sprintf("s%d", i),
 			})
 			require.NoError(t, err)
 		}

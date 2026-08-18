@@ -95,46 +95,46 @@ func main() {
 	// resolves the clusters.
 	signals := []story.Signal[NewsPayload]{
 		{
-			ID:        uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-001")),
-			At:        time.Now(),
-			Embedding: []float32{0.90, 0.30, 0.10},
-			Data:      NewsPayload{Headline: "Central Bank Adjusts Interest Rates", Topic: "Finance"},
+			ID:         uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-001")),
+			At:         time.Now(),
+			Embeddings: []story.Embedding{[]float32{0.90, 0.30, 0.10}},
+			Data:       NewsPayload{Headline: "Central Bank Adjusts Interest Rates", Topic: "Finance"},
 		},
 		{
-			ID:        uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-002")),
-			At:        time.Now(),
-			Embedding: []float32{0.88, 0.28, 0.12},
-			Data:      NewsPayload{Headline: "Regulator Signals Looser Lending Rules", Topic: "Finance"},
+			ID:         uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-002")),
+			At:         time.Now(),
+			Embeddings: []story.Embedding{[]float32{0.88, 0.28, 0.12}},
+			Data:       NewsPayload{Headline: "Regulator Signals Looser Lending Rules", Topic: "Finance"},
 		},
 		{
-			ID:        uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-003")),
-			At:        time.Now(),
-			Embedding: []float32{0.92, 0.32, 0.08},
-			Data:      NewsPayload{Headline: "Banks Post Record Quarterly Earnings", Topic: "Finance"},
+			ID:         uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-003")),
+			At:         time.Now(),
+			Embeddings: []story.Embedding{[]float32{0.92, 0.32, 0.08}},
+			Data:       NewsPayload{Headline: "Banks Post Record Quarterly Earnings", Topic: "Finance"},
 		},
 		{
-			ID:        uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-004")),
-			At:        time.Now(),
-			Embedding: []float32{0.10, 0.90, 0.30},
-			Data:      NewsPayload{Headline: "Wildfire Evacuations Ordered in New Region", Topic: "Disaster"},
+			ID:         uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-004")),
+			At:         time.Now(),
+			Embeddings: []story.Embedding{[]float32{0.10, 0.90, 0.30}},
+			Data:       NewsPayload{Headline: "Wildfire Evacuations Ordered in New Region", Topic: "Disaster"},
 		},
 		{
-			ID:        uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-005")),
-			At:        time.Now(),
-			Embedding: []float32{0.12, 0.88, 0.28},
-			Data:      NewsPayload{Headline: "Coastal Storm Surge Threatens Port Cities", Topic: "Disaster"},
+			ID:         uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-005")),
+			At:         time.Now(),
+			Embeddings: []story.Embedding{[]float32{0.12, 0.88, 0.28}},
+			Data:       NewsPayload{Headline: "Coastal Storm Surge Threatens Port Cities", Topic: "Disaster"},
 		},
 		{
-			ID:        uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-006")),
-			At:        time.Now(),
-			Embedding: []float32{0.08, 0.92, 0.32},
-			Data:      NewsPayload{Headline: "Aftershocks Rattle Quake-Hit County", Topic: "Disaster"},
+			ID:         uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-006")),
+			At:         time.Now(),
+			Embeddings: []story.Embedding{[]float32{0.08, 0.92, 0.32}},
+			Data:       NewsPayload{Headline: "Aftershocks Rattle Quake-Hit County", Topic: "Disaster"},
 		},
 		{
-			ID:        uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-007")),
-			At:        time.Now(),
-			Embedding: []float32{0.05, 0.05, 0.98},
-			Data:      NewsPayload{Headline: "Star Striker Nets Hat-Trick in Derby", Topic: "Sports"},
+			ID:         uuid.NewSHA1(story.TrackerNamespace, []byte("news-signal-007")),
+			At:         time.Now(),
+			Embeddings: []story.Embedding{[]float32{0.05, 0.05, 0.98}},
+			Data:       NewsPayload{Headline: "Star Striker Nets Hat-Trick in Derby", Topic: "Sports"},
 		},
 	}
 
@@ -143,7 +143,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to ingest %s: %v", sig.ID, err)
 		}
-		fmt.Printf("[INGEST] %s -> %s\n", sig.ID, assigned)
+		fmt.Printf("[INGEST] %s -> %v\n", sig.ID, assigned)
 		time.Sleep(100 * time.Millisecond)
 	}
 

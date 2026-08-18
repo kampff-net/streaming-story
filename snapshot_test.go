@@ -151,18 +151,18 @@ func TestIngestDuringApplyReturnsProvisionalStory(t *testing.T) {
 
 	// This Ingest must not touch the store — doing so would block behind the
 	// stalled Apply and the deadline below would fire.
-	ingested := make(chan uuid.UUID, 1)
+	ingested := make(chan []uuid.UUID, 1)
 	go func() {
-		id, err := tr.Ingest(context.Background(), Signal[string]{
-			ID: uuid.New(), At: time.Now(), Embedding: []float32{1, 0.02, 0},
+		ids, err := tr.Ingest(context.Background(), Signal[string]{
+			ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{{1, 0.02, 0}},
 		})
 		require.NoError(t, err)
-		ingested <- id
+		ingested <- ids
 	}()
 
 	select {
 	case got := <-ingested:
-		assert.Equal(t, storyID, got, "a buffered signal still gets a provisional story ID")
+		assert.Equal(t, []uuid.UUID{storyID}, got, "a buffered signal still gets a provisional story ID")
 	case <-time.After(2 * time.Second):
 		t.Fatal("Ingest blocked during Apply: the Draft lookup must not touch the store")
 	}

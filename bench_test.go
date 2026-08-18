@@ -44,9 +44,9 @@ func BenchmarkBatch(b *testing.B) {
 
 	for i := range signals {
 		sig := Signal[string]{
-			ID:        uuid.New(),
-			At:        now.Add(-time.Duration(i) * time.Second),
-			Embedding: benchBlob(rng, (i%4)*2),
+			ID:         uuid.New(),
+			At:         now.Add(-time.Duration(i) * time.Second),
+			Embeddings: []Embedding{benchBlob(rng, (i%4)*2)},
 		}
 		if _, err := tr.Ingest(context.Background(), sig); err != nil {
 			b.Fatal(err)
@@ -76,12 +76,30 @@ func BenchmarkIngestDuringApply(b *testing.B) {
 	b.Cleanup(func() { _ = tr.Close() })
 	tr.applyInProgress.Store(true)
 
+	// Drain the staging channel for the duration. Without a consumer the
+	// benchmark fills IngestBufferCap and blocks forever on the send — which
+	// is not the path under test: in production the batch goroutine drains
+	// this channel as the Apply proceeds.
+	stop := make(chan struct{})
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			select {
+			case <-tr.ingestBuffer:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	b.Cleanup(func() { close(stop); <-drained })
+
 	ctx := context.Background()
 	now := time.Now()
 
 	b.ResetTimer()
 	for b.Loop() {
-		sig := Signal[string]{ID: uuid.New(), At: now, Embedding: benchBlob(rng, 0)}
+		sig := Signal[string]{ID: uuid.New(), At: now, Embeddings: []Embedding{benchBlob(rng, 0)}}
 		if _, err := tr.Ingest(ctx, sig); err != nil {
 			b.Fatal(err)
 		}
@@ -108,9 +126,9 @@ func BenchmarkIngestSteadyState(b *testing.B) {
 	// Seed stories so the lookup has real candidates to scan.
 	for i := range 200 {
 		sig := Signal[string]{
-			ID:        uuid.New(),
-			At:        now.Add(-time.Duration(i) * time.Second),
-			Embedding: benchBlob(rng, (i%4)*2),
+			ID:         uuid.New(),
+			At:         now.Add(-time.Duration(i) * time.Second),
+			Embeddings: []Embedding{benchBlob(rng, (i%4)*2)},
 		}
 		if _, err := tr.Ingest(context.Background(), sig); err != nil {
 			b.Fatal(err)
@@ -121,9 +139,74 @@ func BenchmarkIngestSteadyState(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
 	for b.Loop() {
-		sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embedding: benchBlob(rng, 0)}
+		sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{benchBlob(rng, 0)}}
 		if _, err := tr.Ingest(ctx, sig); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSignalsOf measures the story-to-signals read path. Spec 007 moves
+// the signal payload out from under the story prefix into a canonical record,
+// which turns this from one sequential prefix scan into a scan plus a random
+// read per member. The baseline captured here is what that change is measured
+// against.
+func BenchmarkSignalsOf(b *testing.B) {
+	const signals = 400
+
+	rng := rand.New(rand.NewSource(17))
+	now := time.Now()
+
+	tr, err := NewTracker[string](Config[string]{
+		Store:         newMemStore(),
+		Codec:         JSONCodec[string]{},
+		BatchInterval: time.Hour,
+		MinStorySize:  3,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = tr.Close() })
+
+	for i := range signals {
+		sig := Signal[string]{
+			ID:         uuid.New(),
+			At:         now.Add(-time.Duration(i) * time.Second),
+			Embeddings: []Embedding{benchBlob(rng, (i%4)*2)},
+		}
+		if _, err := tr.Ingest(context.Background(), sig); err != nil {
+			b.Fatal(err)
+		}
+	}
+	tr.runBatch()
+
+	// Read back the largest story, so the benchmark measures a member list
+	// worth iterating rather than whichever story happened to come first.
+	var target uuid.UUID
+	best := -1
+	for meta := range tr.Stories(StoryStateAny) {
+		n := 0
+		for _, err := range tr.SignalsOf(meta.ID) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			n++
+		}
+		if n > best {
+			best, target = n, meta.ID
+		}
+	}
+	if best <= 0 {
+		b.Fatal("no story with members")
+	}
+	b.Logf("largest story holds %d signals", best)
+
+	b.ResetTimer()
+	for b.Loop() {
+		for _, err := range tr.SignalsOf(target) {
+			if err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 }

@@ -338,3 +338,83 @@ func TestCliques_RequiresMutualAdjacency(t *testing.T) {
 func TestCliques_BelowMinSizeYieldsNothing(t *testing.T) {
 	assert.Empty(t, Cliques(3, func(i, j int) bool { return false }, 2))
 }
+
+// --- facet identity and distinct-signal sizing (spec 007) ---
+
+// facetsOf returns n facets of one signal, spread over a tight arc so they
+// group readily. Every facet shares an ID and differs only in Facet.
+func facetsOf(name string, n int, center, spread float64) []Point {
+	id := uuid.NewSHA1(ns, []byte(name))
+	out := make([]Point, n)
+	for i := range out {
+		a := center + spread*(float64(i)/float64(n)-0.5)
+		out[i] = Point{ID: id, Facet: i, At: time.Now(), Vec: unitAt(a)}
+	}
+	return out
+}
+
+// The load-bearing rule of spec 007: MinSize counts signals, not points. One
+// signal split into MinSize facets is still one signal and must not found a
+// group by itself, however tightly its facets cluster.
+func TestGrow_OneSignalCannotSatisfyMinSize(t *testing.T) {
+	pts := facetsOf("solo", 5, 0.5, 0.02)
+	groups := Grow(pts, params(0.28, 0.22, 0.30, 3))
+	assert.Empty(t, groups, "five facets of one signal must not form a group")
+}
+
+// The same fixture plus enough distinct signals does group, so the rule above
+// rejects for the right reason rather than rejecting everything.
+func TestGrow_DistinctSignalsSatisfyMinSize(t *testing.T) {
+	pts := append(facetsOf("multi", 2, 0.5, 0.02), arcPoints("peer", 2, 0.5, 0.02)...)
+	groups := Grow(pts, params(0.28, 0.22, 0.30, 3))
+	require.Len(t, groups, 1)
+	assert.Len(t, groups[0], 4, "all four facets join once three signals are present")
+}
+
+// A split must leave MinSize distinct signals on each side. Facets of one
+// signal landing on both sides are legitimate, so the count that matters is of
+// signals per side, not of points per side.
+func TestSplit_CountsDistinctSignalsPerSide(t *testing.T) {
+	// Two well-separated lobes, each holding one facet of every signal. Every
+	// signal therefore straddles the cut: 6 facets, but only 3 distinct signals
+	// in total, and 3 on each side.
+	var pts []Point
+	for i, name := range []string{"alpha", "beta", "gamma"} {
+		id := uuid.NewSHA1(ns, []byte(name))
+		at := time.Now().Add(time.Duration(i) * time.Second)
+		pts = append(pts,
+			Point{ID: id, Facet: 0, At: at, Vec: unitAt(0.0 + 0.01*float64(i))},
+			Point{ID: id, Facet: 1, At: at, Vec: unitAt(math.Pi/2 + 0.01*float64(i))},
+		)
+	}
+
+	div, ok := Split(pts, Radius(pts), params(0.9, 0.22, 0.30, 3))
+	require.True(t, ok, "two orthogonal lobes of three signals each must split")
+	assert.Len(t, div.Keep, 3)
+	assert.Len(t, div.Spawn, 3)
+
+	// Every signal ends up on both sides — the multi-membership spec 007 exists
+	// to produce.
+	keep, spawn := idsOf(pts, div.Keep), idsOf(pts, div.Spawn)
+	assert.ElementsMatch(t, keep, spawn)
+}
+
+// distinctIDs is the single point of enforcement, so it is tested directly.
+func TestDistinctIDs(t *testing.T) {
+	pts := append(facetsOf("shared", 3, 0.0, 0.01), pointAt("other", 1.0))
+	all := []int{0, 1, 2, 3}
+	assert.Equal(t, 2, distinctIDs(pts, all))
+	assert.Equal(t, 1, distinctIDs(pts, []int{0, 1, 2}))
+	assert.Equal(t, 0, distinctIDs(pts, nil))
+}
+
+// less is the total order every tie-break resolves against; ID alone stopped
+// being one when a signal gained multiple facets.
+func TestLess_OrdersByIDThenFacet(t *testing.T) {
+	id := uuid.NewSHA1(ns, []byte("same"))
+	a := Point{ID: id, Facet: 0}
+	b := Point{ID: id, Facet: 1}
+	assert.True(t, less(a, b))
+	assert.False(t, less(b, a))
+	assert.False(t, less(a, a))
+}

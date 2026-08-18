@@ -1,12 +1,15 @@
 package story
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kvsh.ch/streaming-story/internal/keys"
 )
 
 // minimalConfig returns a Config with only the required fields set,
@@ -207,4 +210,40 @@ func TestConfig_validate(t *testing.T) {
 		cfg.MinStorySize = 1
 		require.Error(t, cfg.validate())
 	})
+}
+
+// --- MaxFacetsPerSignal (spec 007 §2.2.5) ---
+
+func TestConfig_MaxFacetsPerSignalDefault(t *testing.T) {
+	cfg := Config[string]{Store: newMemStore(), Codec: JSONCodec[string]{}}
+	require.NoError(t, cfg.validate())
+	assert.Equal(t, 8, cfg.MaxFacetsPerSignal)
+}
+
+func TestConfig_MaxFacetsPerSignalBounds(t *testing.T) {
+	for _, n := range []int{-1, keys.MaxFacet + 1} {
+		cfg := Config[string]{Store: newMemStore(), Codec: JSONCodec[string]{}, MaxFacetsPerSignal: n}
+		err := cfg.validate()
+		require.Error(t, err, "MaxFacetsPerSignal %d must be rejected", n)
+		assert.Contains(t, err.Error(), "MaxFacetsPerSignal")
+	}
+
+	cfg := Config[string]{Store: newMemStore(), Codec: JSONCodec[string]{}, MaxFacetsPerSignal: keys.MaxFacet}
+	assert.NoError(t, cfg.validate())
+}
+
+func TestConfig_IngestRejectsTooManyFacets(t *testing.T) {
+	tr, err := NewTracker[string](Config[string]{
+		Store: newMemStore(), Codec: JSONCodec[string]{},
+		BatchInterval: time.Hour, MaxFacetsPerSignal: 2,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tr.Close() })
+
+	_, err = tr.Ingest(context.Background(), Signal[string]{
+		ID: uuid.New(), At: time.Now(),
+		Embeddings: []Embedding{{1, 0}, {0, 1}, {1, 1}},
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTooManyFacets)
 }

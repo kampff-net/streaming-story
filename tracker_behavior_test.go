@@ -110,17 +110,17 @@ func TestTracker_Ingest_ReingestIsIdempotent(t *testing.T) {
 	})
 
 	ch := tr.Subscribe()
-	sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embedding: []float32{0.98, 0.02}}
+	sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{0.98, 0.02}}}
 
 	assigned, err := tr.Ingest(context.Background(), sig)
 	require.NoError(t, err)
-	assert.Equal(t, storyID, assigned)
+	assert.Equal(t, []uuid.UUID{storyID}, assigned)
 
 	// Re-ingesting the identical signal is a no-op: same story, no duplicate
 	// emit, and exactly one stored copy.
 	assigned2, err := tr.Ingest(context.Background(), sig)
 	require.NoError(t, err)
-	assert.Equal(t, storyID, assigned2)
+	assert.Equal(t, []uuid.UUID{storyID}, assigned2)
 
 	select {
 	case ev := <-ch:
@@ -136,7 +136,7 @@ func TestTracker_Ingest_ReingestIsIdempotent(t *testing.T) {
 
 	var stored int
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		return tx.ScanPrefix(keys.SignalPrefix(storyID), func(key, val []byte) error {
+		return tx.ScanPrefix(keys.FacetPrefix(storyID), func(key, val []byte) error {
 			stored++
 			return nil
 		})
@@ -157,10 +157,10 @@ func TestTracker_Ingest_CrossStoryMoveReingestDoesNotDuplicate(t *testing.T) {
 		LastSignalAt: time.Now().Add(-time.Hour),
 	})
 
-	sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embedding: []float32{0.98, 0.02}}
+	sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{0.98, 0.02}}}
 	assigned, err := tr.Ingest(context.Background(), sig)
 	require.NoError(t, err)
-	assert.Equal(t, storyA, assigned)
+	assert.Equal(t, []uuid.UUID{storyA}, assigned)
 
 	// A batch run moves the signal from storyA to storyB (merge/re-assign).
 	seedStory(t, tr, storyB, storyRecord{
@@ -170,27 +170,27 @@ func TestTracker_Ingest_CrossStoryMoveReingestDoesNotDuplicate(t *testing.T) {
 		LastSignalAt: time.Now(),
 	})
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		return moveSignal(tx, keys.Signal(storyA, sig.ID), keys.Signal(storyB, sig.ID))
+		return moveFacetToStory(tx, storyA, storyB, sig.ID, 0)
 	}))
 
 	// Re-ingestion must find the copy's batch-moved location and be a no-op:
 	// it returns storyB, emits nothing, and leaves exactly one copy under B.
 	assigned2, err := tr.Ingest(context.Background(), sig)
 	require.NoError(t, err)
-	assert.Equal(t, storyB, assigned2)
+	assert.Equal(t, []uuid.UUID{storyB}, assigned2)
 
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keys.Signal(storyA, sig.ID)), "no copy may remain under the old story")
-		assert.NotNil(t, mustGet(t, tx, keys.Signal(storyB, sig.ID)), "the moved copy must stay put")
+		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyA, sig.ID, 0)), "no membership may remain under the old story")
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyB, sig.ID, 0)), "the moved facet must stay put")
 
-		var copies int
-		for _, prefix := range [][]byte{keys.SignalPrefix(storyA), keys.SignalPrefix(storyB)} {
+		var markers int
+		for _, prefix := range [][]byte{keys.FacetPrefix(storyA), keys.FacetPrefix(storyB)} {
 			require.NoError(t, tx.ScanPrefix(prefix, func(key, val []byte) error {
-				copies++
+				markers++
 				return nil
 			}))
 		}
-		assert.Equal(t, 1, copies, "exactly one copy must exist across both stories")
+		assert.Equal(t, 1, markers, "exactly one membership must exist across both stories")
 		return nil
 	}))
 }
@@ -207,21 +207,19 @@ func TestTracker_Ingest_DeletesOutlierCopyOnAssignment(t *testing.T) {
 		LastSignalAt: time.Now().Add(-time.Minute),
 	})
 
-	sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embedding: []float32{0.98, 0.02}}
-	encoded, err := tr.cfg.Codec.Encode(sig)
-	require.NoError(t, err)
-	// Simulate a prior outlier copy of the same signal.
+	sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{{0.98, 0.02}}}
+	// Simulate the same signal already sitting in the outlier bucket.
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		return tx.Put(keys.Outlier(sig.ID), encoded)
+		return seedOutlier(tx, tr, sig)
 	}))
 
 	assigned, err := tr.Ingest(context.Background(), sig)
 	require.NoError(t, err)
-	assert.Equal(t, storyID, assigned)
+	assert.Equal(t, []uuid.UUID{storyID}, assigned)
 
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keys.Outlier(sig.ID)), "stale outlier copy must be removed")
-		assert.NotNil(t, mustGet(t, tx, keys.Signal(storyID, sig.ID)))
+		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sig.ID, 0)), "stale outlier marker must be removed")
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyID, sig.ID, 0)))
 		return nil
 	}))
 }
@@ -241,7 +239,7 @@ func TestTracker_Ingest_MonotonicLastSignalAt(t *testing.T) {
 
 	// A newer signal advances LastSignalAt; an older one must not regress it.
 	_, err := tr.Ingest(context.Background(), Signal[string]{
-		ID: uuid.New(), At: older.Add(-time.Hour), Embedding: []float32{0.98, 0.02},
+		ID: uuid.New(), At: older.Add(-time.Hour), Embeddings: []Embedding{[]float32{0.98, 0.02}},
 	})
 	require.NoError(t, err)
 
@@ -265,10 +263,10 @@ func TestTracker_Ingest_ReactivateClearsStats(t *testing.T) {
 	})
 
 	assigned, err := tr.Ingest(context.Background(), Signal[string]{
-		ID: uuid.New(), At: time.Now(), Embedding: []float32{0.98, 0.02},
+		ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{0.98, 0.02}},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, storyID, assigned)
+	assert.Equal(t, []uuid.UUID{storyID}, assigned)
 
 	meta, err := tr.Story(storyID)
 	require.NoError(t, err)
@@ -315,7 +313,7 @@ func TestTracker_SignalsOf_Iterator(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		_, err := tr.Ingest(context.Background(), Signal[string]{
-			ID: uuid.New(), At: time.Now(), Embedding: []float32{0.98, 0.02},
+			ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{0.98, 0.02}},
 		})
 		require.NoError(t, err)
 	}
@@ -323,7 +321,7 @@ func TestTracker_SignalsOf_Iterator(t *testing.T) {
 	var count int
 	for sig, err := range tr.SignalsOf(storyID) {
 		require.NoError(t, err)
-		assert.Len(t, sig.Embedding, 2)
+		assert.Len(t, sig.Embeddings[0], 2)
 		count++
 	}
 	assert.Equal(t, 3, count)
@@ -345,10 +343,10 @@ func TestTracker_Ingest_ExcludesStaleStories(t *testing.T) {
 
 	// The stale story must not anchor the signal: it becomes an outlier.
 	assigned, err := tr.Ingest(context.Background(), Signal[string]{
-		ID: uuid.New(), At: time.Now(), Embedding: []float32{0.98, 0.02},
+		ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{0.98, 0.02}},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, uuid.Nil, assigned, "stale story outside ActiveContextWindow must not anchor")
+	assert.Empty(t, assigned, "stale story outside ActiveContextWindow must not anchor")
 }
 
 func TestTracker_Subscribe_AfterCloseReturnsClosedChannel(t *testing.T) {
@@ -432,7 +430,7 @@ func TestPersistStory_LifecycleTransitions(t *testing.T) {
 		// Lifecycle is driven by membership now: an empty story is retired
 		// rather than transitioned, so the subject needs a member whose age
 		// puts it past the window under test.
-		members := []*batchSignal{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
+		members := []*batchFacet{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 			return tr.recentreStory(tx, sid, prev, true, members, &emaAccum{}, &summary, &events, now)
 		}))
@@ -463,7 +461,7 @@ func TestPersistStory_LifecycleTransitions(t *testing.T) {
 		// Lifecycle is driven by membership now: an empty story is retired
 		// rather than transitioned, so the subject needs a member whose age
 		// puts it past the window under test.
-		members := []*batchSignal{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
+		members := []*batchFacet{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 			return tr.recentreStory(tx, sid, prev, true, members, &emaAccum{}, &summary, &events, now)
 		}))
@@ -483,7 +481,7 @@ func TestPersistStory_LifecycleTransitions(t *testing.T) {
 		}
 		var summary BatchSummary
 		var events []StoryEvent[string]
-		members := []*batchSignal{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
+		members := []*batchFacet{{id: uuid.New(), at: prev.LastSignalAt, emb: []float32{1, 0}}}
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 			return tr.recentreStory(tx, sid, prev, true, members, &emaAccum{}, &summary, &events, now)
 		}))
@@ -523,23 +521,19 @@ func TestCollectBatch_OutlierEviction(t *testing.T) {
 	tr.lastBatch = time.Now()
 	tr.dim.Store(2)
 
-	keep := Signal[string]{ID: uuid.New(), At: tr.lastBatch, Embedding: []float32{1, 0}}
-	expire := Signal[string]{ID: uuid.New(), At: tr.lastBatch.Add(-3 * tr.cfg.OutlierTTL), Embedding: []float32{1, 0}}
+	keep := Signal[string]{ID: uuid.New(), At: tr.lastBatch, Embeddings: []Embedding{[]float32{1, 0}}}
+	expire := Signal[string]{ID: uuid.New(), At: tr.lastBatch.Add(-3 * tr.cfg.OutlierTTL), Embeddings: []Embedding{[]float32{1, 0}}}
 
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 		for _, sig := range []Signal[string]{keep, expire} {
-			b, err := tr.cfg.Codec.Encode(sig)
-			if err != nil {
-				return err
-			}
-			if err := tx.Put(keys.Outlier(sig.ID), b); err != nil {
+			if err := seedOutlier(tx, tr, sig); err != nil {
 				return err
 			}
 		}
 		return nil
 	}))
 
-	var signals []batchSignal
+	var signals []batchFacet
 	var evict []uuid.UUID
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
 		var err error
@@ -574,4 +568,210 @@ func TestTracker_saveCalibState_RoundTrip(t *testing.T) {
 	assert.Equal(t, 4, s.Dim)
 	assert.Equal(t, 0.7, s.SigmaGlobal)
 	assert.True(t, s.LastBatchAt.Equal(tr.lastBatch))
+}
+
+// --- multi-facet draft placement (spec 007 §2.3.2) ---
+
+// The point of the whole design: a signal whose facets point at different
+// stories joins both, instead of averaging into the gap between them and
+// landing in the outlier bucket.
+func TestTracker_Ingest_FacetsReachDifferentStories(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.dim.Store(2)
+
+	now := time.Now()
+	storyX := uuid.NewSHA1(TrackerNamespace, []byte("facet-story-x"))
+	storyY := uuid.NewSHA1(TrackerNamespace, []byte("facet-story-y"))
+	seedStory(t, tr, storyX, storyRecord{
+		State: StoryStateActive, Centroid: []float32{1, 0},
+		CreatedAt: now.Add(-2 * time.Hour), LastSignalAt: now.Add(-time.Hour),
+	})
+	seedStory(t, tr, storyY, storyRecord{
+		State: StoryStateActive, Centroid: []float32{0, 1},
+		CreatedAt: now.Add(-2 * time.Hour), LastSignalAt: now.Add(-time.Hour),
+	})
+
+	sig := Signal[string]{
+		ID: uuid.New(), At: now,
+		Embeddings: []Embedding{{0.99, 0.01}, {0.01, 0.99}},
+		Data:       "two-subjects",
+	}
+	assigned, err := tr.Ingest(context.Background(), sig)
+	require.NoError(t, err)
+	assert.Equal(t, storyIDSet(storyX, storyY), assigned,
+		"a two-facet signal must join both stories its facets match")
+
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyX, sig.ID, 0)))
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyY, sig.ID, 1)))
+		// Each facet belongs to exactly one story (invariant 1).
+		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyY, sig.ID, 0)))
+		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyX, sig.ID, 1)))
+		return nil
+	}))
+}
+
+// The averaged single vector this design replaces would fall between the two
+// centroids and match neither. Ingested as one facet, it is orphaned; ingested
+// as two facets, it is placed. Same input, both ways, one assertion.
+func TestTracker_Ingest_AveragedVectorOrphansButFacetsPlace(t *testing.T) {
+	// Two orthogonal centroids. Their bisector sits 0.293 from each, so an
+	// assignment radius below that is exactly the geometry where an averaged
+	// vector falls between two stories and into neither.
+	newSeeded := func() *Tracker[string] {
+		tr, err := NewTracker[string](Config[string]{
+			Store:           newMemStore(),
+			Codec:           JSONCodec[string]{},
+			BatchInterval:   time.Hour,
+			AssignThreshold: 0.20,
+			MergeThreshold:  0.10,
+			SplitThreshold:  0.15,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = tr.Close() })
+		tr.dim.Store(2)
+
+		now := time.Now()
+		for name, c := range map[string][]float32{"a": {1, 0}, "b": {0, 1}} {
+			seedStory(t, tr, uuid.NewSHA1(TrackerNamespace, []byte("orphan-"+name)), storyRecord{
+				State: StoryStateActive, Centroid: c,
+				CreatedAt: now.Add(-2 * time.Hour), LastSignalAt: now.Add(-time.Hour),
+			})
+		}
+		return tr
+	}
+
+	// One averaged facet: equidistant from both centroids, inside neither.
+	single := newSeeded()
+	got, err := single.Ingest(context.Background(), Signal[string]{
+		ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{{0.707, 0.707}},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, got, "the averaged vector matches no story: this is the orphan case")
+
+	// The same item, decomposed.
+	split := newSeeded()
+	got, err = split.Ingest(context.Background(), Signal[string]{
+		ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{{1, 0}, {0, 1}},
+	})
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "decomposed into facets, the same item reaches both stories")
+}
+
+// Several facets landing in one story is still one signal joining one story,
+// so exactly one event is emitted — not one per facet.
+func TestTracker_Ingest_EmitsOneEventPerStoryNotPerFacet(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.dim.Store(2)
+
+	now := time.Now()
+	storyID := uuid.NewSHA1(TrackerNamespace, []byte("dedupe-events"))
+	seedStory(t, tr, storyID, storyRecord{
+		State: StoryStateActive, Centroid: []float32{1, 0},
+		CreatedAt: now.Add(-2 * time.Hour), LastSignalAt: now.Add(-time.Hour),
+	})
+
+	ch := tr.Subscribe()
+	assigned, err := tr.Ingest(context.Background(), Signal[string]{
+		ID: uuid.New(), At: now,
+		Embeddings: []Embedding{{1, 0}, {0.99, 0.01}, {0.98, 0.02}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uuid.UUID{storyID}, assigned)
+
+	select {
+	case ev := <-ch:
+		assert.Equal(t, EventDraftAssigned, ev.Kind)
+		assert.Equal(t, storyID, ev.StoryID)
+	case <-time.After(time.Second):
+		t.Fatal("no draft-assigned event")
+	}
+	select {
+	case ev := <-ch:
+		t.Fatalf("three facets in one story must emit one event, got a second: %+v", ev)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// A signal can be partly placed: the facets that match are placed, the rest
+// wait in the outlier bucket. Before facets this was all-or-nothing.
+func TestTracker_Ingest_PartiallyPlacedSignal(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.dim.Store(2)
+
+	now := time.Now()
+	storyID := uuid.NewSHA1(TrackerNamespace, []byte("partial"))
+	seedStory(t, tr, storyID, storyRecord{
+		State: StoryStateActive, Centroid: []float32{1, 0},
+		CreatedAt: now.Add(-2 * time.Hour), LastSignalAt: now.Add(-time.Hour),
+	})
+
+	sig := Signal[string]{
+		ID: uuid.New(), At: now,
+		Embeddings: []Embedding{{1, 0}, {-1, 0}}, // second faces the other way
+	}
+	assigned, err := tr.Ingest(context.Background(), sig)
+	require.NoError(t, err)
+	assert.Equal(t, []uuid.UUID{storyID}, assigned)
+
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyID, sig.ID, 0)), "matching facet is placed")
+		assert.NotNil(t, mustGet(t, tx, keys.OutlierFacet(sig.ID, 1)), "non-matching facet waits as an outlier")
+
+		locs, hasIndex, err := readSignalLocSet(tx, sig.ID)
+		require.NoError(t, err)
+		require.True(t, hasIndex)
+		assert.Equal(t, []keys.FacetLoc{{StoryID: storyID}, {IsOutlier: true}}, locs)
+		return nil
+	}))
+}
+
+// Re-ingest is a no-op at the signal level once any facet is placed: a late
+// duplicate must not partially overwrite what a batch run decided.
+func TestTracker_Ingest_ReingestNoOpWhenAnyFacetPlaced(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.dim.Store(2)
+
+	now := time.Now()
+	storyID := uuid.NewSHA1(TrackerNamespace, []byte("partial-noop"))
+	seedStory(t, tr, storyID, storyRecord{
+		State: StoryStateActive, Centroid: []float32{1, 0},
+		CreatedAt: now.Add(-2 * time.Hour), LastSignalAt: now.Add(-time.Hour),
+	})
+
+	sig := Signal[string]{
+		ID: uuid.New(), At: now,
+		Embeddings: []Embedding{{1, 0}, {-1, 0}},
+	}
+	first, err := tr.Ingest(context.Background(), sig)
+	require.NoError(t, err)
+
+	ch := tr.Subscribe()
+	second, err := tr.Ingest(context.Background(), sig)
+	require.NoError(t, err)
+	assert.Equal(t, first, second, "re-ingest must report the same placement")
+
+	select {
+	case ev := <-ch:
+		t.Fatalf("re-ingest of a placed signal must emit nothing, got: %+v", ev)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// Facets must agree on dimensionality with each other, not only with the corpus.
+func TestTracker_Ingest_RejectsRaggedFacets(t *testing.T) {
+	tr := newTestTracker(t)
+	_, err := tr.Ingest(context.Background(), Signal[string]{
+		ID: uuid.New(), At: time.Now(),
+		Embeddings: []Embedding{{1, 0}, {1, 0, 0}},
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrDimensionMismatch)
+}
+
+func TestTracker_Ingest_RejectsNoFacets(t *testing.T) {
+	tr := newTestTracker(t)
+	_, err := tr.Ingest(context.Background(), Signal[string]{ID: uuid.New(), At: time.Now()})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least one facet")
 }

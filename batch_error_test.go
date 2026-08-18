@@ -80,7 +80,7 @@ func TestIngestDoesNotOutliveClose(t *testing.T) {
 			defer wg.Done()
 			<-start
 			_, _ = tr.Ingest(context.Background(), Signal[string]{
-				ID: uuid.New(), At: time.Now(), Embedding: []float32{1, 0, 0},
+				ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{1, 0, 0}},
 			})
 		}()
 	}

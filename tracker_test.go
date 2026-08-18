@@ -28,6 +28,38 @@ func newTestTracker(t *testing.T) *Tracker[string] {
 	return tr
 }
 
+// seedMember writes a signal into the store as a member of a story: canonical
+// record, one facet marker per facet, and the location index. Test fixtures use
+// it so the schema is spelled out in one place rather than in every fixture.
+func seedMember(tx Tx, tr *Tracker[string], storyID uuid.UUID, sig Signal[string]) error {
+	if err := tr.writeCanonicalSignal(tx, sig); err != nil {
+		return err
+	}
+	locs := make([]keys.FacetLoc, len(sig.Embeddings))
+	for facet := range sig.Embeddings {
+		if err := placeFacet(tx, storyID, sig.ID, facet); err != nil {
+			return err
+		}
+		locs[facet] = keys.FacetLoc{StoryID: storyID}
+	}
+	return writeSignalLocSet(tx, sig.ID, locs)
+}
+
+// seedOutlier writes a signal into the store with every facet unplaced.
+func seedOutlier(tx Tx, tr *Tracker[string], sig Signal[string]) error {
+	if err := tr.writeCanonicalSignal(tx, sig); err != nil {
+		return err
+	}
+	locs := make([]keys.FacetLoc, len(sig.Embeddings))
+	for facet := range sig.Embeddings {
+		if err := holdFacetOutlier(tx, sig.ID, facet); err != nil {
+			return err
+		}
+		locs[facet] = keys.FacetLoc{IsOutlier: true}
+	}
+	return writeSignalLocSet(tx, sig.ID, locs)
+}
+
 func TestNewTracker(t *testing.T) {
 	t.Run("valid_config", func(t *testing.T) {
 		tr := newTestTracker(t)
@@ -312,7 +344,7 @@ func TestTracker_Ingest(t *testing.T) {
 	t.Run("empty_embedding_returns_error", func(t *testing.T) {
 		tr := newTestTracker(t)
 		_, err := tr.Ingest(context.Background(), Signal[string]{
-			ID: uuid.New(), At: time.Now(), Embedding: nil,
+			ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{nil},
 		})
 		require.Error(t, err)
 	})
@@ -322,9 +354,9 @@ func TestTracker_Ingest(t *testing.T) {
 		tr.dim.Store(5)
 
 		_, err := tr.Ingest(context.Background(), Signal[string]{
-			ID:        uuid.New(),
-			At:        time.Now(),
-			Embedding: []float32{1, 2, 3}, // dim=3, tracker expects 5
+			ID:         uuid.New(),
+			At:         time.Now(),
+			Embeddings: []Embedding{[]float32{1, 2, 3}}, // dim=3, tracker expects 5
 		})
 		require.ErrorIs(t, err, ErrDimensionMismatch)
 	})
@@ -334,7 +366,7 @@ func TestTracker_Ingest(t *testing.T) {
 		tr.dim.Store(3)
 		tr.applyInProgress.Store(true)
 
-		sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embedding: []float32{1, 2, 3}}
+		sig := Signal[string]{ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{1, 2, 3}}}
 		_, err := tr.Ingest(context.Background(), sig)
 		require.NoError(t, err)
 		assert.Equal(t, 1, len(tr.ingestBuffer), "signal must be routed to the in-memory buffer")
@@ -350,7 +382,7 @@ func TestTracker_Ingest(t *testing.T) {
 		require.NoError(t, tr.Close())
 
 		_, err = tr.Ingest(context.Background(), Signal[string]{
-			ID: uuid.New(), At: time.Now(), Embedding: []float32{1},
+			ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{1}},
 		})
 		require.Error(t, err)
 	})
@@ -373,25 +405,20 @@ func TestTracker_Signal(t *testing.T) {
 		storyID := uuid.New()
 		sigID := uuid.New()
 		sig := Signal[string]{
-			ID:        sigID,
-			At:        time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
-			Embedding: []float32{1.0, 2.0},
-			Data:      "story-data-payload",
+			ID:         sigID,
+			At:         time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
+			Embeddings: []Embedding{[]float32{1.0, 2.0}},
+			Data:       "story-data-payload",
 		}
-		b, err := tr.cfg.Codec.Encode(sig)
-		require.NoError(t, err)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keys.Signal(storyID, sigID), b); err != nil {
-				return err
-			}
-			return writeSignalLoc(tx, sigID, storyID, false)
+			return seedMember(tx, tr, storyID, sig)
 		}))
 
 		got, err := tr.Signal(sigID)
 		require.NoError(t, err)
 		assert.Equal(t, sigID, got.ID)
 		assert.Equal(t, "story-data-payload", got.Data)
-		assert.Equal(t, sig.Embedding, got.Embedding)
+		assert.Equal(t, sig.Embeddings[0], got.Embeddings[0])
 		assert.True(t, sig.At.Equal(got.At))
 	})
 
@@ -399,18 +426,13 @@ func TestTracker_Signal(t *testing.T) {
 		tr := newTestTracker(t)
 		sigID := uuid.New()
 		sig := Signal[string]{
-			ID:        sigID,
-			At:        time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
-			Embedding: []float32{0.5, 0.5},
-			Data:      "outlier-data-payload",
+			ID:         sigID,
+			At:         time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
+			Embeddings: []Embedding{[]float32{0.5, 0.5}},
+			Data:       "outlier-data-payload",
 		}
-		b, err := tr.cfg.Codec.Encode(sig)
-		require.NoError(t, err)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keys.Outlier(sigID), b); err != nil {
-				return err
-			}
-			return writeSignalLoc(tx, sigID, uuid.Nil, true)
+			return seedOutlier(tx, tr, sig)
 		}))
 
 		got, err := tr.Signal(sigID)
@@ -447,19 +469,12 @@ func TestTracker_Signal(t *testing.T) {
 				for _, emb := range embs {
 					sigID := uuid.New()
 					sig := Signal[string]{
-						ID:        sigID,
-						At:        now.Add(-time.Minute),
-						Embedding: emb,
-						Data:      "moved-signal",
+						ID:         sigID,
+						At:         now.Add(-time.Minute),
+						Embeddings: []Embedding{emb},
+						Data:       "moved-signal",
 					}
-					b, err := tr.cfg.Codec.Encode(sig)
-					if err != nil {
-						return err
-					}
-					if err := tx.Put(keys.Signal(sid, sigID), b); err != nil {
-						return err
-					}
-					if err := writeSignalLoc(tx, sigID, sid, false); err != nil {
+					if err := seedMember(tx, tr, sid, sig); err != nil {
 						return err
 					}
 					if sid == storyB {
@@ -487,8 +502,8 @@ func TestTracker_Signal(t *testing.T) {
 
 		// The signal now lives under story A; Signal must follow the index.
 		require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-			assert.Nil(t, mustGet(t, tx, keys.Signal(storyB, trackedID)), "signal must leave retired story B")
-			assert.NotNil(t, mustGet(t, tx, keys.Signal(storyA, trackedID)), "signal must land under survivor story A")
+			assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyB, trackedID, 0)), "signal must leave retired story B")
+			assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyA, trackedID, 0)), "signal must land under survivor story A")
 			return nil
 		}))
 
@@ -505,12 +520,14 @@ func TestTracker_Signal(t *testing.T) {
 		assert.True(t, errors.Is(err, ErrNotFound))
 	})
 
+	// A location index naming a story, with no canonical record behind it.
+	// Signal reads the record, so the dangling index is simply not found.
 	t.Run("dangling_index_returns_ErrNotFound", func(t *testing.T) {
 		tr := newTestTracker(t)
 		sigID := uuid.New()
 		storyID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return writeSignalLoc(tx, sigID, storyID, false)
+			return writeSignalLocSet(tx, sigID, []keys.FacetLoc{{StoryID: storyID}})
 		}))
 
 		_, err := tr.Signal(sigID)
@@ -533,12 +550,8 @@ func TestTracker_Signal(t *testing.T) {
 	t.Run("codec_error_propagates_not_ErrNotFound", func(t *testing.T) {
 		tr := newTestTracker(t)
 		sigID := uuid.New()
-		storyID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keys.Signal(storyID, sigID), []byte("{invalid json")); err != nil {
-				return err
-			}
-			return writeSignalLoc(tx, sigID, storyID, false)
+			return tx.Put(keys.CanonicalSignal(sigID), []byte("{invalid json"))
 		}))
 
 		_, err := tr.Signal(sigID)
@@ -557,12 +570,8 @@ func TestTracker_Signal(t *testing.T) {
 		t.Cleanup(func() { _ = tr.Close() })
 
 		sigID := uuid.New()
-		storyID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keys.Signal(storyID, sigID), []byte("payload")); err != nil {
-				return err
-			}
-			return writeSignalLoc(tx, sigID, storyID, false)
+			return tx.Put(keys.CanonicalSignal(sigID), []byte("payload"))
 		}))
 
 		_, err = tr.Signal(sigID)
@@ -581,10 +590,7 @@ func TestTracker_Signal(t *testing.T) {
 		b, err := tr.cfg.Codec.Encode(sig)
 		require.NoError(t, err)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			if err := tx.Put(keys.Signal(storyID, sigID), b); err != nil {
-				return err
-			}
-			if err := writeSignalLoc(tx, sigID, storyID, false); err != nil {
+			if err := tx.Put(keys.CanonicalSignal(sigID), b); err != nil {
 				return err
 			}
 			return tr.writeStoryMeta(tx, storyID, time.Time{}, storyRecord{

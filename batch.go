@@ -60,7 +60,7 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 	now := time.Now()
 
 	var (
-		signals []batchSignal
+		signals []batchFacet
 		stories map[uuid.UUID]storyRecord
 		evict   []uuid.UUID
 	)
@@ -131,9 +131,9 @@ func (t *Tracker[T]) drainBuffer() {
 // Membership is read in full rather than windowed because the lifetime
 // centroid is the mean of every member; reading a window would compute a
 // centre that slides as old signals age out.
-func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchSignal, map[uuid.UUID]storyRecord, []uuid.UUID, error) {
+func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.UUID]storyRecord, []uuid.UUID, error) {
 	var (
-		signals []batchSignal
+		signals []batchFacet
 		stories = make(map[uuid.UUID]storyRecord)
 		evict   []uuid.UUID
 	)
@@ -152,18 +152,32 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchSignal, map[uuid
 		}
 		stories[id] = rec
 
-		// Collect every member. The lifetime centroid is the mean of all of
-		// them (spec 006 §2.7), so a window-scoped read would compute a
-		// different, drifting centre.
-		return tx.ScanPrefix(keys.SignalPrefix(id), func(sigKey, sigVal []byte) error {
-			sig, err := t.cfg.Codec.Decode(sigVal)
-			if err != nil {
+		// Collect every member facet. The lifetime centroid is the mean of all
+		// of them (spec 006 §2.7), so a window-scoped read would compute a
+		// different, drifting centre. The markers carry no payload, so each
+		// referenced signal is read from its canonical record.
+		prefix := keys.FacetPrefix(id)
+		return tx.ScanPrefix(prefix, func(key, _ []byte) error {
+			sigID, facet, ok := keys.ParseFacetMember(key, prefix)
+			if !ok {
 				return nil
 			}
-			signals = append(signals, batchSignal{
+			sig, found, err := t.readCanonicalSignal(tx, sigID)
+			if err != nil {
+				return err
+			}
+			if !found || facet >= len(sig.Embeddings) {
+				// A marker with no record behind it, or naming a facet the
+				// record does not have. Skip rather than fail: the store
+				// invariant test is what catches this, and a batch run must
+				// not be stopped by one bad key.
+				return nil
+			}
+			signals = append(signals, batchFacet{
 				id:      sig.ID,
+				facet:   facet,
 				at:      sig.At,
-				emb:     sig.Embedding,
+				emb:     sig.Embeddings[facet],
 				storyID: id,
 			})
 			return nil
@@ -176,19 +190,29 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchSignal, map[uuid
 	// Outliers: collect those within lastBatch − OutlierTTL and flag the rest
 	// for eviction. The reference is lastBatch, not wall-clock now, so
 	// maintenance pauses do not cause mass eviction.
-	err = tx.ScanPrefix([]byte("o:"), func(key, val []byte) error {
-		sig, err := t.cfg.Codec.Decode(val)
-		if err != nil {
+	err = tx.ScanPrefix(keys.OutlierPrefix(), func(key, _ []byte) error {
+		sigID, facet, ok := keys.ParseOutlierFacet(key)
+		if !ok {
 			return nil
 		}
+		sig, found, err := t.readCanonicalSignal(tx, sigID)
+		if err != nil {
+			return err
+		}
+		if !found || facet >= len(sig.Embeddings) {
+			return nil
+		}
+		// The TTL is a property of the signal's timestamp, so every unplaced
+		// facet of an aged signal is evicted in the same pass.
 		if sig.At.Before(t.lastBatch.Add(-t.cfg.OutlierTTL)) {
 			evict = append(evict, sig.ID)
 			return nil
 		}
-		signals = append(signals, batchSignal{
+		signals = append(signals, batchFacet{
 			id:      sig.ID,
+			facet:   facet,
 			at:      sig.At,
-			emb:     sig.Embedding,
+			emb:     sig.Embeddings[facet],
 			storyID: uuid.Nil,
 			outlier: true,
 		})
@@ -218,47 +242,69 @@ func (e *emaAccum) add(d float64) {
 // storyStats computes the centroid, radius, mean distance, and population
 // standard deviation of the distances for a set of window signals, along with
 
-// moveSignal moves a stored value from one key to another and keeps the
-// signal's location-index entry pointing at the destination, so re-ingestion
-// of a batch-moved signal finds its new home and never duplicates it.
-func moveSignal(tx Tx, from, to []byte) error {
-	val, err := tx.Get(from)
+// moveFacetToStory moves one facet into a story, from wherever it currently
+// sits — another story, or the outlier bucket — and repoints the signal's
+// location index, so re-ingestion of a batch-moved signal finds its new home
+// and never duplicates it.
+//
+// from is uuid.Nil when the facet is coming out of the outlier bucket.
+func moveFacetToStory(tx Tx, from, to, signalID uuid.UUID, facet int) error {
+	if from == uuid.Nil {
+		if err := dropFacetOutlier(tx, signalID, facet); err != nil {
+			return err
+		}
+	} else if from != to {
+		if err := unplaceFacet(tx, from, signalID, facet); err != nil {
+			return err
+		}
+	}
+	if err := placeFacet(tx, to, signalID, facet); err != nil {
+		return err
+	}
+	return setFacetLoc(tx, signalID, facet, keys.FacetLoc{StoryID: to})
+}
+
+// setFacetLoc updates one facet's entry in a signal's location index, growing
+// the index if the facet sits past its current end.
+func setFacetLoc(tx Tx, signalID uuid.UUID, facet int, loc keys.FacetLoc) error {
+	locs, _, err := readSignalLocSet(tx, signalID)
 	if err != nil {
 		return err
 	}
-	if val == nil {
-		return nil
+	for len(locs) <= facet {
+		locs = append(locs, keys.FacetLoc{})
 	}
-	if err := tx.Put(to, val); err != nil {
-		return err
-	}
-	if err := tx.Delete(from); err != nil {
-		return err
-	}
-	sigID, ok := keys.ParseSignalIDFromLoc(to)
-	if !ok {
-		return nil
-	}
-	if keys.IsOutlier(to) {
-		return writeSignalLoc(tx, sigID, uuid.Nil, true)
-	}
-	storyID, ok := keys.ParseStoryIDFromSignal(to)
-	if !ok {
-		return fmt.Errorf("move signal: cannot parse destination story from %q", to)
-	}
-	return writeSignalLoc(tx, sigID, storyID, false)
+	locs[facet] = loc
+	return writeSignalLocSet(tx, signalID, locs)
 }
 
-// migrateSignals moves every signal key under from into to.
-func migrateSignals(tx Tx, from, to uuid.UUID) error {
-	prefix := keys.SignalPrefix(from)
-	return tx.ScanPrefix(prefix, func(key, val []byte) error {
-		sigID, ok := keys.ParseSignal(key, prefix)
+// migrateFacets moves every facet marker under from into to. Two facets of one
+// signal converging on the same survivor cannot collide: the key carries the
+// facet index.
+func migrateFacets(tx Tx, from, to uuid.UUID) error {
+	prefix := keys.FacetPrefix(from)
+	type ref struct {
+		signalID uuid.UUID
+		facet    int
+	}
+	var refs []ref
+	err := tx.ScanPrefix(prefix, func(key, _ []byte) error {
+		sigID, facet, ok := keys.ParseFacetMember(key, prefix)
 		if !ok {
 			return nil
 		}
-		return moveSignal(tx, key, keys.Signal(to, sigID))
+		refs = append(refs, ref{sigID, facet})
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, r := range refs {
+		if err := moveFacetToStory(tx, from, to, r.signalID, r.facet); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // The Draft answers served from memory while a batch run holds the write

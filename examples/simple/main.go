@@ -54,9 +54,9 @@ func main() {
 	sigID := uuid.NewSHA1(story.TrackerNamespace, []byte(domainKey))
 
 	signal := story.Signal[ArticlePayload]{
-		ID:        sigID,
-		At:        time.Now(),
-		Embedding: []float32{0.15, -0.32, 0.77, 0.05, 0.41},
+		ID:         sigID,
+		At:         time.Now(),
+		Embeddings: []story.Embedding{[]float32{0.15, -0.32, 0.77, 0.05, 0.41}},
 		Data: ArticlePayload{
 			Title:   "New AI Chip Breakthrough Announced",
 			Source:  "Tech Daily",
@@ -64,11 +64,16 @@ func main() {
 		},
 	}
 
-	// Ingest signal real-time (Draft Phase)
-	storyID, err := tracker.Ingest(context.Background(), signal)
+	// Ingest signal real-time (Draft Phase). A signal joins one story per facet
+	// it places, so the result is a set: empty when no story claimed any facet.
+	storyIDs, err := tracker.Ingest(context.Background(), signal)
 	if err != nil {
 		log.Fatalf("failed to ingest signal: %v", err)
 	}
 
-	fmt.Printf("Signal %s ingested. Assigned provisional Story ID: %s\n", signal.ID, storyID)
+	if len(storyIDs) == 0 {
+		fmt.Printf("Signal %s ingested. No story matched; held as an outlier.\n", signal.ID)
+	} else {
+		fmt.Printf("Signal %s ingested. Assigned provisional stories: %v\n", signal.ID, storyIDs)
+	}
 }

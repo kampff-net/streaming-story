@@ -18,10 +18,10 @@ func TestJSONCodec(t *testing.T) {
 	t.Run("round_trips_a_signal", func(t *testing.T) {
 		var c JSONCodec[codecPayload]
 		want := Signal[codecPayload]{
-			ID:        uuid.New(),
-			At:        time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC),
-			Embedding: []float32{0.5, -0.25, 1},
-			Data:      codecPayload{Title: "headline", Score: 7},
+			ID:         uuid.New(),
+			At:         time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC),
+			Embeddings: []Embedding{[]float32{0.5, -0.25, 1}},
+			Data:       codecPayload{Title: "headline", Score: 7},
 		}
 
 		b, err := c.Encode(want)
@@ -31,7 +31,7 @@ func TestJSONCodec(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, want.ID, got.ID)
 		assert.True(t, want.At.Equal(got.At))
-		assert.Equal(t, want.Embedding, got.Embedding)
+		assert.Equal(t, want.Embeddings[0], got.Embeddings[0])
 		assert.Equal(t, want.Data, got.Data)
 	})
 

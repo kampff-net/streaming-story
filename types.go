@@ -16,6 +16,10 @@ var TrackerNamespace = uuid.MustParse("d4e5f6a7-b8c9-4d0e-1f2a-3b4c5d6e7f80")
 // length differs from the dimensionality established by the first ingested signal.
 var ErrDimensionMismatch = errors.New("story: embedding dimension mismatch")
 
+// ErrTooManyFacets is returned by Ingest when a signal carries more facets
+// than Config.MaxFacetsPerSignal permits.
+var ErrTooManyFacets = errors.New("story: too many facets")
+
 // ErrNotFound is returned when a requested story does not exist in the store.
 var ErrNotFound = errors.New("story: not found")
 
@@ -31,12 +35,34 @@ const (
 	StoryStateArchived // no signals for ArchiveWindow; terminal; signals retained
 )
 
+// Embedding is one facet's vector. It is an alias rather than a defined type:
+// every vector in this library and in its callers is already []float32, and a
+// defined type would force a conversion at each of those boundaries while
+// adding nothing a conversion could catch. The alias names the concept —
+// [][]float32 does not say what its outer dimension means — and stays freely
+// interchangeable with []float32, so internal/geom, internal/dist, and
+// internal/cluster accept one without an edit.
+type Embedding = []float32
+
 // Signal is the atomic unit of input.
 type Signal[T any] struct {
-	ID        uuid.UUID
-	At        time.Time
-	Embedding []float32
-	Data      T
+	ID uuid.UUID
+	At time.Time
+
+	// Embeddings holds one Embedding per facet: the semantically distinct
+	// components the producer extracted from this item. Every facet must share
+	// the dimensionality established by the first ingested signal.
+	//
+	// Order is significant and stable: facet i is Embeddings[i], and that index
+	// is the facet's persistent identity in the store. A producer that
+	// re-ingests an item must emit its facets in the same order, or the
+	// re-ingested facets are different facets.
+	//
+	// At least one facet is required. A single-facet signal behaves exactly as
+	// a signal did before facets existed.
+	Embeddings []Embedding
+
+	Data T
 }
 
 // StoryMeta holds the current metadata for a persistent story.
@@ -111,11 +137,16 @@ type StoryEvent[T any] struct {
 // Subscribers that cannot handle high per-signal event rates should consume
 // EventBatchComplete for coarse-grained progress and query the store for
 // details rather than relying on individual EventSignalReassigned events.
+// The four story-scoped counters count stories. The rest count *facets*, which
+// is the unit maintenance operates on: a two-facet signal admitted into two
+// stories advances OutliersAdmitted by two. Callers reporting on signals should
+// derive that from the events, which are per (signal, story).
 type BatchSummary struct {
-	StoriesCreated    int
-	StoriesMerged     int
-	StoriesSplit      int
-	StoriesRetired    int
+	StoriesCreated int
+	StoriesMerged  int
+	StoriesSplit   int
+	StoriesRetired int
+
 	SignalsReassigned int
 	OutliersEvicted   int
 	OutliersPromoted  int

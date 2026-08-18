@@ -12,9 +12,15 @@
 | 003 | Two-Phase Cluster Mapping & Lifecycle | ⛔ `SUPERSEDED` by 006 | 2026-08-11 | 2026-08-11 | [spec.md](003_cluster_mapping_lifecycle/spec.md) |
 | 004 | KV Storage Schema & Persistence Layer | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](004_storage_persistence_layer/spec.md) |
 | 005 | Event Streaming & Iterators API | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](005_event_streaming_iterators/spec.md) |
+| 007 | Multi-Facet Signals & Many-to-Many Membership | 🚧 `IMPLEMENTING` | 2026-08-18 | 2026-08-18 | [spec.md](007_multi_facet_signals/spec.md) |
 
 > Spec 006 supersedes the batch re-clustering pipeline in 002 and the cluster
 > mapping engine in 003. Both remain listed for the history.
+
+> Spec 007 widens 006 rather than replacing it: every assignment rule 006
+> established is kept verbatim and re-applied at facet granularity. It changes
+> the store schema and breaks `Signal`, so existing stores are rebuilt by
+> replay and the thresholds are re-derived.
 
 ## Completed
 

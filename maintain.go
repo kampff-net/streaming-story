@@ -19,7 +19,7 @@ import (
 
 // promotion is a group of outliers that has earned story status.
 type promotion struct {
-	members []*batchSignal
+	members []*batchFacet
 }
 
 // deriveStoryID derives a new story's ID from the signals that founded it, as
@@ -41,24 +41,37 @@ func deriveStoryID(
 	tx Tx,
 	ns uuid.UUID,
 	seed string,
-	members []*batchSignal,
+	members []*batchFacet,
 	taken map[uuid.UUID]time.Time,
 ) (uuid.UUID, error) {
 
-	ids := make([]uuid.UUID, len(members))
-	for i, m := range members {
-		ids[i] = m.id
+	// The founding set is a set of facets, not of signals: two different facet
+	// sets drawn from the same signals must derive different IDs, or a split
+	// that cut one story's facets two ways would collide with the other half
+	// and the salting loop would paper over it as an ordinary collision.
+	type facetRef struct {
+		id    uuid.UUID
+		facet int
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		return bytes.Compare(ids[i][:], ids[j][:]) < 0
+	refs := make([]facetRef, len(members))
+	for i, m := range members {
+		refs[i] = facetRef{m.id, m.facet}
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if c := bytes.Compare(refs[i].id[:], refs[j].id[:]); c != 0 {
+			return c < 0
+		}
+		return refs[i].facet < refs[j].facet
 	})
 
 	for salt := 0; ; salt++ {
-		name := make([]byte, 0, len(seed)+1+16*len(ids)+8)
+		name := make([]byte, 0, len(seed)+1+24*len(refs)+8)
 		name = append(name, seed...)
 		name = append(name, 0)
-		for _, id := range ids {
-			name = append(name, id[:]...)
+		for _, r := range refs {
+			name = append(name, r.id[:]...)
+			name = strconv.AppendInt(name, int64(r.facet), 10)
+			name = append(name, 0)
 		}
 		if salt > 0 {
 			name = append(name, 0)
@@ -85,15 +98,21 @@ func deriveStoryID(
 // so a promoted story is compact from birth rather than a chain. Candidates are
 // sorted by ID first, which is what makes the grouping independent of the order
 // collection happened to read them in.
-func (t *Tracker[T]) promoteOutliers(outliers []*batchSignal) []promotion {
+func (t *Tracker[T]) promoteOutliers(outliers []*batchFacet) []promotion {
+	// Facet count is a cheap pre-gate; cluster.Grow applies the authoritative
+	// distinct-signal test to each finished group, so a signal cannot promote
+	// itself into a private story by carrying MinStorySize facets.
 	if len(outliers) < t.cfg.MinStorySize {
 		return nil
 	}
 
-	cand := make([]*batchSignal, len(outliers))
+	cand := make([]*batchFacet, len(outliers))
 	copy(cand, outliers)
 	sort.Slice(cand, func(i, j int) bool {
-		return cand[i].id.String() < cand[j].id.String()
+		if cand[i].id != cand[j].id {
+			return cand[i].id.String() < cand[j].id.String()
+		}
+		return cand[i].facet < cand[j].facet
 	})
 
 	groups := cluster.Grow(clusterPoints(cand), t.clusterParams())
@@ -106,7 +125,7 @@ func (t *Tracker[T]) promoteOutliers(outliers []*batchSignal) []promotion {
 
 // admission records an outlier joining an existing story.
 type admission struct {
-	sig     *batchSignal
+	sig     *batchFacet
 	storyID uuid.UUID
 }
 
@@ -131,8 +150,8 @@ type admission struct {
 // admission can widen a story enough to admit the next -- the chaining a moving
 // per-signal centroid would reintroduce.
 func (t *Tracker[T]) admitOutliers(
-	members map[uuid.UUID][]*batchSignal,
-	outliers []*batchSignal,
+	members map[uuid.UUID][]*batchFacet,
+	outliers []*batchFacet,
 	now time.Time,
 ) []admission {
 	if len(outliers) == 0 || len(members) == 0 {
@@ -162,9 +181,14 @@ func (t *Tracker[T]) admitOutliers(
 		return nil
 	}
 
-	cand := make([]*batchSignal, len(outliers))
+	cand := make([]*batchFacet, len(outliers))
 	copy(cand, outliers)
-	sort.Slice(cand, func(i, j int) bool { return cand[i].id.String() < cand[j].id.String() })
+	sort.Slice(cand, func(i, j int) bool {
+		if cand[i].id != cand[j].id {
+			return cand[i].id.String() < cand[j].id.String()
+		}
+		return cand[i].facet < cand[j].facet
+	})
 
 	var out []admission
 	for _, sig := range cand {
@@ -185,14 +209,14 @@ func (t *Tracker[T]) admitOutliers(
 
 // splitResult describes an accepted two-way division of a story.
 type splitResult struct {
-	keep  []*batchSignal // stays under the existing story ID
-	spawn []*batchSignal // moves to a newly created story
+	keep  []*batchFacet // stays under the existing story ID
+	spawn []*batchFacet // moves to a newly created story
 }
 
 // splitStory tests whether a story holds two groups the split threshold says are
 // separate stories, and returns the division if so. The decision, including the
 // radius pre-filter and the two-medoid search, is cluster.Split.
-func (t *Tracker[T]) splitStory(members []*batchSignal, radius float64) (splitResult, bool) {
+func (t *Tracker[T]) splitStory(members []*batchFacet, radius float64) (splitResult, bool) {
 	div, ok := cluster.Split(clusterPoints(members), radius, t.clusterParams())
 	if !ok {
 		return splitResult{}, false
@@ -206,7 +230,7 @@ func (t *Tracker[T]) splitStory(members []*batchSignal, radius float64) (splitRe
 // planMerges maps each story that is about to be retired to the story absorbing
 // it. The grouping and the survivor rule are cluster.PlanMerges.
 func (t *Tracker[T]) planMerges(
-	members map[uuid.UUID][]*batchSignal,
+	members map[uuid.UUID][]*batchFacet,
 	centroids map[uuid.UUID][]float32,
 	created map[uuid.UUID]time.Time,
 ) cluster.MergePlan {
@@ -217,7 +241,7 @@ func (t *Tracker[T]) planMerges(
 // evict, promote, split, merge, recentre, lifecycle. It is the replacement for
 // the cluster/map/apply pipeline (spec 006).
 func (t *Tracker[T]) applyMaintenance(
-	signals []batchSignal,
+	signals []batchFacet,
 	stories map[uuid.UUID]storyRecord,
 	evict []uuid.UUID,
 	mean []float32,
@@ -229,8 +253,8 @@ func (t *Tracker[T]) applyMaintenance(
 
 	err := t.cfg.Store.Update(func(tx Tx) error {
 		// Membership as it stands, keyed by story. Outliers are held apart.
-		members := make(map[uuid.UUID][]*batchSignal, len(stories))
-		var outliers []*batchSignal
+		members := make(map[uuid.UUID][]*batchFacet, len(stories))
+		var outliers []*batchFacet
 		evicted := make(map[uuid.UUID]bool, len(evict))
 		for _, id := range evict {
 			evicted[id] = true
@@ -246,12 +270,11 @@ func (t *Tracker[T]) applyMaintenance(
 			members[sig.storyID] = append(members[sig.storyID], sig)
 		}
 
-		// 1. Evict stale outliers.
+		// 1. Evict stale outliers. The TTL is a property of the signal, so
+		// every unplaced facet of it goes; the canonical record follows only
+		// if no placed facet remains (the lifetime rule).
 		for _, id := range evict {
-			if err := tx.Delete(keys.Outlier(id)); err != nil {
-				return err
-			}
-			if err := tx.Delete(keys.SignalLoc(id)); err != nil {
+			if err := evictOutlierFacets(tx, id); err != nil {
 				return err
 			}
 		}
@@ -269,7 +292,7 @@ func (t *Tracker[T]) applyMaintenance(
 				return err
 			}
 			for _, m := range p.members {
-				if err := moveSignal(tx, keys.Outlier(m.id), keys.Signal(sid, m.id)); err != nil {
+				if err := moveFacetToStory(tx, uuid.Nil, sid, m.id, m.facet); err != nil {
 					return err
 				}
 				m.storyID = sid
@@ -291,14 +314,14 @@ func (t *Tracker[T]) applyMaintenance(
 		// already cover them. Runs after promotion so a fresh clique competes
 		// for them, and before split so a story widened by admission is cut in
 		// the same run rather than staying diffuse until the next one.
-		var leftover []*batchSignal
+		var leftover []*batchFacet
 		for _, sig := range outliers {
 			if sig.outlier {
 				leftover = append(leftover, sig)
 			}
 		}
 		for _, ad := range t.admitOutliers(members, leftover, now) {
-			if err := moveSignal(tx, keys.Outlier(ad.sig.id), keys.Signal(ad.storyID, ad.sig.id)); err != nil {
+			if err := moveFacetToStory(tx, uuid.Nil, ad.storyID, ad.sig.id, ad.sig.facet); err != nil {
 				return err
 			}
 			ad.sig.storyID = ad.storyID
@@ -329,7 +352,7 @@ func (t *Tracker[T]) applyMaintenance(
 				return err
 			}
 			for _, m := range res.spawn {
-				if err := moveSignal(tx, keys.Signal(sid, m.id), keys.Signal(child, m.id)); err != nil {
+				if err := moveFacetToStory(tx, sid, child, m.id, m.facet); err != nil {
 					return err
 				}
 				m.storyID = child
@@ -363,7 +386,7 @@ func (t *Tracker[T]) applyMaintenance(
 			// Migrate the full key space, including signals older than
 			// BatchWindow: a merge is a key-space migration and is the
 			// documented exception to the stability rule.
-			if err := migrateSignals(tx, retired, survivor); err != nil {
+			if err := migrateFacets(tx, retired, survivor); err != nil {
 				return err
 			}
 			if rec, ok := stories[retired]; ok && !rec.LastSignalAt.IsZero() {
@@ -421,6 +444,12 @@ func (t *Tracker[T]) applyMaintenance(
 	if err != nil {
 		return nil, nil, err
 	}
+	// One reassignment event per (signal, story), however many of that
+	// signal's facets moved there. Deduping once at the end rather than at
+	// each emission site keeps the rule in one place: promotion, admission,
+	// and split can all place several facets of one signal in one story.
+	events = dedupeReassignments(events)
+
 	return summary, events, nil
 }
 
@@ -431,7 +460,7 @@ func (t *Tracker[T]) applyMaintenance(
 // threshold comparison downstream with them.
 func (t *Tracker[T]) recentreStory(
 	tx Tx, sid uuid.UUID, prev storyRecord, existing bool,
-	group []*batchSignal, ema *emaAccum,
+	group []*batchFacet, ema *emaAccum,
 	summary *BatchSummary, events *[]StoryEvent[T], now time.Time,
 ) error {
 	rec := prev
@@ -509,7 +538,7 @@ func (t *Tracker[T]) recentreStory(
 
 // sortedIDs returns the map's keys in a stable order so that iteration never
 // leaks map ordering into a decision.
-func sortedIDs(m map[uuid.UUID][]*batchSignal) []uuid.UUID {
+func sortedIDs(m map[uuid.UUID][]*batchFacet) []uuid.UUID {
 	out := make([]uuid.UUID, 0, len(m))
 	for id := range m {
 		out = append(out, id)
@@ -525,5 +554,29 @@ func sortedPlanKeys(p cluster.MergePlan) []uuid.UUID {
 		out = append(out, id)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
+	return out
+}
+
+// dedupeReassignments collapses EventSignalReassigned to one event per
+// (signal, story) pair, preserving order. Several facets of one signal landing
+// in one story is still one signal joining one story, and a subscriber that
+// synthesises per event must not be told about it once per facet.
+func dedupeReassignments[T any](events []StoryEvent[T]) []StoryEvent[T] {
+	type pair struct {
+		story  uuid.UUID
+		signal uuid.UUID
+	}
+	seen := make(map[pair]struct{}, len(events))
+	out := events[:0]
+	for _, ev := range events {
+		if ev.Kind == EventSignalReassigned {
+			k := pair{ev.StoryID, ev.SignalID}
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+		}
+		out = append(out, ev)
+	}
 	return out
 }

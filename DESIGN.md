@@ -55,13 +55,30 @@ calibration state), and `query.go` (the read API).
 The atomic unit of input, generic over a caller payload.
 
 ```go
+type Embedding = []float32 // alias: names the concept, converts nowhere
+
 type Signal[T any] struct {
-    ID        uuid.UUID // UUID v5; see UUID Namespace
-    At        time.Time
-    Embedding []float32 // dimensionality fixed by the first Ingest; mismatch returns ErrDimensionMismatch
-    Data      T         // opaque caller payload
+    ID         uuid.UUID   // UUID v5; see UUID Namespace
+    At         time.Time
+    Embeddings []Embedding // one per facet; dimensionality fixed by the first Ingest, and shared by every facet
+    Data       T           // opaque caller payload
 }
 ```
+
+**Facets.** A signal carries one vector per *facet* — one semantically distinct
+component of the item. A facet, not a signal, is the unit of assignment and of
+geometry: it is compared to centroids, admitted or held as an outlier, and
+counted into a centroid, radius, and σ. A facet belongs to at most one story,
+and a signal belongs to the union of its facets' stories, which is what makes
+membership many-to-many.
+
+The library never creates, reorders, merges, or drops a facet — decomposition
+is the producer's judgment, and it depends on the item's own structure rather
+than on corpus geometry. Facet order is significant and stable: facet `i` is
+`Embeddings[i]`, and that index is its persistent identity in the store.
+
+Sizes are counted in **distinct signals**, never facets: one signal split into
+`MinStorySize` facets is still one signal and cannot found a story alone.
 
 ### Story
 
@@ -247,10 +264,19 @@ For each arriving signal:
    - **Before the first batch.** σ_global has never been measured, so
      `InitialSigmaGlobal` stands in.
 
-4. **Assign or bucket.** Within threshold, the signal is written under the
-   story, any stale outlier copy is dropped, the location index is updated,
-   `LastSignalAt` advances monotonically, and `EventDraftAssigned` is emitted.
-   Otherwise the signal is written to `o:{signalID}`.
+4. **Assign or bucket, per facet.** Every facet is scored against every
+   candidate story in a single walk of the time index — once for the whole
+   signal, not once per facet. Within threshold, the facet's membership marker
+   is written under the story, any stale outlier marker is dropped, and the
+   location index is updated; otherwise the facet is held at
+   `o:{signalID}:{facet}`. A signal may therefore be partly placed.
+   `LastSignalAt` advances monotonically, once per touched story, and
+   `EventDraftAssigned` is emitted once per `(signal, story)` — several facets
+   landing in one story is still one signal joining one story.
+
+   Re-ingest is a no-op at the signal level once **any** facet is placed: batch
+   placements are authoritative and a late duplicate must not partially
+   overwrite one.
 
 **Centroid currency.** Centroids are recomputed only at the end of a batch run,
 so a Draft decision may use a centroid up to `BatchInterval` old. Accepted:
@@ -450,20 +476,30 @@ depend on it. `MemStore` ships for tests and small deployments.
 |---|---|---|
 | Calibration state | `c:state` | JSON: σ_global, dimensionality, last batch timestamp, corpus mean |
 | Story metadata | `s:{storyID}:m` | JSON: both centroids, radius, state, timestamps, live and frozen statistics |
-| Signal data | `s:{storyID}:s:{signalID}` | Encoded `Signal[T]` |
-| Outlier signal | `o:{signalID}` | Encoded `Signal[T]` |
-| Signal location index | `l:{signalID}` | `s:{storyID}` for a story member, `o` for an outlier |
+| Canonical signal record | `g:{signalID}` | Encoded `Signal[T]`; the one authoritative copy |
+| Facet membership | `s:{storyID}:f:{signalID}:{facet}` | empty marker |
+| Unplaced facet | `o:{signalID}:{facet}` | empty marker |
+| Signal location index | `l:{signalID}` | JSON array, one entry per facet: `s:{storyID}`, `o`, or empty |
 | Story time index | `t:{unix_sec}:{storyID}` | empty |
 
 **Story time index.** Deleted and re-inserted on every metadata write so the
 timestamp stays current. A range scan from `t:{cutoff}:` retrieves recently
 active stories for Tier 3 without a full metadata scan.
 
-**Signal location index.** Written when a signal is stored, updated by every
-batch move including merge migrations, deleted on eviction. `Ingest` consults it
-before the centroid match: a copy living in *any* story is a strict no-op. This
-closes a duplicate-creation window where a signal ingested once, then moved by a
-batch run, would be re-ingested as a second copy under the nearest story.
+**Canonical signal record.** The payload lives once at `g:{signalID}`,
+independently of where its facets sit, so a signal in several stories is stored
+once rather than copied per membership — and so the whole corpus can be
+enumerated by one prefix scan. It is written on first ingest and never
+rewritten, and deleted only when no facet of the signal remains anywhere: no
+membership under any story, and nothing in the outlier bucket. That delete runs
+in the same transaction as the one that removed the last facet.
+
+**Signal location index.** Derived state, rebuildable in full from the facet
+membership and outlier key spaces. It carries one entry per facet and is
+updated by every placement change, in the same transaction as the markers it
+mirrors, so the two cannot disagree. It exists so `Ingest` can find where a
+signal's facets live without scanning, which is what makes re-ingestion after a
+batch move a no-op rather than a duplicate.
 
 **Signal retention.** Signal data is retained in all story states, Archived
 included. No signal keys are deleted on archival.

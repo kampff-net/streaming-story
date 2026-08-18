@@ -42,7 +42,7 @@ calibration state), and `query.go` (the read API).
 
 Two rules worth keeping: a decision belongs in `internal/cluster` if it can be
 expressed over points and thresholds alone, and any conversion between a
-`batchSignal` and an algorithm's view belongs in `points.go` rather than at the
+`batchFacet` and an algorithm's view belongs in `points.go` rather than at the
 call site.
 
 ## Build and Test Commands
@@ -95,9 +95,11 @@ A buffered `Ingest` still returns a provisional story ID. It is computed from `d
 |---|---|
 | `c:state` | `σ_global`, dimensionality, last batch timestamp, corpus mean |
 | `s:{storyID}:m` | Story metadata (centroid, radius, state, timestamps, frozen stats) |
-| `s:{storyID}:s:{signalID}` | Signal data |
+| `g:{signalID}` | Canonical signal record: the one authoritative copy of a `Signal[T]`, held independently of where its facets are placed. Deleted only when no facet of the signal remains anywhere |
+| `s:{storyID}:f:{signalID}:{facet}` | Facet membership marker, payload-free. `{facet}` is zero-padded to four digits so a signal's facets sort in facet order |
+| `o:{signalID}:{facet}` | Unplaced facet marker, payload-free |
 | `o:{signalID}` | Outlier signal |
-| `l:{signalID}` | Signal location index: `s:{storyID}` for story membership, `o` for outlier bucket. Lets `Ingest` find where a copy lives so re-ingestion after a batch move never duplicates it |
+| `l:{signalID}` | Signal location index: JSON array with one entry per facet — `s:{storyID}`, `o`, or empty. Derived state, rebuildable from the two marker spaces. Lets `Ingest` find where a signal's facets live so re-ingestion after a batch move never duplicates them |
 | `t:{unix_sec}:{storyID}` | Time index for efficient Tier 3 range scans |
 
 ### Library Conveniences
@@ -129,7 +131,9 @@ Key rules when touching this code:
 
 ### Resolved Design Decisions
 
-- `MinStorySize` is the minimum signals for a group to be a story; it gates promotion and both sides of a split. It replaced `MinClusterSize`, which has since been removed along with every other dead knob — `Config` has no no-op fields, and none should be reintroduced. See [`HISTORY.md`](HISTORY.md#removed-config-fields).
+- **Facets.** A signal carries one `Embedding` per facet (`Signal.Embeddings`). A facet is the unit of assignment and geometry and belongs to at most one story; a signal belongs to the union of its facets' stories, so membership is many-to-many. The library never creates, merges, reorders, or drops a facet — decomposition is the caller's judgment. Facet order is its persistent identity. See [spec 007](spec/007_multi_facet_signals/spec.md).
+- **Sizes count distinct signals, never facets.** `cluster.Params.MinSize` counts distinct `Point.ID`s, so one signal split into `MinStorySize` facets cannot found a story alone. Do not "simplify" it back to `len(group)`.
+- `MinStorySize` is the minimum distinct signals for a group to be a story; it gates promotion and both sides of a split. It replaced `MinClusterSize`, which has since been removed along with every other dead knob — `Config` has no no-op fields, and none should be reintroduced. See [`HISTORY.md`](HISTORY.md#removed-config-fields).
 - **`BatchWindow` only sets the `OutlierTTL` default.** It does not bound clustering input: membership is read in full every pass. Do not reach for it to limit work.
 - `StabilityWindow` is **removed** — `BatchWindow` is the sole re-assignment scope.
 - Signal UUID namespace is a **fixed compile-time constant** (`TrackerNamespace`) — not derived from store path.

@@ -13,127 +13,167 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseSignalKey(t *testing.T) {
+func TestParseFacetMemberKey(t *testing.T) {
 	sid := uuid.New()
-	prefix := keys.SignalPrefix(uuid.New())
-	id, ok := keys.ParseSignal(keys.Signal(uuid.New(), sid), prefix)
+	story := uuid.New()
+	prefix := keys.FacetPrefix(story)
+
+	id, facet, ok := keys.ParseFacetMember(keys.FacetMember(story, sid, 2), prefix)
 	assert.True(t, ok)
 	assert.Equal(t, sid, id)
+	assert.Equal(t, 2, facet)
 
-	_, ok = keys.ParseSignal([]byte("s:short"), prefix)
+	_, _, ok = keys.ParseFacetMember([]byte("s:short"), prefix)
 	assert.False(t, ok)
-	_, ok = keys.ParseSignal(prefix, prefix)
+	_, _, ok = keys.ParseFacetMember(prefix, prefix)
+	assert.False(t, ok)
+	// A facet key of a different story must not parse under this prefix.
+	_, _, ok = keys.ParseFacetMember(keys.FacetMember(uuid.New(), sid, 0), prefix)
 	assert.False(t, ok)
 }
-func TestMoveSignal(t *testing.T) {
+
+// moveFacetToStory is the one operation that relocates a facet, and the
+// location index must follow it in every direction.
+func TestMoveFacetToStory_MaintainsLocationIndex(t *testing.T) {
 	ms := newMemStore()
-	from := keys.Signal(uuid.New(), uuid.New())
-	to := keys.Outlier(uuid.New())
+	storyA, storyB := uuid.New(), uuid.New()
+	sigID := uuid.New()
+	const facet = 0
 
+	// Start in the outlier bucket.
 	require.NoError(t, ms.Update(func(tx Tx) error {
-		return tx.Put(from, []byte("payload"))
-	}))
-	require.NoError(t, ms.Update(func(tx Tx) error {
-		return moveSignal(tx, from, to)
+		if err := holdFacetOutlier(tx, sigID, facet); err != nil {
+			return err
+		}
+		return writeSignalLocSet(tx, sigID, []keys.FacetLoc{{IsOutlier: true}})
 	}))
 
+	// outlier -> story A.
+	require.NoError(t, ms.Update(func(tx Tx) error {
+		return moveFacetToStory(tx, uuid.Nil, storyA, sigID, facet)
+	}))
 	require.NoError(t, ms.View(func(tx Tx) error {
-		v, err := tx.Get(from)
+		locs, hasIndex, err := readSignalLocSet(tx, sigID)
 		require.NoError(t, err)
-		assert.Nil(t, v, "source must be deleted")
-		v, err = tx.Get(to)
-		require.NoError(t, err)
-		assert.Equal(t, []byte("payload"), v)
+		require.True(t, hasIndex)
+		assert.Equal(t, []keys.FacetLoc{{StoryID: storyA}}, locs)
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyA, sigID, facet)))
+		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sigID, facet)), "outlier marker must be cleared")
 		return nil
 	}))
 
-	// Moving a missing key is a no-op.
+	// story A -> story B: the old membership must not linger.
 	require.NoError(t, ms.Update(func(tx Tx) error {
-		return moveSignal(tx, keys.Signal(uuid.New(), uuid.New()), to)
+		return moveFacetToStory(tx, storyA, storyB, sigID, facet)
+	}))
+	require.NoError(t, ms.View(func(tx Tx) error {
+		locs, _, err := readSignalLocSet(tx, sigID)
+		require.NoError(t, err)
+		assert.Equal(t, []keys.FacetLoc{{StoryID: storyB}}, locs)
+		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyA, sigID, facet)))
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyB, sigID, facet)))
+		return nil
 	}))
 }
 
-func TestMoveSignal_MaintainsLocationIndex(t *testing.T) {
+// Two facets of one signal converging on the same survivor must both survive:
+// the key carries the facet index, so they cannot collide.
+func TestMigrateFacets_KeepsBothFacetsOfOneSignal(t *testing.T) {
 	ms := newMemStore()
-	storyA := uuid.New()
-	storyB := uuid.New()
+	retired, survivor := uuid.New(), uuid.New()
 	sigID := uuid.New()
 
-	keyA := keys.Signal(storyA, sigID)
-	keyB := keys.Signal(storyB, sigID)
-	keyO := keys.Outlier(sigID)
-
 	require.NoError(t, ms.Update(func(tx Tx) error {
-		return tx.Put(keyA, []byte("payload"))
+		if err := placeFacet(tx, retired, sigID, 0); err != nil {
+			return err
+		}
+		if err := placeFacet(tx, survivor, sigID, 1); err != nil {
+			return err
+		}
+		return writeSignalLocSet(tx, sigID, []keys.FacetLoc{{StoryID: retired}, {StoryID: survivor}})
 	}))
 
-	// story -> story: index follows the destination.
 	require.NoError(t, ms.Update(func(tx Tx) error {
-		return moveSignal(tx, keyA, keyB)
+		return migrateFacets(tx, retired, survivor)
 	}))
+
 	require.NoError(t, ms.View(func(tx Tx) error {
-		storyID, isOutlier, hasIndex, err := readSignalLoc(tx, sigID)
-		require.NoError(t, err)
-		require.True(t, hasIndex)
-		assert.Equal(t, storyB, storyID)
-		assert.False(t, isOutlier)
-		return nil
-	}))
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(survivor, sigID, 0)))
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(survivor, sigID, 1)))
+		assert.Nil(t, mustGet(t, tx, keys.FacetMember(retired, sigID, 0)))
 
-	// story -> outlier: index records the outlier bucket.
-	require.NoError(t, ms.Update(func(tx Tx) error {
-		return moveSignal(tx, keyB, keyO)
-	}))
-	require.NoError(t, ms.View(func(tx Tx) error {
-		_, isOutlier, hasIndex, err := readSignalLoc(tx, sigID)
+		locs, _, err := readSignalLocSet(tx, sigID)
 		require.NoError(t, err)
-		require.True(t, hasIndex)
-		assert.True(t, isOutlier)
-		return nil
-	}))
-
-	// outlier -> story: index follows the destination again.
-	require.NoError(t, ms.Update(func(tx Tx) error {
-		return moveSignal(tx, keyO, keyA)
-	}))
-	require.NoError(t, ms.View(func(tx Tx) error {
-		storyID, isOutlier, hasIndex, err := readSignalLoc(tx, sigID)
-		require.NoError(t, err)
-		require.True(t, hasIndex)
-		assert.Equal(t, storyA, storyID)
-		assert.False(t, isOutlier)
+		assert.Equal(t, []keys.FacetLoc{{StoryID: survivor}, {StoryID: survivor}}, locs)
 		return nil
 	}))
 }
 
-func TestEvictionDeletesLocationIndex(t *testing.T) {
+// Eviction must clear the outlier marker, the location index, and — because
+// nothing else holds it — the canonical record.
+func TestEvictionDropsFacetsIndexAndRecord(t *testing.T) {
 	tr := newTestTracker(t)
 	tr.dim.Store(2)
 
 	sigID := uuid.New()
-	encoded, err := tr.cfg.Codec.Encode(Signal[string]{ID: sigID, At: time.Now(), Embedding: []float32{0, 0}})
-	require.NoError(t, err)
+	sig := Signal[string]{ID: sigID, At: time.Now(), Embeddings: []Embedding{{0, 0}}}
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		if err := tx.Put(keys.Outlier(sigID), encoded); err != nil {
-			return err
-		}
-		return writeSignalLoc(tx, sigID, uuid.Nil, true)
+		return seedOutlier(tx, tr, sig)
 	}))
 
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-		if err := tx.Delete(keys.Outlier(sigID)); err != nil {
-			return err
-		}
-		return tx.Delete(keys.SignalLoc(sigID))
+		return evictOutlierFacets(tx, sigID)
 	}))
 
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		_, _, hasIndex, err := readSignalLoc(tx, sigID)
+		_, hasIndex, err := readSignalLocSet(tx, sigID)
 		require.NoError(t, err)
 		assert.False(t, hasIndex, "evicted outlier must drop its location-index entry")
+		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sigID, 0)))
+		assert.Nil(t, mustGet(t, tx, keys.CanonicalSignal(sigID)), "no facet remains, so the record goes too")
 		return nil
 	}))
 }
+
+// The lifetime rule: a signal with a placed facet keeps its canonical record
+// even when its unplaced facets age out.
+func TestEviction_KeepsRecordWhileAFacetIsPlaced(t *testing.T) {
+	tr := newTestTracker(t)
+	tr.dim.Store(2)
+
+	storyID := uuid.New()
+	sigID := uuid.New()
+	sig := Signal[string]{ID: sigID, At: time.Now(), Embeddings: []Embedding{{1, 0}, {0, 1}}}
+	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+		if err := tr.writeCanonicalSignal(tx, sig); err != nil {
+			return err
+		}
+		if err := placeFacet(tx, storyID, sigID, 0); err != nil {
+			return err
+		}
+		if err := holdFacetOutlier(tx, sigID, 1); err != nil {
+			return err
+		}
+		return writeSignalLocSet(tx, sigID, []keys.FacetLoc{{StoryID: storyID}, {IsOutlier: true}})
+	}))
+
+	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
+		return evictOutlierFacets(tx, sigID)
+	}))
+
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		assert.NotNil(t, mustGet(t, tx, keys.CanonicalSignal(sigID)), "a placed facet keeps the record alive")
+		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyID, sigID, 0)), "placed facet is untouched")
+		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sigID, 1)), "unplaced facet is evicted")
+
+		locs, hasIndex, err := readSignalLocSet(tx, sigID)
+		require.NoError(t, err)
+		require.True(t, hasIndex)
+		assert.Equal(t, []keys.FacetLoc{{StoryID: storyID}, {}}, locs)
+		return nil
+	}))
+}
+
 func TestRunBatch_StoryCreationFromOutliers(t *testing.T) {
 	tr := newTestTracker(t)
 	tr.dim.Store(3)
@@ -149,7 +189,7 @@ func TestRunBatch_StoryCreationFromOutliers(t *testing.T) {
 	}
 	for i, emb := range embeddings {
 		sigID := uuid.NewSHA1(TrackerNamespace, []byte(fmt.Sprintf("batch-create-%d", i)))
-		_, err := tr.Ingest(context.Background(), Signal[string]{ID: sigID, At: time.Now(), Embedding: emb})
+		_, err := tr.Ingest(context.Background(), Signal[string]{ID: sigID, At: time.Now(), Embeddings: []Embedding{emb}})
 		require.NoError(t, err)
 	}
 
@@ -205,12 +245,8 @@ func TestRunBatch_Merge(t *testing.T) {
 		write := func(sid uuid.UUID, created time.Time, embs [][]float32) error {
 			for i, emb := range embs {
 				sigID := uuid.NewSHA1(sid, []byte(fmt.Sprintf("sig-%d", i)))
-				sig := Signal[string]{ID: sigID, At: now.Add(-time.Minute), Embedding: emb}
-				b, err := tr.cfg.Codec.Encode(sig)
-				if err != nil {
-					return err
-				}
-				if err := tx.Put(keys.Signal(sid, sigID), b); err != nil {
+				sig := Signal[string]{ID: sigID, At: now.Add(-time.Minute), Embeddings: []Embedding{emb}}
+				if err := seedMember(tx, tr, sid, sig); err != nil {
 					return err
 				}
 			}

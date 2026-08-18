@@ -34,7 +34,7 @@ func TestCorpusProbe(t *testing.T) {
 	for i, emb := range pts {
 		id := uuid.NewSHA1(TrackerNamespace, []byte(fmt.Sprintf("corpus-%d", i)))
 		_, err := tr.Ingest(context.Background(), Signal[string]{
-			ID: id, At: now, Embedding: emb, Data: fmt.Sprintf("s%d", i),
+			ID: id, At: now, Embeddings: []Embedding{emb}, Data: fmt.Sprintf("s%d", i),
 		})
 		require.NoError(t, err)
 	}
@@ -74,13 +74,13 @@ func probeReport(t *testing.T, tr *Tracker[string], total int, label string) {
 	// through the projector before it is measured. Without that these numbers
 	// describe a geometry the maintenance pass never sees.
 	p := tr.projector()
-	var big []*batchSignal
+	var big []*batchFacet
 	for meta := range tr.Stories(StoryStateAny) {
-		var group []*batchSignal
+		var group []*batchFacet
 		for sig, err := range tr.SignalsOf(meta.ID) {
 			if err == nil {
-				group = append(group, &batchSignal{
-					id: sig.ID, at: sig.At, emb: p.Project(sig.Embedding),
+				group = append(group, &batchFacet{
+					id: sig.ID, at: sig.At, emb: p.Project(sig.Embeddings[0]),
 				})
 			}
 		}
@@ -99,7 +99,7 @@ func probeReport(t *testing.T, tr *Tracker[string], total int, label string) {
 		if ok {
 			sep = dist.CosineDistance(centroidOf(res.keep), centroidOf(res.spawn))
 		} else {
-			var l, rr []*batchSignal
+			var l, rr []*batchFacet
 			for _, m := range big {
 				if dist.CosineDistance(m.emb, big[a].emb) <= dist.CosineDistance(m.emb, big[b].emb) {
 					l = append(l, m)

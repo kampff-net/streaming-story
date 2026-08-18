@@ -32,86 +32,11 @@ func TestKeyStoryPrefix(t *testing.T) {
 	)
 }
 
-func TestKeySignal(t *testing.T) {
-	assert.Equal(t,
-		[]byte("s:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:s:11111111-2222-3333-4444-555555555555"),
-		Signal(keysTestStoryID, keysTestSignalID),
-	)
-}
-
-func TestKeySignalPrefix(t *testing.T) {
-	assert.Equal(t,
-		[]byte("s:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:s:"),
-		SignalPrefix(keysTestStoryID),
-	)
-}
-
-func TestKeyOutlier(t *testing.T) {
-	assert.Equal(t,
-		[]byte("o:11111111-2222-3333-4444-555555555555"),
-		Outlier(keysTestSignalID),
-	)
-}
-
 func TestKeySignalLoc(t *testing.T) {
 	assert.Equal(t,
 		[]byte("l:11111111-2222-3333-4444-555555555555"),
 		SignalLoc(keysTestSignalID),
 	)
-}
-
-func TestParseSignalIDFromLocKey(t *testing.T) {
-	id, ok := ParseSignalIDFromLoc(Signal(keysTestStoryID, keysTestSignalID))
-	require.True(t, ok)
-	assert.Equal(t, keysTestSignalID, id)
-
-	id, ok = ParseSignalIDFromLoc(Outlier(keysTestSignalID))
-	require.True(t, ok)
-	assert.Equal(t, keysTestSignalID, id)
-
-	_, ok = ParseSignalIDFromLoc([]byte("s:story:m"))
-	assert.False(t, ok)
-	_, ok = ParseSignalIDFromLoc([]byte("l:whatever"))
-	assert.False(t, ok)
-	_, ok = ParseSignalIDFromLoc(nil)
-	assert.False(t, ok)
-}
-
-func TestParseStoryIDFromSignalKey(t *testing.T) {
-	id, ok := ParseStoryIDFromSignal(Signal(keysTestStoryID, keysTestSignalID))
-	require.True(t, ok)
-	assert.Equal(t, keysTestStoryID, id)
-
-	_, ok = ParseStoryIDFromSignal(Outlier(keysTestSignalID))
-	assert.False(t, ok)
-	_, ok = ParseStoryIDFromSignal([]byte("s:story:m"))
-	assert.False(t, ok)
-}
-
-func TestIsOutlierKey(t *testing.T) {
-	assert.True(t, IsOutlier(Outlier(keysTestSignalID)))
-	assert.False(t, IsOutlier(Signal(keysTestStoryID, keysTestSignalID)))
-	assert.False(t, IsOutlier(nil))
-}
-
-func TestParseSignalLoc(t *testing.T) {
-	storyID := uuid.New()
-
-	id, isOutlier, ok := ParseSignalLoc([]byte("s:" + storyID.String()))
-	require.True(t, ok)
-	assert.Equal(t, storyID, id)
-	assert.False(t, isOutlier)
-
-	_, isOutlier, ok = ParseSignalLoc([]byte("o"))
-	require.True(t, ok)
-	assert.True(t, isOutlier)
-
-	_, _, ok = ParseSignalLoc([]byte("s:not-a-uuid"))
-	assert.False(t, ok)
-	_, _, ok = ParseSignalLoc([]byte("x"))
-	assert.False(t, ok)
-	_, _, ok = ParseSignalLoc(nil)
-	assert.False(t, ok)
 }
 
 func TestParseTimeIndexKey(t *testing.T) {
@@ -154,4 +79,125 @@ func TestKeyTimeIndex(t *testing.T) {
 
 func TestKeyTimeIndexFrom(t *testing.T) {
 	assert.Equal(t, []byte("t:1234567890:"), TimeIndexFrom(1234567890))
+}
+
+// --- spec 007: facet-granular schema ---
+
+func TestCanonicalSignal_RoundTrip(t *testing.T) {
+	id := uuid.New()
+	key := CanonicalSignal(id)
+	assert.True(t, bytes.HasPrefix(key, CanonicalPrefix()))
+
+	got, ok := ParseCanonicalSignal(key)
+	require.True(t, ok)
+	assert.Equal(t, id, got)
+}
+
+func TestCanonicalSignal_RejectsOtherSpaces(t *testing.T) {
+	for _, key := range [][]byte{
+		StoryMeta(uuid.New()),
+		OutlierFacet(uuid.New(), 0),
+		[]byte("g:not-a-uuid"),
+		[]byte("g:"),
+		nil,
+	} {
+		_, ok := ParseCanonicalSignal(key)
+		assert.False(t, ok, "key %q must not parse as a canonical record", key)
+	}
+}
+
+func TestFacetMember_RoundTrip(t *testing.T) {
+	story, sig := uuid.New(), uuid.New()
+	prefix := FacetPrefix(story)
+
+	key := FacetMember(story, sig, 7)
+	assert.True(t, bytes.HasPrefix(key, prefix))
+
+	gotSig, gotFacet, ok := ParseFacetMember(key, prefix)
+	require.True(t, ok)
+	assert.Equal(t, sig, gotSig)
+	assert.Equal(t, 7, gotFacet)
+}
+
+// The membership prefix must not collide with the metadata key: both live
+// under "s:{storyID}:".
+func TestFacetPrefix_DoesNotCollide(t *testing.T) {
+	story := uuid.New()
+	prefix := FacetPrefix(story)
+
+	assert.False(t, bytes.HasPrefix(StoryMeta(story), prefix))
+	assert.True(t, bytes.HasPrefix(prefix, StoryPrefix(story)), "facet keys live under the story prefix")
+	assert.True(t, bytes.HasPrefix(FacetMember(story, uuid.New(), 0), prefix))
+}
+
+// Facet keys of one signal must sort in facet order, which is what the
+// zero-padding buys and what an unpadded index would break at 9 -> 10.
+func TestFacetMember_SortsByFacetIndex(t *testing.T) {
+	story, sig := uuid.New(), uuid.New()
+	prev := FacetMember(story, sig, 0)
+	for facet := 1; facet <= MaxFacet; facet *= 3 {
+		key := FacetMember(story, sig, facet)
+		assert.Negative(t, bytes.Compare(prev, key), "facet %d must sort after its predecessor", facet)
+		prev = key
+	}
+}
+
+func TestOutlierFacet_RoundTrip(t *testing.T) {
+	sig := uuid.New()
+	key := OutlierFacet(sig, 3)
+	assert.True(t, bytes.HasPrefix(key, OutlierPrefix()))
+
+	gotSig, gotFacet, ok := ParseOutlierFacet(key)
+	require.True(t, ok)
+	assert.Equal(t, sig, gotSig)
+	assert.Equal(t, 3, gotFacet)
+}
+
+// A malformed facet index must be rejected outright. Parsing it as facet 0
+// would silently alias every broken key onto a real facet.
+func TestParseFacet_RejectsMalformedIndex(t *testing.T) {
+	sig := uuid.New()
+	for _, key := range [][]byte{
+		[]byte("o:" + sig.String() + ":12"),    // too short
+		[]byte("o:" + sig.String() + ":00012"), // too long
+		[]byte("o:" + sig.String() + ":00x1"),  // not digits
+		[]byte("o:" + sig.String()),            // no index at all
+		[]byte("o:" + sig.String() + ":"),      // empty index
+		[]byte("o:not-a-uuid:0001"),            // bad signal ID
+	} {
+		_, _, ok := ParseOutlierFacet(key)
+		assert.False(t, ok, "key %q must not parse", key)
+	}
+}
+
+func TestSignalLocSet_RoundTrip(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	in := []FacetLoc{
+		{StoryID: a},
+		{IsOutlier: true},
+		{StoryID: b},
+		{}, // no location recorded
+	}
+
+	out, ok := ParseSignalLocSet(EncodeSignalLocSet(in))
+	require.True(t, ok)
+	assert.Equal(t, in, out)
+}
+
+func TestSignalLocSet_Empty(t *testing.T) {
+	out, ok := ParseSignalLocSet(EncodeSignalLocSet(nil))
+	require.True(t, ok)
+	assert.Empty(t, out)
+}
+
+func TestSignalLocSet_RejectsMalformed(t *testing.T) {
+	for _, val := range [][]byte{
+		[]byte(`not json`),
+		[]byte(`{"a":1}`),
+		[]byte(`["x:whatever"]`),
+		[]byte(`["s:not-a-uuid"]`),
+	} {
+		_, ok := ParseSignalLocSet(val)
+		assert.False(t, ok, "value %q must not parse", val)
+	}
 }

@@ -1,0 +1,66 @@
+goos: linux
+goarch: amd64
+pkg: go.kvsh.ch/streaming-story
+cpu: AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics  
+BenchmarkBatch-16                	     460	   2512240 ns/op	  835776 B/op	    8736 allocs/op
+BenchmarkBatch-16                	     522	   2175672 ns/op	  834784 B/op	    8732 allocs/op
+BenchmarkBatch-16                	     504	   2197592 ns/op	  834757 B/op	    8732 allocs/op
+BenchmarkBatch-16                	     525	   2207816 ns/op	  834747 B/op	    8731 allocs/op
+BenchmarkBatch-16                	     517	   2191609 ns/op	  834803 B/op	    8732 allocs/op
+BenchmarkBatch-16                	     518	   2170344 ns/op	  834783 B/op	    8731 allocs/op
+BenchmarkBatch-16                	     482	   2298453 ns/op	  835002 B/op	    8734 allocs/op
+BenchmarkBatch-16                	     498	   2262014 ns/op	  833898 B/op	    8732 allocs/op
+BenchmarkBatch-16                	     571	   2135180 ns/op	  834398 B/op	    8729 allocs/op
+BenchmarkBatch-16                	     534	   2287742 ns/op	  834651 B/op	    8731 allocs/op
+BenchmarkIngestDuringApply-16    	 1822984	       662.5 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1628535	       706.6 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1848722	       654.7 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1798580	       671.4 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1789124	       672.6 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1753182	       690.0 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1778844	       675.5 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1777231	       669.8 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1739240	       684.1 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1744167	       688.8 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   2004345 ns/op	  264005 B/op	     154 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1990267 ns/op	  263794 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1991157 ns/op	  263784 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1998307 ns/op	  263761 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1988318 ns/op	  263792 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   2002491 ns/op	  263700 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1990574 ns/op	  263742 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1997824 ns/op	  263688 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   2000543 ns/op	  263636 B/op	     153 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1992623 ns/op	  263763 B/op	     153 allocs/op
+BenchmarkSignalsOf-16            	    2755	    431287 ns/op	  112015 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    3087	    425036 ns/op	  112001 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2853	    421794 ns/op	  111985 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2757	    416833 ns/op	  111901 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2965	    418432 ns/op	  111983 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2834	    415233 ns/op	  111888 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2857	    414816 ns/op	  111902 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    3128	    416395 ns/op	  111664 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2836	    417418 ns/op	  111887 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2772	    419498 ns/op	  111986 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:202: largest story holds 100 signals
+PASS
+ok  	go.kvsh.ch/streaming-story	257.464s

@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"go.kvsh.ch/streaming-story/internal/keys"
 )
 
 // Config holds all configuration for a Tracker.
@@ -90,10 +92,21 @@ type Config[T any] struct {
 	// stability on narrow corpora.
 	MeanRemoval float64
 
-	// MinStorySize is the number of signals a group must hold to exist as a
-	// story (default: 3). It gates outlier promotion and both sides of a
-	// split; a smaller group stays in the outlier bucket or stays put.
+	// MinStorySize is the number of *distinct signals* a group must hold to
+	// exist as a story (default: 3). It gates outlier promotion and both sides
+	// of a split; a smaller group stays in the outlier bucket or stays put.
+	//
+	// It counts signals rather than facets on purpose: one signal decomposed
+	// into MinStorySize facets is still one signal, and must not found a story
+	// by itself.
 	MinStorySize int
+
+	// MaxFacetsPerSignal bounds the facets one signal may carry (default: 8).
+	// Ingest cost is linear in facet count, split cost is quadratic in a
+	// story's facet count, and the key schema encodes the index in four
+	// digits — so the bound is real rather than defensive. Ingest returns
+	// ErrTooManyFacets above it. Must be in [1, 9999].
+	MaxFacetsPerSignal int
 
 	// Draft-phase assignment.
 	AssignmentK float64 // σ multiplier for per-story assignment radius (default: 2.0)
@@ -186,6 +199,9 @@ func (c *Config[T]) validate() error {
 	if c.MinStorySize == 0 {
 		c.MinStorySize = 3
 	}
+	if c.MaxFacetsPerSignal == 0 {
+		c.MaxFacetsPerSignal = 8
+	}
 	if c.AssignmentK == 0 {
 		c.AssignmentK = 2.0
 	}
@@ -234,6 +250,10 @@ func (c *Config[T]) validate() error {
 	}
 	if c.MinStorySize < 2 {
 		return fmt.Errorf("story: Config.MinStorySize must be >= 2, got %d", c.MinStorySize)
+	}
+	if c.MaxFacetsPerSignal < 1 || c.MaxFacetsPerSignal > keys.MaxFacet {
+		return fmt.Errorf("story: Config.MaxFacetsPerSignal must be in [1, %d], got %d",
+			keys.MaxFacet, c.MaxFacetsPerSignal)
 	}
 	return nil
 }

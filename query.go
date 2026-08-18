@@ -64,18 +64,38 @@ func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta] {
 // fully iterable.
 func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error] {
 	return func(yield func(Signal[T], error) bool) {
-		prefix := keys.SignalPrefix(storyID)
+		prefix := keys.FacetPrefix(storyID)
 		_ = t.cfg.Store.View(func(tx Tx) error {
-			return tx.ScanPrefix(prefix, func(key, val []byte) error {
-				sig, err := t.cfg.Codec.Decode(val)
+			// A signal contributing several facets to one story is still one
+			// member, so it is yielded once. Facet keys of a signal are
+			// contiguous and sorted, so remembering the last ID suffices.
+			var last uuid.UUID
+			seen := false
+			return tx.ScanPrefix(prefix, func(key, _ []byte) error {
+				sigID, _, ok := keys.ParseFacetMember(key, prefix)
+				if !ok {
+					return nil
+				}
+				if seen && sigID == last {
+					return nil
+				}
+				last, seen = sigID, true
+
+				sig, found, err := t.readCanonicalSignal(tx, sigID)
 				if err != nil {
 					if !yield(Signal[T]{}, err) {
-						return errors.New("stop iteration")
+						return errStopIteration
 					}
 					return nil
 				}
+				if !found {
+					// A membership marker with no record behind it. The store
+					// invariant forbids this; skip rather than yield a zero
+					// signal that a caller would read as real.
+					return nil
+				}
 				if !yield(sig, nil) {
-					return errors.New("stop iteration")
+					return errStopIteration
 				}
 				return nil
 			})
@@ -83,50 +103,130 @@ func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error] {
 	}
 }
 
-// Signal returns the signal with the given ID, wherever it currently lives:
-// attached to a story or held in the outlier bucket. Callers that need to know
-// which of the two, or which story, should use SignalsOf or Outliers instead;
-// this method deliberately reports only the signal.
+// Placement is one facet's membership: the atom of the many-to-many relation
+// between signals and stories. StoryID is uuid.Nil for a facet still held in
+// the outlier bucket.
+type Placement struct {
+	SignalID uuid.UUID
+	Facet    int
+	StoryID  uuid.UUID
+}
+
+// StoriesOf returns the stories signalID currently has at least one facet in,
+// sorted and de-duplicated. An empty slice means every facet is an outlier or
+// the signal is unknown; use Signal to distinguish the two.
+func (t *Tracker[T]) StoriesOf(signalID uuid.UUID) ([]uuid.UUID, error) {
+	var out []uuid.UUID
+	err := t.cfg.Store.View(func(tx Tx) error {
+		locs, _, err := readSignalLocSet(tx, signalID)
+		if err != nil {
+			return err
+		}
+		out = placedStories(locs)
+		return nil
+	})
+	return out, err
+}
+
+// FacetsOfSignal returns one Placement per facet of signalID, in facet order,
+// including facets still held as outliers. It is the detailed form of
+// StoriesOf: it reports not just which stories claimed the signal but which of
+// its facets each story claimed, and which facets nothing claimed at all.
+func (t *Tracker[T]) FacetsOfSignal(signalID uuid.UUID) ([]Placement, error) {
+	var out []Placement
+	err := t.cfg.Store.View(func(tx Tx) error {
+		locs, _, err := readSignalLocSet(tx, signalID)
+		if err != nil {
+			return err
+		}
+		out = make([]Placement, len(locs))
+		for facet, loc := range locs {
+			out[facet] = Placement{SignalID: signalID, Facet: facet, StoryID: loc.StoryID}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// FacetsOfStory returns an iterator over every facet the story holds, ordered
+// by (signal, facet). A signal contributing two facets appears twice — which is
+// the point: this is the view that shows a story's true geometric membership,
+// the same multiset the centroid and radius are computed over.
+func (t *Tracker[T]) FacetsOfStory(storyID uuid.UUID) iter.Seq2[Placement, error] {
+	return func(yield func(Placement, error) bool) {
+		prefix := keys.FacetPrefix(storyID)
+		_ = t.cfg.Store.View(func(tx Tx) error {
+			return tx.ScanPrefix(prefix, func(key, _ []byte) error {
+				sigID, facet, ok := keys.ParseFacetMember(key, prefix)
+				if !ok {
+					return nil
+				}
+				if !yield(Placement{SignalID: sigID, Facet: facet, StoryID: storyID}, nil) {
+					return errStopIteration
+				}
+				return nil
+			})
+		})
+	}
+}
+
+// Signal returns the signal with the given ID, read from its canonical record.
+// It does not consult the location index and does not need to: the record
+// exists independently of where — or whether — the signal's facets are placed.
 //
-// It returns an error wrapping ErrNotFound when the ID has no location-index
-// entry, when the index points at a record that no longer exists, or when the
-// index value is malformed. A signal evicted from the outlier bucket or
-// belonging to a retired story is therefore not found, which is the intended
-// behavior.
+// It returns an error wrapping ErrNotFound when no canonical record exists. A
+// signal whose every facet was evicted from the outlier bucket is therefore not
+// found, which is the intended behavior; a signal merely held as an outlier
+// still is.
+//
+// Callers that need to know which stories hold the signal should use StoriesOf,
+// or FacetsOfSignal for the per-facet detail.
 func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error) {
 	var sig Signal[T]
 	err := t.cfg.Store.View(func(tx Tx) error {
-		storyID, isOutlier, hasIndex, err := readSignalLoc(tx, id)
+		s, found, err := t.readCanonicalSignal(tx, id)
 		if err != nil {
 			return err
 		}
-		if !hasIndex {
+		if !found {
 			return fmt.Errorf("signal %s: %w", id, ErrNotFound)
-		}
-
-		var key []byte
-		if isOutlier {
-			key = keys.Outlier(id)
-		} else {
-			key = keys.Signal(storyID, id)
-		}
-
-		b, err := tx.Get(key)
-		if err != nil {
-			return err
-		}
-		if b == nil {
-			return fmt.Errorf("signal %s: %w", id, ErrNotFound)
-		}
-
-		s, err := t.cfg.Codec.Decode(b)
-		if err != nil {
-			return fmt.Errorf("decode signal %s: %w", id, err)
 		}
 		sig = s
 		return nil
 	})
 	return sig, err
+}
+
+// Signals returns an iterator over every signal in the store, in signal-ID
+// order, independently of where — or whether — its facets are placed. Members,
+// partially placed signals, and signals whose every facet is still an outlier
+// all appear, and a signal appears once regardless of facet count.
+//
+// The yielded value is complete: ID, At, Embeddings, and Data are the values
+// that were ingested. Signals is therefore a lossless dump, and replaying it
+// through Ingest against a fresh store is a full rebuild that needs no access
+// to the original source and no re-embedding.
+func (t *Tracker[T]) Signals() iter.Seq2[Signal[T], error] {
+	return func(yield func(Signal[T], error) bool) {
+		_ = t.cfg.Store.View(func(tx Tx) error {
+			return tx.ScanPrefix(keys.CanonicalPrefix(), func(key, val []byte) error {
+				if _, ok := keys.ParseCanonicalSignal(key); !ok {
+					return nil
+				}
+				sig, err := t.cfg.Codec.Decode(val)
+				if err != nil {
+					if !yield(Signal[T]{}, err) {
+						return errStopIteration
+					}
+					return nil
+				}
+				if !yield(sig, nil) {
+					return errStopIteration
+				}
+				return nil
+			})
+		})
+	}
 }
 
 // errStopIteration terminates a range scan early; the caller checks for it
