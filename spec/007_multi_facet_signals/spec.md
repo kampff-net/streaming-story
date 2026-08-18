@@ -1,15 +1,17 @@
 # SDD Spec: Multi-Facet Signals & Many-to-Many Membership
 
 ## Metadata
-* **Status:** `IMPLEMENTING`
+* **Status:** `COMPLETED`
 * **Author:** Consigliere
 * **Created:** 2026-08-18
 * **Last Updated:** 2026-08-18
 * **Approver:** Codefather
 
-> **Phases 1–3 are authored and the design is signed off.** Phase 3 is a task
-> list to be executed in order; every task builds and leaves `go test ./...`
-> green. No implementation has begun.
+> **Implemented and approved.** All sixteen tasks are done and verified. One
+> Phase 4 item is closed as a known limitation rather than as a pass: the change
+> is benchmarked only against `MemStore`, whose scan sorts the whole key space,
+> so the ingest budget in §2.4 is unmeasured on a production store. See
+> [`performance.md`](performance.md).
 
 ---
 
@@ -879,9 +881,24 @@ implied after every task and are not repeated per line.
 ---
 
 ## Phase 5: Completed
-- [ ] All Phase 4 items `[x]`.
-- [ ] No regressions.
-- [ ] Spec document reflects actual implementation.
-- [ ] `DESIGN.md` and `README.md` updated for facets.
-- [ ] `spec/README.md` updated to `COMPLETED`.
-- [ ] Approved by Codefather.
+- [x] All Phase 4 items `[x]`, except the bbolt benchmark, accepted as a known
+      limitation and recorded in [`performance.md`](performance.md).
+- [x] No regressions: `F = 1` clustering is identical to spec 006 on the
+      reference corpus, and `magic-giant` builds and passes unchanged.
+- [x] Spec document reflects the implementation, including the three places the
+      design as written did not survive contact: `Cliques` is story-level and
+      untouched (§2.2.4), story IDs necessarily change (§3.2), and the
+      recalibration §2.5 called mandatory was measured and declined
+      ([`calibration.md`](calibration.md)).
+- [x] `DESIGN.md`, `README.md`, and `AGENTS.md` updated for facets.
+- [x] `spec/README.md` updated to `COMPLETED`.
+- [x] Approved by Codefather.
+
+### Follow-up work, not part of this spec
+
+1. **Benchmark on bbolt.** The one open measurement (§2.4, `performance.md`).
+2. **Facet extraction in `magic-giant`.** This change makes multi-facet
+   clustering possible; nothing produces facets yet, so the orphan rate is
+   untouched until that lands. Needs its own spec in that repository.
+3. **Orphan-rate evidence.** No corpus decomposed by a real extractor exists, so
+   whether facets reduce orphaning is unmeasured (`calibration.md`).
