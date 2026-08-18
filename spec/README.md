@@ -42,3 +42,4 @@
 
 | # | Feature | Status | Created | Updated | Spec |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| 008 | High-Throughput Performance & Latency Optimizations | 💡 `PROPOSAL` | 2026-08-18 | 2026-08-18 | [spec.md](008_performance_optimizations/spec.md) |
