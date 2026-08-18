@@ -229,6 +229,44 @@ func (t *Tracker[T]) Signals() iter.Seq2[Signal[T], error] {
 	}
 }
 
+// Outliers returns an iterator over signals that have at least one unplaced facet.
+// A signal with several unplaced facets is yielded once. Signals whose canonical record
+// is missing or undecodable are skipped so one bad entry does not stop iteration.
+func (t *Tracker[T]) Outliers() iter.Seq2[Signal[T], error] {
+	return func(yield func(Signal[T], error) bool) {
+		_ = t.cfg.Store.View(func(tx Tx) error {
+			var last uuid.UUID
+			seen := false
+			return tx.ScanPrefix(keys.OutlierPrefix(), func(key, _ []byte) error {
+				sigID, _, ok := keys.ParseOutlierFacet(key)
+				if !ok {
+					return nil
+				}
+				if seen && sigID == last {
+					return nil
+				}
+				last, seen = sigID, true
+
+				sig, found, err := t.readCanonicalSignal(tx, sigID)
+				if err != nil {
+					if !yield(Signal[T]{}, err) {
+						return errStopIteration
+					}
+					return nil
+				}
+				if !found {
+					return nil
+				}
+				if !yield(sig, nil) {
+					return errStopIteration
+				}
+				return nil
+			})
+		})
+	}
+}
+
 // errStopIteration terminates a range scan early; the caller checks for it
 // with errors.Is to distinguish a requested stop from a real failure.
 var errStopIteration = errors.New("stop iteration")
+

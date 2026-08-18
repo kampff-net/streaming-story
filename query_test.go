@@ -443,3 +443,49 @@ func TestReadAPI_EmptyStory(t *testing.T) {
 	}
 	assert.Empty(t, got)
 }
+
+func TestOutliers_YieldsUnplacedSignals(t *testing.T) {
+	tr := newTestTracker(t)
+
+	// Ingest a signal that won't land in any story (no existing stories)
+	sig1 := Signal[string]{
+		ID:         uuid.New(),
+		At:         time.Now(),
+		Embeddings: []Embedding{{1, 0}},
+		Data:       "outlier-1",
+	}
+	_, err := tr.Ingest(context.Background(), sig1)
+	require.NoError(t, err)
+
+	var outliers []Signal[string]
+	for s, err := range tr.Outliers() {
+		require.NoError(t, err)
+		outliers = append(outliers, s)
+	}
+	require.Len(t, outliers, 1)
+	assert.Equal(t, sig1.ID, outliers[0].ID)
+	assert.Equal(t, sig1.Data, outliers[0].Data)
+}
+
+func TestOutliers_YieldsSignalOncePerSignal(t *testing.T) {
+	tr := newTestTracker(t)
+
+	// Ingest a multi-facet signal that lands as outlier for both facets
+	sig := Signal[string]{
+		ID:         uuid.New(),
+		At:         time.Now(),
+		Embeddings: []Embedding{{1, 0}, {0, 1}},
+		Data:       "multi-facet-outlier",
+	}
+	_, err := tr.Ingest(context.Background(), sig)
+	require.NoError(t, err)
+
+	var outliers []Signal[string]
+	for s, err := range tr.Outliers() {
+		require.NoError(t, err)
+		outliers = append(outliers, s)
+	}
+	require.Len(t, outliers, 1, "multi-facet outlier signal must be yielded exactly once")
+	assert.Equal(t, sig.ID, outliers[0].ID)
+}
+
