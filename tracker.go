@@ -45,10 +45,10 @@ type Tracker[T any] struct {
 
 	// batch-apply concurrency: while applyInProgress is set, Ingest writes
 	// to ingestBuffer instead of directly to the store, and answers from
-	// draftSnapshot instead of reading the store.
+	// storyIndex instead of reading the store.
 	applyInProgress atomic.Bool
 	ingestBuffer    chan Signal[T]
-	draftSnapshot   atomic.Pointer[draftSnapshot]
+	storyIndex      atomic.Pointer[activeStoryIndex]
 
 	// lifecycle
 	stopCh  chan struct{}
@@ -73,6 +73,17 @@ func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 	if err := t.loadCalibState(); err != nil {
 		return nil, fmt.Errorf("story: load calibration state: %w", err)
 	}
+
+	var idx *activeStoryIndex
+	err := cfg.Store.View(func(tx Tx) error {
+		var err error
+		idx, err = t.buildActiveStoryIndex(tx)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("story: build story index: %w", err)
+	}
+	t.storyIndex.Store(idx)
 
 	go t.batchLoop()
 	return t, nil

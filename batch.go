@@ -6,13 +6,10 @@ package story
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/google/uuid"
-	"go.kvsh.ch/streaming-story/internal/dist"
 	"go.kvsh.ch/streaming-story/internal/geom"
 	"go.kvsh.ch/streaming-story/internal/keys"
 )
@@ -35,38 +32,32 @@ func (t *Tracker[T]) runBatch() {
 	})
 }
 
-// beginApplyWindow redirects Ingest into the staging buffer and publishes the
-// story snapshot that Draft lookups answer from while the write transaction
-// holds the store.
-func (t *Tracker[T]) beginApplyWindow(stories map[uuid.UUID]storyRecord) {
-	t.publishDraftSnapshot(stories)
+// beginApplyWindow redirects Ingest into the staging buffer while the write
+// transaction holds the store.
+func (t *Tracker[T]) beginApplyWindow() {
 	t.applyInProgress.Store(true)
 }
 
-// endApplyWindow reopens the direct ingest path and flushes whatever was
-// staged. The snapshot outlives the flag until the drain completes, so an
-// Ingest that observed the flag just before it cleared still gets an answer.
-// It is idempotent.
+// endApplyWindow reopens the direct ingest path and flushes whatever was staged.
 func (t *Tracker[T]) endApplyWindow() {
 	t.applyInProgress.Store(false)
 	t.drainBuffer()
-	t.clearDraftSnapshot()
 }
 
-// runBatchCore performs collection, sampling, HDBSCAN clustering, cluster
-// mapping, and the apply transaction. It returns a summary of the run; on
-// internal failure it returns an all-zero summary so the lifecycle continues.
+// runBatchCore performs collection, calibration, and the apply transaction.
 func (t *Tracker[T]) runBatchCore() *BatchSummary {
 	now := time.Now()
 
 	var (
-		signals []batchFacet
-		stories map[uuid.UUID]storyRecord
-		evict   []uuid.UUID
+		signals           []batchFacet
+		stories           map[uuid.UUID]storyRecord
+		evict             []uuid.UUID
+		mean              []float32
+		droppedMismatches int
 	)
 	err := t.cfg.Store.View(func(tx Tx) error {
 		var err error
-		signals, stories, evict, err = t.collectBatch(tx, now)
+		signals, stories, evict, mean, droppedMismatches, err = t.collectBatch(tx, now)
 		return err
 	})
 	if err != nil {
@@ -74,22 +65,36 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 		return &BatchSummary{}
 	}
 
-	// Establish this run's geometry before any distance is measured. The mean
-	// comes from the full collected membership, so it is a property of the
-	// stored data rather than of how many runs have happened, and every
-	// centroid recomputed below lands in the same space (geometry.go).
-	mean := corpusMeanOf(signals)
-	projectAll(geom.Projector{Mean: mean, Strength: float32(t.cfg.MeanRemoval)}, signals)
+	// Establish this run's geometry before any distance is measured.
+	// In-place projection pass over the collected facets:
+	if len(mean) > 0 && t.cfg.MeanRemoval > 0 {
+		strength := float32(t.cfg.MeanRemoval)
+		for i := range signals {
+			geom.ProjectInPlace(signals[i].emb, mean, strength)
+		}
+	}
 
 	// Only the write transaction needs the ingest path redirected: collection
 	// is read-only, and every maintenance decision is computed inside the
 	// write transaction from state already in hand.
-	t.beginApplyWindow(stories)
+	t.beginApplyWindow()
 	summary, events, err := t.applyMaintenance(signals, stories, evict, mean, now)
 	t.endApplyWindow()
 	if err != nil {
 		t.reportBatchError(fmt.Errorf("story: batch apply: %w", err))
 		return &BatchSummary{}
+	}
+	summary.DimensionMismatchesDropped = droppedMismatches
+
+	// Rebuild and atomically swap activeStoryIndex with the updated store state
+	var newIdx *activeStoryIndex
+	_ = t.cfg.Store.View(func(tx Tx) error {
+		var err error
+		newIdx, err = t.buildActiveStoryIndex(tx)
+		return err
+	})
+	if newIdx != nil {
+		t.storyIndex.Store(newIdx)
 	}
 
 	for _, ev := range events {
@@ -131,12 +136,16 @@ func (t *Tracker[T]) drainBuffer() {
 // Membership is read in full rather than windowed because the lifetime
 // centroid is the mean of every member; reading a window would compute a
 // centre that slides as old signals age out.
-func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.UUID]storyRecord, []uuid.UUID, error) {
+func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.UUID]storyRecord, []uuid.UUID, []float32, int, error) {
 	var (
-		signals []batchFacet
-		stories = make(map[uuid.UUID]storyRecord)
-		evict   []uuid.UUID
+		signals           []batchFacet
+		stories           = make(map[uuid.UUID]storyRecord)
+		evict             []uuid.UUID
+		meanSum           []float32
+		meanCount         int
+		droppedMismatches int
 	)
+	dim := int(t.dim.Load())
 
 	// A signal with several facets is named by several markers, so a batch
 	// that decoded per marker decoded it once per facet. Cache what a
@@ -152,7 +161,7 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 		if s, ok := sigCache[sigID]; ok {
 			return s, s != nil, nil
 		}
-		sig, found, err := t.readCanonicalSignal(tx, sigID)
+		at, embs, found, err := t.readSignalHeader(tx, sigID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -160,7 +169,7 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 			sigCache[sigID] = nil
 			return nil, false, nil
 		}
-		c := &cachedSignal{at: sig.At, embs: sig.Embeddings}
+		c := &cachedSignal{at: at, embs: embs}
 		sigCache[sigID] = c
 		return c, true, nil
 	}
@@ -171,7 +180,7 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 			return nil
 		}
 		var rec storyRecord
-		if err := json.Unmarshal(val, &rec); err != nil {
+		if err := cborStrictDecMode.Unmarshal(val, &rec); err != nil {
 			return nil
 		}
 		if rec.State == StoryStateArchived {
@@ -200,18 +209,30 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 				// not be stopped by one bad key.
 				return nil
 			}
+			emb := sig.embs[facet]
+			if dim > 0 && len(emb) != dim {
+				droppedMismatches++
+				return nil
+			}
+			if len(meanSum) == 0 {
+				meanSum = make([]float32, len(emb))
+			}
+			for i, v := range emb {
+				meanSum[i] += v
+			}
+			meanCount++
 			signals = append(signals, batchFacet{
 				id:      sigID,
 				facet:   facet,
 				at:      sig.at,
-				emb:     sig.embs[facet],
+				emb:     emb,
 				storyID: id,
 			})
 			return nil
 		})
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, 0, err
 	}
 
 	// Outliers: collect those within lastBatch − OutlierTTL and flag the rest
@@ -235,21 +256,43 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 			evict = append(evict, sigID)
 			return nil
 		}
+		emb := sig.embs[facet]
+		if dim > 0 && len(emb) != dim {
+			droppedMismatches++
+			return nil
+		}
+		if len(meanSum) == 0 {
+			meanSum = make([]float32, len(emb))
+		}
+		for i, v := range emb {
+			meanSum[i] += v
+		}
+		meanCount++
 		signals = append(signals, batchFacet{
 			id:      sigID,
 			facet:   facet,
 			at:      sig.at,
-			emb:     sig.embs[facet],
+			emb:     emb,
 			storyID: uuid.Nil,
 			outlier: true,
 		})
 		return nil
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, 0, err
 	}
 
-	return signals, stories, evict, nil
+	var mean []float32
+	if meanCount > 0 {
+		mean = make([]float32, len(meanSum))
+		inv := 1.0 / float32(meanCount)
+		for i, v := range meanSum {
+			mean[i] = v * inv
+		}
+		mean = geom.Unit(mean)
+	}
+
+	return signals, stories, evict, mean, droppedMismatches, nil
 }
 
 // sampleGroup is a group of signal indices for stratified sampling.
@@ -334,83 +377,4 @@ func migrateFacets(tx Tx, from, to uuid.UUID) error {
 	return nil
 }
 
-// The Draft answers served from memory while a batch run holds the write
-// transaction.
 
-// draftSnapshot is an immutable copy of the story metadata a batch run
-// collected, published for the duration of the Apply transaction.
-//
-// It exists because the Store contract does not promise that View may run
-// concurrently with Update — single-lock backends (MemStore among them) would
-// block a Draft lookup for the whole Apply, which is exactly the stall the
-// ingest buffer exists to avoid. Answering from memory keeps Ingest wait-free
-// while still using last-batch centroids, which is what the Draft phase reads
-// at any other time.
-type draftSnapshot struct {
-	stories []snapshotStory
-}
-
-// snapshotStory is one story's Draft-relevant metadata.
-type snapshotStory struct {
-	meta StoryMeta
-}
-
-// newDraftSnapshot builds a snapshot from the story records a batch run has
-// already read. Archived stories and stories with no centroid are omitted:
-// neither can be a Draft anchor.
-func newDraftSnapshot(stories map[uuid.UUID]storyRecord) *draftSnapshot {
-	snap := &draftSnapshot{stories: make([]snapshotStory, 0, len(stories))}
-	for id, rec := range stories {
-		if rec.State == StoryStateArchived || len(rec.Centroid) == 0 {
-			continue
-		}
-		snap.stories = append(snap.stories, snapshotStory{meta: storyMetaFromRecord(id, rec)})
-	}
-	return snap
-}
-
-// publishDraftSnapshot makes snap the source of Draft answers until it is
-// cleared.
-func (t *Tracker[T]) publishDraftSnapshot(stories map[uuid.UUID]storyRecord) {
-	t.draftSnapshot.Store(newDraftSnapshot(stories))
-}
-
-// clearDraftSnapshot drops the snapshot so Draft lookups go back to the store.
-func (t *Tracker[T]) clearDraftSnapshot() {
-	t.draftSnapshot.Store(nil)
-}
-
-// provisionalStory returns the story a signal would be assigned to, computed
-// against the published snapshot rather than the store. It returns uuid.Nil
-// when no story is within its adaptive threshold, or when no snapshot is
-// published.
-//
-// The answer is provisional in the same sense as any Draft assignment: the
-// Apply transaction running concurrently may merge, retire, or re-shape the
-// named story. The buffered signal is re-ingested for real once Apply
-// commits, and that placement is the authoritative one.
-func (t *Tracker[T]) provisionalStory(emb []float32, now time.Time) uuid.UUID {
-	snap := t.draftSnapshot.Load()
-	if snap == nil {
-		return uuid.Nil
-	}
-
-	cutoff := now.Add(-t.cfg.ActiveContextWindow)
-	best := uuid.Nil
-	bestDist := math.MaxFloat64
-	var bestMeta StoryMeta
-
-	for _, s := range snap.stories {
-		if s.meta.LastSignalAt.Before(cutoff) {
-			continue
-		}
-		d := dist.CosineDistance(emb, s.meta.RecentCentroid)
-		if d < bestDist {
-			bestDist, best, bestMeta = d, s.meta.ID, s.meta
-		}
-	}
-	if best == uuid.Nil || bestDist > t.calcThreshold(bestMeta) {
-		return uuid.Nil
-	}
-	return best
-}

@@ -1,0 +1,68 @@
+# Host: AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics, linux/amd64, go1.26.5
+# Store footprint baseline (TestStoreFootprint): 103519 bytes across 1209 keys
+goos: linux
+goarch: amd64
+pkg: go.kvsh.ch/streaming-story
+cpu: AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics  
+BenchmarkBatch-16                	     427	   2813159 ns/op	  882804 B/op	    9156 allocs/op
+BenchmarkBatch-16                	     412	   2652767 ns/op	  880938 B/op	    9155 allocs/op
+BenchmarkBatch-16                	     554	   2125572 ns/op	  880970 B/op	    9146 allocs/op
+BenchmarkBatch-16                	     528	   2140269 ns/op	  881306 B/op	    9148 allocs/op
+BenchmarkBatch-16                	     547	   2136345 ns/op	  881053 B/op	    9146 allocs/op
+BenchmarkBatchFacets/F1-16       	     226	   5267250 ns/op	 2234522 B/op	    9593 allocs/op
+BenchmarkBatchFacets/F1-16       	     243	   4898022 ns/op	 2230507 B/op	    9581 allocs/op
+BenchmarkBatchFacets/F1-16       	     242	   4877899 ns/op	 2230627 B/op	    9582 allocs/op
+BenchmarkBatchFacets/F1-16       	     238	   4972697 ns/op	 2230571 B/op	    9583 allocs/op
+BenchmarkBatchFacets/F1-16       	     242	   4916967 ns/op	 2230400 B/op	    9581 allocs/op
+BenchmarkBatchFacets/F3-16       	     148	   7724478 ns/op	 3322779 B/op	   17851 allocs/op
+BenchmarkBatchFacets/F3-16       	     154	   7418583 ns/op	 3317895 B/op	   17832 allocs/op
+BenchmarkBatchFacets/F3-16       	     156	   7378606 ns/op	 3317105 B/op	   17827 allocs/op
+BenchmarkBatchFacets/F3-16       	     157	   7367848 ns/op	 3317024 B/op	   17827 allocs/op
+BenchmarkBatchFacets/F3-16       	     157	   7418294 ns/op	 3316713 B/op	   17825 allocs/op
+BenchmarkIngestDuringApply-16    	 1837034	       642.4 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1801495	       655.2 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1888924	       634.5 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1928990	       625.0 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestDuringApply-16    	 1925085	       625.4 ns/op	     136 B/op	       6 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   2027928 ns/op	  264765 B/op	     169 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   2056226 ns/op	  264519 B/op	     168 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1948570 ns/op	  264510 B/op	     168 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1940169 ns/op	  264510 B/op	     168 allocs/op
+BenchmarkIngestSteadyState-16    	   10000	   1977869 ns/op	  264520 B/op	     168 allocs/op
+BenchmarkSignalsOf-16            	    2668	    435883 ns/op	  112011 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:256: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2775	    422636 ns/op	  112002 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:256: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    3130	    420375 ns/op	  111890 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:256: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2695	    424475 ns/op	  112003 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:256: largest story holds 100 signals
+BenchmarkSignalsOf-16            	    2811	    421512 ns/op	  111906 B/op	    1812 allocs/op
+--- BENCH: BenchmarkSignalsOf-16
+    bench_test.go:256: largest story holds 100 signals
+PASS
+ok  	go.kvsh.ch/streaming-story	140.772s
+?   	go.kvsh.ch/streaming-story/examples/iterators	[no test files]
+?   	go.kvsh.ch/streaming-story/examples/simple	[no test files]
+?   	go.kvsh.ch/streaming-story/examples/subscribers	[no test files]
+PASS
+ok  	go.kvsh.ch/streaming-story/internal/cluster	0.007s
+goos: linux
+goarch: amd64
+pkg: go.kvsh.ch/streaming-story/internal/dist
+cpu: AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics  
+BenchmarkCosineDistance-16    	  238608	      4968 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCosineDistance-16    	  249374	      4922 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCosineDistance-16    	  249304	      4959 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCosineDistance-16    	  263908	      4748 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCosineDistance-16    	  252110	      4650 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	go.kvsh.ch/streaming-story/internal/dist	6.083s
+PASS
+ok  	go.kvsh.ch/streaming-story/internal/geom	0.005s
+PASS
+ok  	go.kvsh.ch/streaming-story/internal/keys	0.004s

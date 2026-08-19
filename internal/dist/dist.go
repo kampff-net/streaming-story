@@ -61,3 +61,26 @@ func Norm(a []float32) float32 {
 	}
 	return blas32.Nrm2(blas32.Vector{N: len(a), Data: a, Inc: 1})
 }
+
+// DotUnit returns the dot product of two unit vectors.
+func DotUnit(a, b []float32) float32 {
+	return Dot(a, b)
+}
+
+// CosineDistanceUnit returns the cosine distance between two vectors the
+// caller guarantees are unit length. It is 1 - Dot with no norm computed;
+// passing a non-unit vector returns a meaningless number rather than an
+// error, which is why the name says Unit and §2.2.3 says where that holds.
+func CosineDistanceUnit(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 1.0
+	}
+	sim := DotUnit(a, b)
+	if sim > 1 {
+		sim = 1
+	} else if sim < -1 {
+		sim = -1
+	}
+	return 1.0 - float64(sim)
+}
+

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -12,20 +11,8 @@ import (
 )
 
 type NewsPayload struct {
-	Headline string `json:"headline"`
-	Topic    string `json:"topic"`
-}
-
-type NewsCodec struct{}
-
-func (c NewsCodec) Encode(sig story.Signal[NewsPayload]) ([]byte, error) {
-	return json.Marshal(sig)
-}
-
-func (c NewsCodec) Decode(b []byte) (story.Signal[NewsPayload], error) {
-	var sig story.Signal[NewsPayload]
-	err := json.Unmarshal(b, &sig)
-	return sig, err
+	Headline string `cbor:"0,keyasint"`
+	Topic    string `cbor:"1,keyasint"`
 }
 
 func elapsed(start time.Time) string {
@@ -36,7 +23,7 @@ func main() {
 	store := story.NewMemStore()
 	cfg := story.Config[NewsPayload]{
 		Store:           store,
-		Codec:           NewsCodec{},
+		Codec:           story.CBORCodec[NewsPayload]{},
 		BatchInterval:   500 * time.Millisecond,
 		EventBufferSize: 128,
 		// A demo corpus is far narrower than a real one, so leave more of the

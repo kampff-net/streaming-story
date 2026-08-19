@@ -3,9 +3,7 @@ package story
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"math"
 	"sort"
 	"time"
 
@@ -62,6 +60,23 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 		}
 	}
 
+	// Normalize every facet to a unit vector immediately. The store holds unit
+	// vectors and all downstream math relies on unit length.
+	normEmbs := make([]Embedding, len(sig.Embeddings))
+	for i, facet := range sig.Embeddings {
+		n := dist.Norm(facet)
+		if n == 0 {
+			return nil, ErrZeroEmbedding
+		}
+		u := make([]float32, len(facet))
+		inv := 1.0 / n
+		for j, v := range facet {
+			u[j] = v * inv
+		}
+		normEmbs[i] = u
+	}
+	sig.Embeddings = normEmbs
+
 	// If a batch Apply is in progress, buffer the signal instead of writing
 	// directly to the store, and answer the caller from the snapshot the
 	// batch published. The store is not touched: the Store contract does not
@@ -74,11 +89,23 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 		embs[i] = proj.Project(facet)
 	}
 
+	now := time.Now()
+	matches := make([]nearestStory, len(embs))
+	hasMatch := make([]bool, len(embs))
+	for i, emb := range embs {
+		m := t.findNearestStories(emb, now)
+		if len(m) > 0 {
+			matches[i] = m[0]
+			hasMatch[i] = true
+		}
+	}
+
 	if t.applyInProgress.Load() {
-		now := time.Now()
 		provisional := make([]uuid.UUID, 0, len(embs))
-		for _, emb := range embs {
-			provisional = append(provisional, t.provisionalStory(emb, now))
+		for i := range embs {
+			if hasMatch[i] {
+				provisional = append(provisional, matches[i].id)
+			}
 		}
 		select {
 		case t.ingestBuffer <- sig:
@@ -93,6 +120,13 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 	// however many facets landed there: it is still one signal joining one
 	// story, and a subscriber must not see it once per facet.
 	var emitTo []uuid.UUID
+
+	type patchInfo struct {
+		lastAt      time.Time
+		reactivated bool
+		reactAt     time.Time
+	}
+	patched := make(map[uuid.UUID]patchInfo)
 
 	err := t.cfg.Store.Update(func(tx Tx) error {
 		assigned, emitTo = nil, nil
@@ -126,21 +160,12 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 			return nil
 		}
 
-		matches, err := t.findNearestStories(tx, embs)
-		if err != nil {
-			return err
-		}
-
 		locs := make([]keys.FacetLoc, len(embs))
-		// Story records touched by this signal, so each is written once with
-		// every facet's effect folded in rather than once per facet. The
-		// metadata is carried over from the scan that matched it: re-reading
-		// and re-decoding it here would be the scan's work done twice.
 		touched := make(map[uuid.UUID]StoryMeta, len(embs))
 		newlyPlaced := make(map[uuid.UUID]bool, len(embs))
 
-		for facet, m := range matches {
-			if !m.accepted {
+		for facet := range embs {
+			if !hasMatch[facet] {
 				if err := holdFacetOutlier(tx, sig.ID, facet); err != nil {
 					return err
 				}
@@ -148,18 +173,19 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 				continue
 			}
 
-			existing, err := tx.Get(keys.FacetMember(m.story.ID, sig.ID, facet))
+			m := matches[facet]
+			existing, err := tx.Get(keys.FacetMember(m.id, sig.ID, facet))
 			if err != nil {
 				return err
 			}
 			if existing == nil {
-				if err := placeFacet(tx, m.story.ID, sig.ID, facet); err != nil {
+				if err := placeFacet(tx, m.id, sig.ID, facet); err != nil {
 					return err
 				}
-				newlyPlaced[m.story.ID] = true
+				newlyPlaced[m.id] = true
 			}
-			locs[facet] = keys.FacetLoc{StoryID: m.story.ID}
-			touched[m.story.ID] = m.story
+			locs[facet] = keys.FacetLoc{StoryID: m.id}
+			touched[m.id] = m.story
 		}
 
 		if err := writeSignalLocSet(tx, sig.ID, locs); err != nil {
@@ -173,44 +199,33 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 			}
 		}
 
-		// One metadata write per touched story, in sorted order so a replay
-		// makes the same writes in the same sequence.
+		// One hot metadata write per touched story, in sorted order.
 		for _, id := range storyIDSet(keysOf(touched)...) {
 			meta := touched[id]
-			rec := storyRecord{
-				State:              meta.State,
-				Centroid:           meta.Centroid,
-				RecentCentroid:     meta.RecentCentroid,
-				Radius:             meta.Radius,
-				CreatedAt:          meta.CreatedAt,
-				LastSignalAt:       meta.LastSignalAt,
-				MeanDistance:       meta.MeanDistance,
-				Sigma:              meta.Sigma,
-				SignalCount:        meta.SignalCount,
-				FrozenMeanDistance: meta.FrozenMeanDistance,
-				FrozenSigma:        meta.FrozenSigma,
+			hot := storyHot{
+				State:         meta.State,
+				LastSignalAt:  meta.LastSignalAt,
+				ReactivatedAt: meta.ReactivatedAt,
 			}
 
-			// LastSignalAt advances monotonically; out-of-order signals do not
-			// regress it.
-			if sig.At.After(rec.LastSignalAt) {
-				rec.LastSignalAt = sig.At
+			if sig.At.After(hot.LastSignalAt) {
+				hot.LastSignalAt = sig.At
 			}
 
-			// Reactivation clears the frozen and live statistics: the story
-			// re-enters cold-start until the next batch run recomputes live
-			// statistics.
-			if rec.State == StoryStateDormant {
-				rec.State = StoryStateActive
-				rec.MeanDistance = 0
-				rec.Sigma = 0
-				rec.SignalCount = 0
-				rec.FrozenMeanDistance = 0
-				rec.FrozenSigma = 0
+			reactivated := false
+			if hot.State == StoryStateDormant {
+				hot.State = StoryStateActive
+				hot.ReactivatedAt = sig.At
+				reactivated = true
 			}
 
-			if err := t.writeStoryMeta(tx, id, meta.LastSignalAt, rec); err != nil {
+			if err := t.writeStoryHot(tx, id, meta.LastSignalAt, hot); err != nil {
 				return err
+			}
+			patched[id] = patchInfo{
+				lastAt:      hot.LastSignalAt,
+				reactivated: reactivated,
+				reactAt:     hot.ReactivatedAt,
 			}
 		}
 		return nil
@@ -220,13 +235,17 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 		return nil, err
 	}
 
-	now := time.Now()
+	for id, p := range patched {
+		t.patchStoryIndex(id, p.lastAt, p.reactivated, p.reactAt)
+	}
+
+	eventNow := time.Now()
 	for _, id := range emitTo {
 		t.emit(StoryEvent[T]{
 			Kind:     EventDraftAssigned,
 			StoryID:  id,
 			SignalID: sig.ID,
-			At:       now,
+			At:       eventNow,
 		})
 	}
 
@@ -261,82 +280,4 @@ func storyIDSet(ids ...uuid.UUID) []uuid.UUID {
 	}
 	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i][:], out[j][:]) < 0 })
 	return out
-}
-
-// facetMatch is the best story found for one facet, and whether that story's
-// threshold accepts it.
-type facetMatch struct {
-	story    StoryMeta
-	dist     float64
-	found    bool
-	accepted bool
-}
-
-// findNearestStories finds the nearest active or dormant story centroid for
-// every facet, in a single walk of the time index.
-//
-// Candidates come from the Tier 3 Active Context: stories whose last signal is
-// at least ActiveContextWindow old are not anchors. The t: time index is
-// scanned rather than the full s: prefix, so the cost is proportional to the
-// number of candidate stories rather than the number of stored signals — and
-// the scan is walked once for all facets rather than once per facet, which is
-// the difference between O(S) and O(F·S) store reads on the hot path.
-func (t *Tracker[T]) findNearestStories(tx Tx, embs []Embedding) ([]facetMatch, error) {
-	out := make([]facetMatch, len(embs))
-	for i := range out {
-		out[i].dist = math.MaxFloat64
-	}
-
-	cutoff := keys.TimeIndexFrom(time.Now().Add(-t.cfg.ActiveContextWindow).Unix())
-
-	err := tx.ScanRange(cutoff, []byte("u:"), func(key, val []byte) error {
-		id, ok := keys.ParseTimeIndex(key)
-		if !ok {
-			return nil
-		}
-		var rec storyRecord
-		b, err := tx.Get(keys.StoryMeta(id))
-		if err != nil {
-			return err
-		}
-		if b == nil {
-			return nil
-		}
-		if err := json.Unmarshal(b, &rec); err != nil {
-			return nil
-		}
-		if rec.State == StoryStateArchived || len(rec.Centroid) == 0 {
-			return nil
-		}
-
-		// Admission uses the recency centroid so a developing story keeps
-		// admitting its own current coverage (spec 006 §2.7).
-		centre := recentOrCentroid(rec)
-		var meta StoryMeta
-		decoded := false
-		for i, emb := range embs {
-			d := dist.CosineDistance(emb, centre)
-			if d >= out[i].dist {
-				continue
-			}
-			if !decoded {
-				meta = storyMetaFromRecord(id, rec)
-				decoded = true
-			}
-			out[i] = facetMatch{story: meta, dist: d, found: true}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Each facet is admitted on its own story's terms, the same test the
-	// single-vector path applied (threshold.go).
-	for i := range out {
-		if out[i].found && out[i].dist <= t.calcThreshold(out[i].story) {
-			out[i].accepted = true
-		}
-	}
-	return out, nil
 }

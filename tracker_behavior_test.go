@@ -2,7 +2,6 @@ package story
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -89,11 +88,22 @@ func TestCalcThreshold(t *testing.T) {
 	})
 }
 
-// seedStory writes a story record plus its time index via writeStoryMeta.
+// seedStory writes a story record plus its time index via writeStoryMeta, and updates the in-memory index.
 func seedStory(t *testing.T, tr *Tracker[string], id uuid.UUID, rec storyRecord) {
 	t.Helper()
+	if len(rec.Centroid) > 0 && tr.dim.Load() == 0 {
+		tr.dim.Store(int32(len(rec.Centroid)))
+	}
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 		return tr.writeStoryMeta(tx, id, time.Time{}, rec)
+	}))
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		idx, err := tr.buildActiveStoryIndex(tx)
+		if err != nil {
+			return err
+		}
+		tr.storyIndex.Store(idx)
+		return nil
 	}))
 }
 
@@ -258,9 +268,17 @@ func TestTracker_Ingest_ReactivateClearsStats(t *testing.T) {
 		Centroid:           []float32{1, 0},
 		CreatedAt:          time.Now().Add(-2 * time.Hour),
 		LastSignalAt:       time.Now().Add(-10 * time.Hour),
+		StatsAt:            time.Now().Add(-10 * time.Hour),
 		FrozenMeanDistance: 0.4,
 		FrozenSigma:        0.1,
 	})
+
+	var metaBytesBefore []byte
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		b, err := tx.Get(keys.StoryMeta(storyID))
+		metaBytesBefore = b
+		return err
+	}))
 
 	assigned, err := tr.Ingest(context.Background(), Signal[string]{
 		ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{0.98, 0.02}},
@@ -271,10 +289,23 @@ func TestTracker_Ingest_ReactivateClearsStats(t *testing.T) {
 	meta, err := tr.Story(storyID)
 	require.NoError(t, err)
 	assert.Equal(t, StoryStateActive, meta.State)
-	assert.Zero(t, meta.FrozenMeanDistance)
-	assert.Zero(t, meta.FrozenSigma)
-	assert.Zero(t, meta.Sigma)
-	assert.Equal(t, 0, meta.SignalCount)
+	assert.False(t, meta.ReactivatedAt.IsZero())
+	assert.True(t, meta.ReactivatedAt.After(meta.StatsAt))
+
+	// Threshold calculation treats reactivated story as cold-start:
+	tr.calibMu.Lock()
+	tr.sigmaGlobal = 0.2
+	tr.calibMu.Unlock()
+	thresh := tr.calcThreshold(meta)
+	assert.Equal(t, tr.cfg.AssignmentK*0.2, thresh)
+
+	// Ensure s:{id}:m is byte-identical: Ingest never touches s:m
+	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
+		b, err := tx.Get(keys.StoryMeta(storyID))
+		require.NoError(t, err)
+		assert.Equal(t, metaBytesBefore, b, "s:m must be byte-identical before and after ingest")
+		return nil
+	}))
 }
 
 func TestTracker_Stories_Iterator(t *testing.T) {
@@ -352,7 +383,7 @@ func TestTracker_Ingest_ExcludesStaleStories(t *testing.T) {
 func TestTracker_Subscribe_AfterCloseReturnsClosedChannel(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
@@ -366,7 +397,7 @@ func TestTracker_Subscribe_AfterCloseReturnsClosedChannel(t *testing.T) {
 func TestTracker_Close_IsIdempotent(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
@@ -537,7 +568,7 @@ func TestCollectBatch_OutlierEviction(t *testing.T) {
 	var evict []uuid.UUID
 	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
 		var err error
-		signals, _, evict, err = tr.collectBatch(tx, time.Now())
+		signals, _, evict, _, _, err = tr.collectBatch(tx, time.Now())
 		return err
 	}))
 
@@ -564,7 +595,7 @@ func TestTracker_saveCalibState_RoundTrip(t *testing.T) {
 		return err
 	}))
 	var s calibState
-	require.NoError(t, json.Unmarshal(b, &s))
+	require.NoError(t, cborStrictDecMode.Unmarshal(b, &s))
 	assert.Equal(t, 4, s.Dim)
 	assert.Equal(t, 0.7, s.SigmaGlobal)
 	assert.True(t, s.LastBatchAt.Equal(tr.lastBatch))
@@ -621,7 +652,7 @@ func TestTracker_Ingest_AveragedVectorOrphansButFacetsPlace(t *testing.T) {
 	newSeeded := func() *Tracker[string] {
 		tr, err := NewTracker[string](Config[string]{
 			Store:           newMemStore(),
-			Codec:           JSONCodec[string]{},
+			Codec:           CBORCodec[string]{},
 			BatchInterval:   time.Hour,
 			AssignThreshold: 0.20,
 			MergeThreshold:  0.10,

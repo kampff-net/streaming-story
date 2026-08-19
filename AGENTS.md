@@ -24,7 +24,7 @@ import, so those packages can be reshaped freely.
 
 | Package | Holds |
 |---|---|
-| `story` (root) | Public types, `Config`, `Store`/`Tx`, `MemStore`, `JSONCodec`, and the `Tracker`: ingest, batch orchestration, persistence, events. |
+| `story` (root) | Public types, `Config`, `Store`/`Tx`, `MemStore`, `CBORCodec`, and the `Tracker`: ingest, batch orchestration, persistence, events. |
 | `internal/geom` | Vector geometry: the corpus mean, the projector that centres against it, group statistics, the quadratic angular bound. |
 | `internal/cluster` | Grouping decisions over an index-based `Point`: growth, cliques, split, merge planning. Pure — no store, no clock, no `Config`. |
 | `internal/keys` | The KV key schema and its parsers. Nothing else assembles a key. |
@@ -89,22 +89,22 @@ The flag covers **only the write transaction** — collection is read-only and c
 
 A buffered `Ingest` still returns a provisional story ID. It is computed from `draftSnapshot`, an immutable copy of the story metadata the batch already collected, published for the Apply window. The lookup **must not touch the store**: the `Store` contract does not promise `View` may run concurrently with `Update`, and single-lock backends (`MemStore` included) would block the caller for the whole Apply — the exact stall the buffer exists to prevent. The drain re-ingests each buffered signal for real; that placement is authoritative.
 
-### KV Key Schema
+### Key Space
 
-| Prefix | Content |
+| Key | Value |
 |---|---|
-| `c:state` | `σ_global`, dimensionality, last batch timestamp, corpus mean |
-| `s:{storyID}:m` | Story metadata (centroid, radius, state, timestamps, frozen stats) |
-| `g:{signalID}` | Canonical signal record: the one authoritative copy of a `Signal[T]`, held independently of where its facets are placed. Deleted only when no facet of the signal remains anywhere |
-| `s:{storyID}:f:{signalID}:{facet}` | Facet membership marker, payload-free. `{facet}` is zero-padded to four digits so a signal's facets sort in facet order |
+| `c:state` | Global calibration state (`calibState`): σ_global, dim, lastBatch, mean |
+| `s:{storyID}` | Story metadata (`storyRecord`): centroid, recent centroid, radius, timestamps, stats |
+| `s:{storyID}:f:{signalID}:{facet}` | Facet membership marker, payload-free |
+| `g:{signalID}` | Canonical signal record (`Signal[T]`): ID, timestamp, embeddings, caller payload |
 | `o:{signalID}:{facet}` | Unplaced facet marker, payload-free |
 | `o:{signalID}` | Outlier signal |
-| `l:{signalID}` | Signal location index: JSON array with one entry per facet — `s:{storyID}`, `o`, or empty. Derived state, rebuildable from the two marker spaces. Lets `Ingest` find where a signal's facets live so re-ingestion after a batch move never duplicates them |
+| `l:{signalID}` | Signal location index: CBOR-encoded `[]FacetLoc` with one entry per facet |
 | `t:{unix_sec}:{storyID}` | Time index for efficient Tier 3 range scans |
 
 ### Library Conveniences
 
-- `story.JSONCodec[T]` is the shipped default `Codec`; supply a custom one only for binary encodings.
+- `story.CBORCodec[T]` is the shipped default `Codec`; supply a custom one only for a non-CBOR format.
 - `Tracker.SignalID(domainKey)` derives the UUID v5 signal ID under `Config.Namespace`. Prefer it over calling `uuid.NewSHA1(story.TrackerNamespace, ...)` directly, which ignores a configured namespace.
 - `Config.OnBatchError` is the only way to observe a failed batch run: a failure leaves the store untouched, returns an empty summary, and the next tick retries.
 - `Config.InitialSigmaGlobal` (default 0.25) is the σ_global stand-in before the first batch measures one. Until then every story is in cold-start, so this single value decides the Draft assignment radius.

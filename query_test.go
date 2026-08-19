@@ -281,7 +281,7 @@ func TestStoreInvariants_HoldForMultiFacetSignals(t *testing.T) {
 func TestStoreInvariants_HoldAfterEviction(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		OutlierTTL:    time.Nanosecond,
 	})

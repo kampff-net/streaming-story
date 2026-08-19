@@ -2,7 +2,6 @@ package story
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -20,7 +19,7 @@ func newTestTracker(t *testing.T) *Tracker[string] {
 	t.Helper()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
@@ -67,7 +66,7 @@ func TestNewTracker(t *testing.T) {
 	})
 
 	t.Run("nil_store_returns_error", func(t *testing.T) {
-		_, err := NewTracker[string](Config[string]{Codec: JSONCodec[string]{}})
+		_, err := NewTracker[string](Config[string]{Codec: CBORCodec[string]{}})
 		require.Error(t, err)
 	})
 
@@ -79,7 +78,7 @@ func TestNewTracker(t *testing.T) {
 	t.Run("loads_persisted_calib_state", func(t *testing.T) {
 		ms := newMemStore()
 		state := calibState{SigmaGlobal: 0.42, Dim: 64}
-		b, err := json.Marshal(state)
+		b, err := cborEncMode.Marshal(state)
 		require.NoError(t, err)
 		require.NoError(t, ms.Update(func(tx Tx) error {
 			return tx.Put(keys.CalibState(), b)
@@ -87,7 +86,7 @@ func TestNewTracker(t *testing.T) {
 
 		tr, err := NewTracker[string](Config[string]{
 			Store:         ms,
-			Codec:         JSONCodec[string]{},
+			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -118,7 +117,7 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("returns_without_blocking", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         JSONCodec[string]{},
+			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -136,7 +135,7 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("closes_subscriber_channels", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         JSONCodec[string]{},
+			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -178,7 +177,7 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("does_not_block_on_full_channel", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:           newMemStore(),
-			Codec:           JSONCodec[string]{},
+			Codec:           CBORCodec[string]{},
 			BatchInterval:   time.Hour,
 			EventBufferSize: 1,
 		})
@@ -208,7 +207,7 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("no_op_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         JSONCodec[string]{},
+			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -230,7 +229,7 @@ func TestTracker_loadCalibState(t *testing.T) {
 
 	t.Run("loads_dim_and_sigma_from_store", func(t *testing.T) {
 		ms := newMemStore()
-		b, _ := json.Marshal(calibState{SigmaGlobal: 1.23, Dim: 128})
+		b, _ := cborEncMode.Marshal(calibState{SigmaGlobal: 1.23, Dim: 128})
 		require.NoError(t, ms.Update(func(tx Tx) error {
 			return tx.Put(keys.CalibState(), b)
 		}))
@@ -260,7 +259,7 @@ func TestTracker_saveCalibState(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return json.Unmarshal(b, &got)
+		return cborStrictDecMode.Unmarshal(b, &got)
 	}))
 
 	assert.Equal(t, 32, got.Dim)
@@ -289,7 +288,7 @@ func TestTracker_readStoryMeta(t *testing.T) {
 			CreatedAt:    time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
 			LastSignalAt: time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
 		}
-		b, _ := json.Marshal(rec)
+		b, _ := cborEncMode.Marshal(rec)
 		require.NoError(t, ms.Update(func(tx Tx) error {
 			return tx.Put(keys.StoryMeta(id), b)
 		}))
@@ -328,7 +327,7 @@ func TestTracker_Story(t *testing.T) {
 			CreatedAt:    time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
 			LastSignalAt: time.Date(2024, 6, 2, 0, 0, 0, 0, time.UTC),
 		}
-		b, _ := json.Marshal(rec)
+		b, _ := cborEncMode.Marshal(rec)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 			return tx.Put(keys.StoryMeta(id), b)
 		}))
@@ -361,6 +360,16 @@ func TestTracker_Ingest(t *testing.T) {
 		require.ErrorIs(t, err, ErrDimensionMismatch)
 	})
 
+	t.Run("zero_embedding_returns_ErrZeroEmbedding", func(t *testing.T) {
+		tr := newTestTracker(t)
+		_, err := tr.Ingest(context.Background(), Signal[string]{
+			ID:         uuid.New(),
+			At:         time.Now(),
+			Embeddings: []Embedding{[]float32{0, 0, 0}},
+		})
+		require.ErrorIs(t, err, ErrZeroEmbedding)
+	})
+
 	t.Run("buffers_signal_when_apply_in_progress", func(t *testing.T) {
 		tr := newTestTracker(t)
 		tr.dim.Store(3)
@@ -375,7 +384,7 @@ func TestTracker_Ingest(t *testing.T) {
 	t.Run("returns_error_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         JSONCodec[string]{},
+			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -393,7 +402,7 @@ func TestTracker_Ingest(t *testing.T) {
 var errDecodeFailed = errors.New("codec decode failed")
 
 // failingDecodeCodec encodes normally but always fails to decode.
-type failingDecodeCodec[T any] struct{ JSONCodec[T] }
+type failingDecodeCodec[T any] struct{ CBORCodec[T] }
 
 func (failingDecodeCodec[T]) Decode([]byte) (Signal[T], error) {
 	return Signal[T]{}, errDecodeFailed
@@ -551,7 +560,7 @@ func TestTracker_Signal(t *testing.T) {
 		tr := newTestTracker(t)
 		sigID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return tx.Put(keys.CanonicalSignal(sigID), []byte("{invalid json"))
+			return tx.Put(keys.CanonicalSignal(sigID), []byte{0xff, 0xff})
 		}))
 
 		_, err := tr.Signal(sigID)

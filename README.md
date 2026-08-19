@@ -60,7 +60,7 @@ go get go.kvsh.ch/streaming-story
 
 ### 1. Create a tracker
 
-`JSONCodec[T]` and `MemStore` ship with the library, so a working tracker needs
+`CBORCodec[T]` and `MemStore` ship with the library, so a working tracker needs
 no custom types:
 
 ```go
@@ -75,14 +75,14 @@ import (
 )
 
 type Article struct {
-	Title  string `json:"title"`
-	Source string `json:"source"`
+	Title  string `cbor:"0,keyasint"`
+	Source string `cbor:"1,keyasint"`
 }
 
 func main() {
 	tracker, err := story.NewTracker(story.Config[Article]{
 		Store:         story.NewMemStore(),        // required; swap for bbolt/LevelDB in production
-		Codec:         story.JSONCodec[Article]{}, // required
+		Codec:         story.CBORCodec[Article]{}, // required
 		BatchInterval: 30 * time.Minute,
 		OnBatchError:  func(err error) { log.Printf("batch: %v", err) },
 	})
@@ -234,7 +234,7 @@ or above `AssignThreshold`, `SplitThreshold` at or below `MergeThreshold` or abo
 | Parameter | Effect |
 |---|---|
 | `Store` | The persistence backend. Must give lexicographic byte ordering — the range scans over the time index and story prefixes depend on it. `NewMemStore()` for tests. |
-| `Codec` | Encodes and decodes `Signal[T]`. `JSONCodec[T]{}` unless you need a binary format for large embeddings or a tight latency budget. |
+| `Codec` | Encodes and decodes `Signal[T]`. `CBORCodec[T]{}` by default; supply a custom one for a non-CBOR format. |
 
 ### Identity
 

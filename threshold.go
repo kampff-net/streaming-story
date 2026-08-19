@@ -39,6 +39,12 @@ func (t *Tracker[T]) calcThreshold(story StoryMeta) float64 {
 		return t.clampAssign(story.FrozenMeanDistance + t.cfg.AssignmentK*sigma)
 	}
 
+	// Reactivation makes statistics stale until the next batch pass measures
+	// them fresh. Deriving staleness from timestamps avoids mutating stats.
+	if !story.ReactivatedAt.IsZero() && (story.StatsAt.IsZero() || story.ReactivatedAt.After(story.StatsAt)) {
+		return t.clampAssign(t.cfg.AssignmentK * sigmaGlobal)
+	}
+
 	if story.SignalCount >= t.cfg.ColdStartMinSignals {
 		sigma := story.Sigma
 		if sigma < floor {

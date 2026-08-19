@@ -5,7 +5,6 @@ package story
 // calibration state. Nothing outside this file marshals a record.
 
 import (
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -17,35 +16,42 @@ import (
 // Nothing outside this file marshals a record or touches the time index.
 
 type storyRecord struct {
-	State              StoryState `json:"state"`
-	Centroid           []float32  `json:"centroid"`
-	RecentCentroid     []float32  `json:"recent_centroid,omitempty"`
-	Radius             float64    `json:"radius"`
-	CreatedAt          time.Time  `json:"created_at"`
-	LastSignalAt       time.Time  `json:"last_signal_at"`
-	MeanDistance       float64    `json:"mean_distance,omitempty"`
-	Sigma              float64    `json:"sigma,omitempty"`
-	SignalCount        int        `json:"signal_count,omitempty"`
-	FrozenMeanDistance float64    `json:"frozen_mean_distance,omitempty"`
-	FrozenSigma        float64    `json:"frozen_sigma,omitempty"`
+	State              StoryState `cbor:"0,keyasint"`
+	Centroid           []float32  `cbor:"1,keyasint"`
+	RecentCentroid     []float32  `cbor:"2,keyasint,omitempty"`
+	Radius             float64    `cbor:"3,keyasint"`
+	CreatedAt          time.Time  `cbor:"4,keyasint"`
+	LastSignalAt       time.Time  `cbor:"5,keyasint"`
+	MeanDistance       float64    `cbor:"6,keyasint,omitempty"`
+	Sigma              float64    `cbor:"7,keyasint,omitempty"`
+	SignalCount        int        `cbor:"8,keyasint,omitempty"`
+	FrozenMeanDistance float64    `cbor:"9,keyasint,omitempty"`
+	FrozenSigma        float64    `cbor:"10,keyasint,omitempty"`
+	ReactivatedAt      time.Time  `cbor:"11,keyasint,omitempty"`
+	StatsAt            time.Time  `cbor:"12,keyasint,omitempty"`
 }
 
-// calibState is the JSON-serialised form of the global calibration state
+// storyHot is the CBOR-serialised form of the hot metadata written by Ingest
+// at keys.StoryHot(storyID).
+type storyHot struct {
+	State         StoryState `cbor:"0,keyasint"`
+	LastSignalAt  time.Time  `cbor:"1,keyasint"`
+	ReactivatedAt time.Time  `cbor:"2,keyasint,omitempty"`
+}
+
+// calibState is the CBOR-serialised form of the global calibration state
 // stored at keys.CalibState().
 type calibState struct {
-	SigmaGlobal float64   `json:"sigma_global"`
-	Dim         int       `json:"dim"`
-	LastBatchAt time.Time `json:"last_batch_at"`
+	SigmaGlobal float64   `cbor:"0,keyasint"`
+	Dim         int       `cbor:"1,keyasint"`
+	LastBatchAt time.Time `cbor:"2,keyasint"`
 
 	// Mean is the corpus mean direction subtracted from every embedding
 	// before any distance is measured. Empty until the first batch run
 	// measures one; see geometry.go.
-	Mean []float32 `json:"mean,omitempty"`
+	Mean []float32 `cbor:"3,keyasint,omitempty"`
 }
 
-// storyRecord is the JSON-serialised form of story metadata stored at
-// keys.StoryMeta(). It mirrors StoryMeta but keeps JSON tags out of the
-// public type.
 // recentOrCentroid returns the recency centroid, falling back to the lifetime
 // centroid for stories with no members inside ActiveContextWindow — every
 // Dormant story, and any Active one whose recent traffic has lapsed.
@@ -72,10 +78,13 @@ func storyMetaFromRecord(id uuid.UUID, rec storyRecord) StoryMeta {
 		SignalCount:        rec.SignalCount,
 		FrozenMeanDistance: rec.FrozenMeanDistance,
 		FrozenSigma:        rec.FrozenSigma,
+		ReactivatedAt:      rec.ReactivatedAt,
+		StatsAt:            rec.StatsAt,
 	}
 }
 
-// readStoryMeta reads and decodes story metadata for id from tx.
+// readStoryMeta reads and decodes story metadata for id from tx, overlaying
+// the hot state (keys.StoryHot) on top of the batch-owned record (keys.StoryMeta).
 func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
 	b, err := tx.Get(keys.StoryMeta(id))
 	if err != nil {
@@ -85,25 +94,39 @@ func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
 		return StoryMeta{}, fmt.Errorf("story %s: %w", id, ErrNotFound)
 	}
 	var rec storyRecord
-	if err := json.Unmarshal(b, &rec); err != nil {
+	if err := cborStrictDecMode.Unmarshal(b, &rec); err != nil {
 		return StoryMeta{}, fmt.Errorf("decode story %s: %w", id, err)
+	}
+	bh, err := tx.Get(keys.StoryHot(id))
+	if err != nil {
+		return StoryMeta{}, err
+	}
+	if bh != nil {
+		var hot storyHot
+		if err := cborStrictDecMode.Unmarshal(bh, &hot); err != nil {
+			return StoryMeta{}, fmt.Errorf("decode story hot %s: %w", id, err)
+		}
+		rec.State = hot.State
+		if hot.LastSignalAt.After(rec.LastSignalAt) {
+			rec.LastSignalAt = hot.LastSignalAt
+		}
+		if !hot.ReactivatedAt.IsZero() {
+			rec.ReactivatedAt = hot.ReactivatedAt
+		}
 	}
 	return storyMetaFromRecord(id, rec), nil
 }
 
-// writeStoryMeta persists rec for storyID and keeps the story's time-index
-// entry current. When LastSignalAt changes, the previous index entry (if
-// any) is removed and a fresh one is written so the index carries at most
-// one entry per story.
-func (t *Tracker[T]) writeStoryMeta(tx Tx, storyID uuid.UUID, oldLastSignalAt time.Time, rec storyRecord) error {
-	b, err := json.Marshal(rec)
+// writeStoryHot persists hot metadata for storyID and updates the time-index.
+func (t *Tracker[T]) writeStoryHot(tx Tx, storyID uuid.UUID, oldLastSignalAt time.Time, hot storyHot) error {
+	b, err := cborEncMode.Marshal(hot)
 	if err != nil {
 		return err
 	}
-	if err := tx.Put(keys.StoryMeta(storyID), b); err != nil {
+	if err := tx.Put(keys.StoryHot(storyID), b); err != nil {
 		return err
 	}
-	if rec.LastSignalAt.Equal(oldLastSignalAt) {
+	if hot.LastSignalAt.Equal(oldLastSignalAt) {
 		return nil
 	}
 	if !oldLastSignalAt.IsZero() {
@@ -111,14 +134,32 @@ func (t *Tracker[T]) writeStoryMeta(tx Tx, storyID uuid.UUID, oldLastSignalAt ti
 			return err
 		}
 	}
-	if !rec.LastSignalAt.IsZero() {
+	if !hot.LastSignalAt.IsZero() {
 		// The time index carries no payload; a non-empty sentinel satisfies
 		// the Store contract that values must not be empty.
-		if err := tx.Put(keys.TimeIndex(rec.LastSignalAt.Unix(), storyID), []byte{1}); err != nil {
+		if err := tx.Put(keys.TimeIndex(hot.LastSignalAt.Unix(), storyID), []byte{1}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// writeStoryMeta persists rec for storyID, synchronizing both keys.StoryMeta
+// and keys.StoryHot.
+func (t *Tracker[T]) writeStoryMeta(tx Tx, storyID uuid.UUID, oldLastSignalAt time.Time, rec storyRecord) error {
+	b, err := cborEncMode.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := tx.Put(keys.StoryMeta(storyID), b); err != nil {
+		return err
+	}
+	hot := storyHot{
+		State:         rec.State,
+		LastSignalAt:  rec.LastSignalAt,
+		ReactivatedAt: rec.ReactivatedAt,
+	}
+	return t.writeStoryHot(tx, storyID, oldLastSignalAt, hot)
 }
 
 // The canonical signal record: the one authoritative copy of a signal, held
@@ -216,6 +257,40 @@ func (t *Tracker[T]) readCanonicalSignal(tx Tx, id uuid.UUID) (Signal[T], bool, 
 		return Signal[T]{}, false, fmt.Errorf("decode signal %s: %w", id, err)
 	}
 	return sig, true, nil
+}
+
+// cborSignalHeader is the part of a Signal[T] a batch run needs. Key 0 (ID) and
+// key 3 (Data) are deliberately absent: a key the struct does not declare is
+// skipped by the decoder without being allocated, copied, or retained. The
+// signal's ID is already in hand from the membership key that named it.
+type cborSignalHeader struct {
+	At         time.Time   `cbor:"1,keyasint"`
+	Embeddings []Embedding `cbor:"2,keyasint"`
+}
+
+// readSignalHeader reads timestamp and embeddings from the canonical record,
+// skipping the caller payload T when the configured codec is CBORCodec[T].
+// For custom codecs, it falls back to full Decode.
+func (t *Tracker[T]) readSignalHeader(tx Tx, id uuid.UUID) (time.Time, []Embedding, bool, error) {
+	b, err := tx.Get(keys.CanonicalSignal(id))
+	if err != nil {
+		return time.Time{}, nil, false, err
+	}
+	if b == nil {
+		return time.Time{}, nil, false, nil
+	}
+	if _, isCBOR := t.cfg.Codec.(CBORCodec[T]); isCBOR {
+		var hdr cborSignalHeader
+		if err := cborDecMode.Unmarshal(b, &hdr); err != nil {
+			return time.Time{}, nil, false, fmt.Errorf("decode signal header %s: %w", id, err)
+		}
+		return hdr.At, hdr.Embeddings, true, nil
+	}
+	sig, err := t.cfg.Codec.Decode(b)
+	if err != nil {
+		return time.Time{}, nil, false, fmt.Errorf("decode signal %s: %w", id, err)
+	}
+	return sig.At, sig.Embeddings, true, nil
 }
 
 // Facet placement. A facet lives in exactly one of three states: under a story,
@@ -396,7 +471,7 @@ func (t *Tracker[T]) loadCalibState() error {
 			return err
 		}
 		var s calibState
-		if err := json.Unmarshal(b, &s); err != nil {
+		if err := cborStrictDecMode.Unmarshal(b, &s); err != nil {
 			return fmt.Errorf("decode calib state: %w", err)
 		}
 		if s.Dim > 0 {
@@ -422,9 +497,10 @@ func (t *Tracker[T]) saveCalibState(tx Tx) error {
 	}
 	t.calibMu.RUnlock()
 
-	b, err := json.Marshal(s)
+	b, err := cborEncMode.Marshal(s)
 	if err != nil {
 		return err
 	}
 	return tx.Put(keys.CalibState(), b)
 }
+

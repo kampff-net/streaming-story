@@ -35,7 +35,7 @@ func BenchmarkBatch(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour, // the ticker must not fire mid-benchmark
 		MinStorySize:  3,
 	})
@@ -76,7 +76,7 @@ func BenchmarkBatchFacets(b *testing.B) {
 
 			tr, err := NewTracker[string](Config[string]{
 				Store:         newMemStore(),
-				Codec:         JSONCodec[string]{},
+				Codec:         CBORCodec[string]{},
 				BatchInterval: time.Hour,
 				MinStorySize:  3,
 			})
@@ -120,7 +120,7 @@ func BenchmarkIngestDuringApply(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:           newMemStore(),
-		Codec:           JSONCodec[string]{},
+		Codec:           CBORCodec[string]{},
 		BatchInterval:   time.Hour,
 		IngestBufferCap: 1 << 20, // large enough that the benchmark never blocks
 	})
@@ -168,7 +168,7 @@ func BenchmarkIngestSteadyState(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})
@@ -213,7 +213,7 @@ func BenchmarkSignalsOf(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})
@@ -264,3 +264,44 @@ func BenchmarkSignalsOf(b *testing.B) {
 		}
 	}
 }
+
+
+// TestStoreFootprint measures the sum of encoded value bytes across all keys
+// in a populated store after a batch pass, matching the §2.7 footprint metric.
+func TestStoreFootprint(t *testing.T) {
+	const signals = 400
+
+	rng := rand.New(rand.NewSource(7))
+	now := time.Now()
+
+	ms := newMemStore()
+	tr, err := NewTracker[string](Config[string]{
+		Store:         ms,
+		Codec:         CBORCodec[string]{},
+		BatchInterval: time.Hour,
+		MinStorySize:  3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	for i := range signals {
+		sig := Signal[string]{
+			ID:         uuid.New(),
+			At:         now.Add(-time.Duration(i) * time.Second),
+			Embeddings: []Embedding{benchBlob(rng, (i%4)*2)},
+		}
+		if _, err := tr.Ingest(context.Background(), sig); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tr.runBatch()
+
+	var totalBytes int
+	for _, v := range ms.data {
+		totalBytes += len(v)
+	}
+	t.Logf("STORE_FOOTPRINT_BYTES: %d (across %d keys)", totalBytes, len(ms.data))
+}
+

@@ -23,6 +23,19 @@ func TestKeyStoryMeta(t *testing.T) {
 		[]byte("s:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:m"),
 		StoryMeta(keysTestStoryID),
 	)
+	id, ok := ParseStoryMeta(StoryMeta(keysTestStoryID))
+	require.True(t, ok)
+	assert.Equal(t, keysTestStoryID, id)
+}
+
+func TestKeyStoryHot(t *testing.T) {
+	assert.Equal(t,
+		[]byte("s:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:h"),
+		StoryHot(keysTestStoryID),
+	)
+	id, ok := ParseStoryHot(StoryHot(keysTestStoryID))
+	require.True(t, ok)
+	assert.Equal(t, keysTestStoryID, id)
 }
 
 func TestKeyStoryPrefix(t *testing.T) {
@@ -191,11 +204,16 @@ func TestSignalLocSet_Empty(t *testing.T) {
 }
 
 func TestSignalLocSet_RejectsMalformed(t *testing.T) {
+	validBytes := EncodeSignalLocSet([]FacetLoc{{StoryID: uuid.New()}, {IsOutlier: true}})
+	truncated := validBytes[:len(validBytes)-2]
+
 	for _, val := range [][]byte{
 		[]byte(`not json`),
 		[]byte(`{"a":1}`),
 		[]byte(`["x:whatever"]`),
-		[]byte(`["s:not-a-uuid"]`),
+		[]byte(`["s:11111111-2222-3333-4444-555555555555","o"]`), // legacy JSON array
+		{0xff, 0xff}, // invalid CBOR
+		truncated,    // truncated CBOR
 	} {
 		_, ok := ParseSignalLocSet(val)
 		assert.False(t, ok, "value %q must not parse", val)

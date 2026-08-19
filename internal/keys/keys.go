@@ -2,9 +2,9 @@ package keys
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 )
 
@@ -29,6 +29,10 @@ func CalibState() []byte {
 
 func StoryMeta(storyID uuid.UUID) []byte {
 	return fmt.Appendf(nil, "s:%s:m", storyID)
+}
+
+func StoryHot(storyID uuid.UUID) []byte {
+	return fmt.Appendf(nil, "s:%s:h", storyID)
 }
 
 // StoryPrefix returns the prefix covering all keys for a story
@@ -80,6 +84,18 @@ func ParseTimeIndex(key []byte) (uuid.UUID, bool) {
 // (for example signal keys, which share the "s:" prefix).
 func ParseStoryMeta(key []byte) (uuid.UUID, bool) {
 	if len(key) < len("s::m") || string(key[len(key)-2:]) != ":m" {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(string(key[2 : len(key)-2]))
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+// ParseStoryHot extracts the story ID from a "s:{storyID}:h" hot state key.
+func ParseStoryHot(key []byte) (uuid.UUID, bool) {
+	if len(key) < len("s::h") || string(key[len(key)-2:]) != ":h" {
 		return uuid.Nil, false
 	}
 	id, err := uuid.Parse(string(key[2 : len(key)-2]))
@@ -212,32 +228,46 @@ func ParseOutlierFacet(key []byte) (uuid.UUID, int, bool) {
 // only for a signal whose record exists but whose placement has not been
 // written yet.
 type FacetLoc struct {
-	StoryID   uuid.UUID
-	IsOutlier bool
+	StoryID   uuid.UUID `cbor:"0,keyasint,omitempty"`
+	IsOutlier bool      `cbor:"1,keyasint,omitempty"`
+}
+
+var (
+	cborEncMode = mustEncMode()
+	cborStrictDecMode = mustDecMode()
+)
+
+func mustEncMode() cbor.EncMode {
+	opts := cbor.CanonicalEncOptions()
+	opts.Time = cbor.TimeRFC3339Nano
+	opts.TimeTag = cbor.EncTagNone
+	m, err := opts.EncMode()
+	if err != nil {
+		panic("keys: cbor enc mode: " + err.Error())
+	}
+	return m
+}
+
+func mustDecMode() cbor.DecMode {
+	opts := cbor.DecOptions{
+		ExtraReturnErrors: cbor.ExtraDecErrorUnknownField,
+	}
+	m, err := opts.DecMode()
+	if err != nil {
+		panic("keys: cbor dec mode: " + err.Error())
+	}
+	return m
 }
 
 // EncodeSignalLocSet builds the location-index value for a whole signal: one
-// entry per facet, in facet order. "s:{storyID}" for story membership, "o" for
-// the outlier bucket, "" for a facet with no location.
+// entry per facet, in facet order.
 //
 // The index is derived state. It is rebuildable in full from the facet
 // membership and outlier key spaces, and is kept only so Ingest can find where
 // a signal lives without scanning them.
 func EncodeSignalLocSet(locs []FacetLoc) []byte {
-	parts := make([]string, len(locs))
-	for i, l := range locs {
-		switch {
-		case l.IsOutlier:
-			parts[i] = "o"
-		case l.StoryID != uuid.Nil:
-			parts[i] = "s:" + l.StoryID.String()
-		default:
-			parts[i] = ""
-		}
-	}
-	b, err := json.Marshal(parts)
+	b, err := cborEncMode.Marshal(locs)
 	if err != nil {
-		// json.Marshal of []string cannot fail.
 		return nil
 	}
 	return b
@@ -246,26 +276,9 @@ func EncodeSignalLocSet(locs []FacetLoc) []byte {
 // ParseSignalLocSet decodes a location-index value written by
 // EncodeSignalLocSet.
 func ParseSignalLocSet(val []byte) ([]FacetLoc, bool) {
-	var parts []string
-	if err := json.Unmarshal(val, &parts); err != nil {
+	var locs []FacetLoc
+	if err := cborStrictDecMode.Unmarshal(val, &locs); err != nil {
 		return nil, false
 	}
-	out := make([]FacetLoc, len(parts))
-	for i, p := range parts {
-		switch {
-		case p == "":
-			// No location recorded for this facet.
-		case p == "o":
-			out[i] = FacetLoc{IsOutlier: true}
-		case len(p) > 2 && p[0] == 's' && p[1] == ':':
-			id, err := uuid.Parse(p[2:])
-			if err != nil {
-				return nil, false
-			}
-			out[i] = FacetLoc{StoryID: id}
-		default:
-			return nil, false
-		}
-	}
-	return out, true
+	return locs, true
 }

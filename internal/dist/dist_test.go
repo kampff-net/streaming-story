@@ -83,3 +83,58 @@ func TestCosineDistance(t *testing.T) {
 		})
 	}
 }
+
+func TestCosineDistanceUnit(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []float32
+		want float64
+	}{
+		{"identical", []float32{1, 0, 0}, []float32{1, 0, 0}, 0},
+		{"orthogonal", []float32{1, 0}, []float32{0, 1}, 1},
+		{"opposite", []float32{1, 0}, []float32{-1, 0}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.InDelta(t, tt.want, CosineDistanceUnit(tt.a, tt.b), 1e-6)
+		})
+	}
+}
+
+func BenchmarkCosineDistance(b *testing.B) {
+	const dim = 1536
+	v1 := make([]float32, dim)
+	v2 := make([]float32, dim)
+	for i := range dim {
+		v1[i] = float32(i) * 0.001
+		v2[i] = float32(dim-i) * 0.001
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		_ = CosineDistance(v1, v2)
+	}
+}
+
+func BenchmarkCosineDistanceUnit(b *testing.B) {
+	const dim = 1536
+	v1 := make([]float32, dim)
+	v2 := make([]float32, dim)
+	for i := range dim {
+		v1[i] = float32(i) * 0.001
+		v2[i] = float32(dim-i) * 0.001
+	}
+	norm1 := Norm(v1)
+	norm2 := Norm(v2)
+	for i := range dim {
+		v1[i] /= norm1
+		v2[i] /= norm2
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		_ = CosineDistanceUnit(v1, v2)
+	}
+}
+
+

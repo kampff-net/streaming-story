@@ -274,3 +274,24 @@ parameter had no effect long before it disappeared.
 default to `2×BatchWindow` and has no other effect: membership is read in full on
 every pass, so it no longer bounds the clustering input the way it did under
 windowed re-clustering. Set `OutlierTTL` directly and it stops mattering.
+
+---
+
+## 7. JSON serialization and `JSONCodec[T]`
+
+**What it was.** All internal records (`storyRecord`, `calibState`, `Signal[T]`, location indexes) were serialized with `encoding/json`. `JSONCodec[T]` was the default codec.
+
+**Why it was removed.** JSON encoding of floating-point vectors is slow and bloated (~10-15 bytes per float ASCII vs 4 bytes binary). Deserialization during ingest and batch collection caused high CPU overhead and GC churn.
+
+**What replaced it.** Canonical CBOR (`github.com/fxamacker/cbor/v2`) with integer keys (`keyasint`). `CBORCodec[T]` is the default codec. `JSONCodec[T]` was removed. Existing stores must be rebuilt via replay.
+
+---
+
+## 8. Preserving producer embedding magnitudes
+
+**What it was.** Ingest preserved producer vector magnitudes in `Signal.Embeddings`, and distance computations normalized on every pairwise comparison.
+
+**Why it was removed.** Magnitude is unused by cosine similarity, centroids, and clustering. Recomputing norms on every distance comparison was the single most expensive linear algebra operation.
+
+**What replaced it.** Normalization to unit vectors on ingest. The store holds unit vectors; `Signals()` returns normalized unit vectors; zero-magnitude embeddings are rejected at `Ingest` with `ErrZeroEmbedding`.
+

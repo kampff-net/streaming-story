@@ -397,6 +397,9 @@ func (t *Tracker[T]) applyMaintenance(
 			if err := tx.Delete(keys.StoryMeta(retired)); err != nil {
 				return err
 			}
+			if err := tx.Delete(keys.StoryHot(retired)); err != nil {
+				return err
+			}
 			for _, m := range members[retired] {
 				m.storyID = survivor
 			}
@@ -479,6 +482,9 @@ func (t *Tracker[T]) recentreStory(
 		if err := tx.Delete(keys.StoryMeta(sid)); err != nil {
 			return err
 		}
+		if err := tx.Delete(keys.StoryHot(sid)); err != nil {
+			return err
+		}
 		summary.StoriesRetired++
 		*events = append(*events, StoryEvent[T]{Kind: EventStoryRetired, StoryID: sid, At: now})
 		return nil
@@ -492,6 +498,7 @@ func (t *Tracker[T]) recentreStory(
 	rec.MeanDistance = st.Mean
 	rec.Sigma = st.Sigma
 	rec.LastSignalAt = st.LatestAt
+	rec.StatsAt = now
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = now
 	}

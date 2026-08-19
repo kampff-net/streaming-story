@@ -33,26 +33,6 @@ func (t *Tracker[T]) projector() geom.Projector {
 	return geom.Projector{Mean: t.mean, Strength: float32(t.cfg.MeanRemoval)}
 }
 
-// projectAll centres a batch's collected signals in place, so every downstream
-// decision in that run is computed in one consistent geometry.
-func projectAll(p geom.Projector, signals []batchFacet) {
-	if len(p.Mean) == 0 || p.Strength == 0 {
-		return
-	}
-	for i := range signals {
-		signals[i].emb = p.Project(signals[i].emb)
-	}
-}
-
-// corpusMeanOf returns the mean direction of a batch's collected signals, which
-// becomes the geometry every distance in that run is measured against.
-func corpusMeanOf(signals []batchFacet) []float32 {
-	vecs := make([][]float32, len(signals))
-	for i := range signals {
-		vecs[i] = signals[i].emb
-	}
-	return geom.Mean(vecs)
-}
 
 // clusterParams packages the configured thresholds for the clustering decisions.
 func (t *Tracker[T]) clusterParams() cluster.Params {

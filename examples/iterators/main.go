@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 
@@ -9,26 +8,14 @@ import (
 )
 
 type SimplePayload struct {
-	Text string `json:"text"`
-}
-
-type SimpleCodec struct{}
-
-func (c SimpleCodec) Encode(sig story.Signal[SimplePayload]) ([]byte, error) {
-	return json.Marshal(sig)
-}
-
-func (c SimpleCodec) Decode(b []byte) (story.Signal[SimplePayload], error) {
-	var sig story.Signal[SimplePayload]
-	err := json.Unmarshal(b, &sig)
-	return sig, err
+	Text string `cbor:"0,keyasint"`
 }
 
 func main() {
 	store := story.NewMemStore()
 	cfg := story.Config[SimplePayload]{
 		Store: store,
-		Codec: SimpleCodec{},
+		Codec: story.CBORCodec[SimplePayload]{},
 	}
 
 	tracker, err := story.NewTracker(cfg)

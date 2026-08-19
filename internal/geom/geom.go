@@ -57,12 +57,28 @@ type Projector struct {
 	Strength float32
 }
 
-// Project returns emb as a unit vector with Strength × Mean subtracted.
-//
-// The result is not renormalized: cosine distance is scale-invariant, so the
-// residual's length does not affect any comparison. Normalizing the input first
-// does matter — the mean is an average of unit vectors, so subtracting it from an
-// embedding of some other magnitude would remove the wrong amount.
+// ProjectInPlace centres v against mean and renormalizes it to unit length,
+// without allocating. v must be unit on entry and is unit on return.
+func ProjectInPlace(v, mean []float32, strength float32) {
+	if len(v) != len(mean) || len(v) == 0 || strength == 0 {
+		return
+	}
+	var sum float64
+	for i := range v {
+		v[i] -= strength * mean[i]
+		sum += float64(v[i]) * float64(v[i])
+	}
+	if sum == 0 {
+		return
+	}
+	inv := float32(1.0 / math.Sqrt(sum))
+	for i := range v {
+		v[i] *= inv
+	}
+}
+
+// Project returns emb as a unit vector with Strength × Mean subtracted and
+// renormalized to unit length.
 func (p Projector) Project(emb []float32) []float32 {
 	if len(p.Mean) != len(emb) || len(emb) == 0 || p.Strength == 0 {
 		// No mean established yet, or a dimensionality mismatch the caller
@@ -70,9 +86,7 @@ func (p Projector) Project(emb []float32) []float32 {
 		return emb
 	}
 	out := Unit(emb)
-	for i := range out {
-		out[i] -= p.Strength * p.Mean[i]
-	}
+	ProjectInPlace(out, p.Mean, p.Strength)
 	return out
 }
 
@@ -127,9 +141,7 @@ func Mean(vecs [][]float32) []float32 {
 	return mean
 }
 
-// Centroid returns the unweighted mean of the vectors, without normalizing them
-// first. It is the group's centre of mass in whatever space the caller is
-// already working in.
+// Centroid returns the unit-normalized mean direction of the vectors.
 func Centroid(vecs [][]float32) []float32 {
 	if len(vecs) == 0 {
 		return nil
@@ -140,11 +152,7 @@ func Centroid(vecs [][]float32) []float32 {
 			c[d] += x
 		}
 	}
-	n := float32(len(vecs))
-	for d := range c {
-		c[d] /= n
-	}
-	return c
+	return Unit(c)
 }
 
 // Radius returns the greatest distance from the group's centroid to a member.
@@ -152,7 +160,7 @@ func Radius(vecs [][]float32) float64 {
 	c := Centroid(vecs)
 	var r float64
 	for _, v := range vecs {
-		if d := dist.CosineDistance(v, c); d > r {
+		if d := dist.CosineDistanceUnit(v, c); d > r {
 			r = d
 		}
 	}
@@ -182,7 +190,7 @@ func Measure(vecs [][]float32, times []time.Time) Stats {
 	}
 	var sum, sumSq float64
 	for i, v := range vecs {
-		d := dist.CosineDistance(v, st.Centroid)
+		d := dist.CosineDistanceUnit(v, st.Centroid)
 		st.Dists = append(st.Dists, d)
 		sum += d
 		sumSq += d * d

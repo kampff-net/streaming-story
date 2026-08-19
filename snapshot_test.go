@@ -2,6 +2,7 @@ package story
 
 import (
 	"context"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kvsh.ch/streaming-story/internal/geom"
 )
 
 // blockingStore holds the write lock open on the first write transaction that
@@ -33,6 +35,54 @@ func (s *blockingStore) Update(fn func(tx Tx) error) error {
 	})
 }
 
+func setTestIndex(tr *Tracker[string], stories map[uuid.UUID]storyRecord) {
+	dim := 2
+	for _, rec := range stories {
+		if len(rec.Centroid) > 0 {
+			dim = len(rec.Centroid)
+			break
+		}
+	}
+	tr.dim.Store(int32(dim))
+	ids := make([]uuid.UUID, 0, len(stories))
+	for id, rec := range stories {
+		if rec.State == StoryStateArchived || len(rec.Centroid) == 0 {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+
+	idx := &activeStoryIndex{
+		dim:     dim,
+		ids:     ids,
+		recents: make([]float32, len(ids)*dim),
+		metas:   make([]activeStoryMeta, len(ids)),
+	}
+	for i, id := range ids {
+		rec := stories[id]
+		recent := rec.RecentCentroid
+		if len(recent) == 0 {
+			recent = rec.Centroid
+		}
+		copy(idx.recents[i*dim:(i+1)*dim], geom.Unit(recent))
+		idx.metas[i] = activeStoryMeta{
+			state:              rec.State,
+			createdAt:          rec.CreatedAt,
+			lastSignalAt:       rec.LastSignalAt,
+			reactivatedAt:      rec.ReactivatedAt,
+			statsAt:            rec.StatsAt,
+			radius:             rec.Radius,
+			meanDistance:       rec.MeanDistance,
+			sigma:              rec.Sigma,
+			signalCount:        rec.SignalCount,
+			frozenMeanDistance: rec.FrozenMeanDistance,
+			frozenSigma:        rec.FrozenSigma,
+		}
+	}
+	tr.storyIndex.Store(idx)
+}
+
 func TestProvisionalStory(t *testing.T) {
 	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
 
@@ -40,7 +90,7 @@ func TestProvisionalStory(t *testing.T) {
 		t.Helper()
 		tr, err := NewTracker[string](Config[string]{
 			Store:         NewMemStore(),
-			Codec:         JSONCodec[string]{},
+			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -59,7 +109,7 @@ func TestProvisionalStory(t *testing.T) {
 	t.Run("returns_the_nearest_story_within_threshold", func(t *testing.T) {
 		tr := newTr(t)
 		near, far := uuid.New(), uuid.New()
-		tr.publishDraftSnapshot(map[uuid.UUID]storyRecord{
+		setTestIndex(tr, map[uuid.UUID]storyRecord{
 			near: {State: StoryStateActive, Centroid: []float32{1, 0}, LastSignalAt: now},
 			far:  {State: StoryStateActive, Centroid: []float32{0, 1}, LastSignalAt: now},
 		})
@@ -70,7 +120,7 @@ func TestProvisionalStory(t *testing.T) {
 	t.Run("distant_signal_gets_no_story", func(t *testing.T) {
 		tr := newTr(t)
 		id := uuid.New()
-		tr.publishDraftSnapshot(map[uuid.UUID]storyRecord{
+		setTestIndex(tr, map[uuid.UUID]storyRecord{
 			id: {
 				State: StoryStateActive, Centroid: []float32{1, 0}, LastSignalAt: now,
 				MeanDistance: 0.01, Sigma: 0.001, SignalCount: 20,
@@ -83,7 +133,7 @@ func TestProvisionalStory(t *testing.T) {
 	t.Run("archived_and_centroidless_stories_are_skipped", func(t *testing.T) {
 		tr := newTr(t)
 		archived, empty := uuid.New(), uuid.New()
-		tr.publishDraftSnapshot(map[uuid.UUID]storyRecord{
+		setTestIndex(tr, map[uuid.UUID]storyRecord{
 			archived: {State: StoryStateArchived, Centroid: []float32{1, 0}, LastSignalAt: now},
 			empty:    {State: StoryStateActive, LastSignalAt: now},
 		})
@@ -95,7 +145,7 @@ func TestProvisionalStory(t *testing.T) {
 		tr := newTr(t)
 		id := uuid.New()
 		stale := now.Add(-tr.cfg.ActiveContextWindow - time.Hour)
-		tr.publishDraftSnapshot(map[uuid.UUID]storyRecord{
+		setTestIndex(tr, map[uuid.UUID]storyRecord{
 			id: {State: StoryStateActive, Centroid: []float32{1, 0}, LastSignalAt: stale},
 		})
 
@@ -105,12 +155,12 @@ func TestProvisionalStory(t *testing.T) {
 	t.Run("clearing_the_snapshot_removes_the_answer", func(t *testing.T) {
 		tr := newTr(t)
 		id := uuid.New()
-		tr.publishDraftSnapshot(map[uuid.UUID]storyRecord{
+		setTestIndex(tr, map[uuid.UUID]storyRecord{
 			id: {State: StoryStateActive, Centroid: []float32{1, 0}, LastSignalAt: now},
 		})
 		require.Equal(t, id, tr.provisionalStory([]float32{1, 0}, now))
 
-		tr.clearDraftSnapshot()
+		tr.storyIndex.Store(nil)
 		assert.Equal(t, uuid.Nil, tr.provisionalStory([]float32{1, 0}, now))
 	})
 }
@@ -123,7 +173,7 @@ func TestIngestDuringApplyReturnsProvisionalStory(t *testing.T) {
 	}
 	tr, err := NewTracker[string](Config[string]{
 		Store:         store,
-		Codec:         JSONCodec[string]{},
+		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})

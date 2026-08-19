@@ -38,7 +38,7 @@ package. The logic that can be stated without either lives in `internal/`:
 
 Root files are grouped by function, not by type: `types.go` (public types and
 events), `config.go` (knobs and validation), `store.go` (the `Store`/`Tx`/`Codec`
-contracts plus `MemStore` and `JSONCodec`), `tracker.go` (lifecycle, batch loop,
+contracts plus `MemStore` and `CBORCodec`), `tracker.go` (lifecycle, batch loop,
 subscriber fan-out), `ingest.go` (the Draft path), `threshold.go` (admission
 radius policy, shared by Draft and by outlier admission), `batch.go` (collection,
 apply window, snapshot, buffer drain), `maintain.go` (the pass itself),
@@ -570,7 +570,7 @@ func (t *Tracker[T]) SignalsOf(id uuid.UUID) iter.Seq2[Signal[T], error]
 func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error)         // story member or outlier
 
 // Shipped helpers.
-type JSONCodec[T any] struct{} // default Codec
+type CBORCodec[T any] struct{} // default Codec
 func NewMemStore() *MemStore   // in-memory Store
 ```
 

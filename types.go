@@ -16,6 +16,10 @@ var TrackerNamespace = uuid.MustParse("d4e5f6a7-b8c9-4d0e-1f2a-3b4c5d6e7f80")
 // length differs from the dimensionality established by the first ingested signal.
 var ErrDimensionMismatch = errors.New("story: embedding dimension mismatch")
 
+// ErrZeroEmbedding is returned by Ingest when a signal carries an embedding
+// with zero magnitude.
+var ErrZeroEmbedding = errors.New("story: zero embedding")
+
 // ErrTooManyFacets is returned by Ingest when a signal carries more facets
 // than Config.MaxFacetsPerSignal permits.
 var ErrTooManyFacets = errors.New("story: too many facets")
@@ -46,23 +50,15 @@ type Embedding = []float32
 
 // Signal is the atomic unit of input.
 type Signal[T any] struct {
-	ID uuid.UUID
-	At time.Time
+	ID uuid.UUID `cbor:"0,keyasint"`
+	At time.Time `cbor:"1,keyasint"`
 
-	// Embeddings holds one Embedding per facet: the semantically distinct
-	// components the producer extracted from this item. Every facet must share
-	// the dimensionality established by the first ingested signal.
-	//
-	// Order is significant and stable: facet i is Embeddings[i], and that index
-	// is the facet's persistent identity in the store. A producer that
-	// re-ingests an item must emit its facets in the same order, or the
-	// re-ingested facets are different facets.
-	//
-	// At least one facet is required. A single-facet signal behaves exactly as
-	// a signal did before facets existed.
-	Embeddings []Embedding
+	// Embeddings holds one Embedding per facet. Embeddings are unit-normalized
+	// upon ingest and stored as unit vectors. Lossless for replay; direction
+	// is preserved exactly, magnitude is not.
+	Embeddings []Embedding `cbor:"2,keyasint"`
 
-	Data T
+	Data T `cbor:"3,keyasint"`
 }
 
 // StoryMeta holds the current metadata for a persistent story.
@@ -101,6 +97,8 @@ type StoryMeta struct {
 	// reactivation, at which point they are cleared.
 	FrozenMeanDistance float64
 	FrozenSigma        float64
+	ReactivatedAt      time.Time
+	StatsAt            time.Time
 }
 
 // EventKind identifies the type of a StoryEvent.
@@ -147,8 +145,9 @@ type BatchSummary struct {
 	StoriesSplit   int
 	StoriesRetired int
 
-	SignalsReassigned int
-	OutliersEvicted   int
-	OutliersPromoted  int
-	OutliersAdmitted  int
+	SignalsReassigned          int
+	OutliersEvicted            int
+	OutliersPromoted           int
+	OutliersAdmitted           int
+	DimensionMismatchesDropped int
 }

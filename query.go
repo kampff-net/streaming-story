@@ -1,7 +1,6 @@
 package story
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -44,7 +43,7 @@ func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta] {
 					return nil
 				}
 				var rec storyRecord
-				if err := json.Unmarshal(val, &rec); err != nil {
+				if err := cborStrictDecMode.Unmarshal(val, &rec); err != nil {
 					return nil
 				}
 				if state != StoryStateAny && rec.State != state {
@@ -202,10 +201,10 @@ func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error) {
 // partially placed signals, and signals whose every facet is still an outlier
 // all appear, and a signal appears once regardless of facet count.
 //
-// The yielded value is complete: ID, At, Embeddings, and Data are the values
-// that were ingested. Signals is therefore a lossless dump, and replaying it
-// through Ingest against a fresh store is a full rebuild that needs no access
-// to the original source and no re-embedding.
+// The yielded value is complete: ID, At, and Data are preserved, and
+// Embeddings are returned as unit-normalized vectors. Signals is lossless for
+// replay: replaying it through Ingest against a fresh store reproduces the
+// exact clustering without requiring original embedding sources.
 func (t *Tracker[T]) Signals() iter.Seq2[Signal[T], error] {
 	return func(yield func(Signal[T], error) bool) {
 		_ = t.cfg.Store.View(func(tx Tx) error {

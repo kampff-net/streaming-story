@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -13,22 +12,9 @@ import (
 
 // ArticlePayload represents a generic caller data structure attached to a signal.
 type ArticlePayload struct {
-	Title   string `json:"title"`
-	Source  string `json:"source"`
-	Content string `json:"content"`
-}
-
-// JSONCodec implements story.Codec[ArticlePayload] for persistence.
-type JSONCodec struct{}
-
-func (c JSONCodec) Encode(sig story.Signal[ArticlePayload]) ([]byte, error) {
-	return json.Marshal(sig)
-}
-
-func (c JSONCodec) Decode(b []byte) (story.Signal[ArticlePayload], error) {
-	var sig story.Signal[ArticlePayload]
-	err := json.Unmarshal(b, &sig)
-	return sig, err
+	Title   string `cbor:"0,keyasint"`
+	Source  string `cbor:"1,keyasint"`
+	Content string `cbor:"2,keyasint"`
 }
 
 func main() {
@@ -38,7 +24,7 @@ func main() {
 	// Configure the Tracker
 	cfg := story.Config[ArticlePayload]{
 		Store:         store,
-		Codec:         JSONCodec{},
+		Codec:         story.CBORCodec[ArticlePayload]{},
 		BatchWindow:   24 * time.Hour,
 		BatchInterval: 30 * time.Minute,
 	}

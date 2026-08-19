@@ -1,14 +1,13 @@
 package story
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
 )
 
 // The persistence and encoding contracts, and the implementations shipped
-// for them: MemStore for tests and small deployments, JSONCodec as the
+// for them: MemStore for tests and small deployments, CBORCodec as the
 // default payload encoding.
 
 // Store is the persistence interface used by Tracker.
@@ -33,10 +32,12 @@ type Store interface {
 
 // Tx is a single key-value transaction provided to Store.View and Store.Update callbacks.
 // Tx values must not be used outside the callback they are passed to.
+// All byte slices passed to or returned from Tx callbacks (keys and values in Get,
+// ScanPrefix, ScanRange) are owned by the store only for the duration of the callback/transaction.
+// Callers must not mutate them and must not retain references past transaction completion.
 type Tx interface {
 	// Get returns the value for key, or nil if the key does not exist.
 	// The returned slice is only valid for the lifetime of the transaction.
-	// Implementations that reuse internal buffers must return a copy.
 	Get(key []byte) ([]byte, error)
 
 	// Put writes key → value. value must not be empty (use Delete to remove a key).
@@ -64,21 +65,22 @@ type Codec[T any] interface {
 	Decode(b []byte) (Signal[T], error)
 }
 
-// JSONCodec encodes signals with encoding/json. It is the default choice when
-// the payload type T is JSON-serialisable; callers with large embeddings or
-// strict latency budgets should supply a binary Codec instead.
-type JSONCodec[T any] struct{}
+// CBORCodec encodes signals with canonical CBOR (github.com/fxamacker/cbor/v2)
+// using integer keys. It is the default choice.
+type CBORCodec[T any] struct{}
 
 // Compile-time interface check.
-var _ Codec[struct{}] = JSONCodec[struct{}]{}
+var _ Codec[struct{}] = CBORCodec[struct{}]{}
 
 // Encode implements Codec.
-func (JSONCodec[T]) Encode(sig Signal[T]) ([]byte, error) { return json.Marshal(sig) }
+func (CBORCodec[T]) Encode(sig Signal[T]) ([]byte, error) {
+	return cborEncMode.Marshal(sig)
+}
 
 // Decode implements Codec.
-func (JSONCodec[T]) Decode(b []byte) (Signal[T], error) {
+func (CBORCodec[T]) Decode(b []byte) (Signal[T], error) {
 	var sig Signal[T]
-	if err := json.Unmarshal(b, &sig); err != nil {
+	if err := cborDecMode.Unmarshal(b, &sig); err != nil {
 		return Signal[T]{}, err
 	}
 	return sig, nil
