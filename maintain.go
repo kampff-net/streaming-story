@@ -331,6 +331,16 @@ func (t *Tracker[T]) applyMaintenance(
 			events = append(events, StoryEvent[T]{
 				Kind: EventSignalReassigned, StoryID: ad.storyID, SignalID: ad.sig.id, At: now,
 			})
+			// A suppressed story absorbing an outlier is still just more
+			// evidence it's noise, not evidence it should reactivate (see
+			// ingest.go and spec 009 §1.3). stories holds the pre-batch
+			// snapshot, so its State reflects what the story was before this
+			// run touched it.
+			if rec, ok := stories[ad.storyID]; ok && rec.State == StoryStateSuppressed {
+				events = append(events, StoryEvent[T]{
+					Kind: EventSuppressedStorySignal, StoryID: ad.storyID, SignalID: ad.sig.id, At: now,
+				})
+			}
 		}
 
 		// 4. Split stories that now hold two groups. At most one split per
@@ -383,6 +393,27 @@ func (t *Tracker[T]) applyMaintenance(
 		plan := t.planMerges(members, centroids, created)
 		for _, retired := range sortedPlanKeys(plan) {
 			survivor := plan[retired]
+
+			// A merge always unsuppresses: it means the clustering logic
+			// determined this suppressed cluster is actually the same story
+			// as another one, a stronger signal than a single new member
+			// joining it alone (spec 009 §1.3). stories holds the pre-batch
+			// snapshot; survivorRec is missing only when survivor was itself
+			// created this run (promotion or split), which can't be
+			// suppressed.
+			if survivorRec, ok := stories[survivor]; ok {
+				retiredRec := stories[retired] // zero value if also created this run
+				if survivorRec.State == StoryStateSuppressed || survivorRec.WasSuppressed ||
+					retiredRec.State == StoryStateSuppressed || retiredRec.WasSuppressed {
+					survivorRec.State = StoryStateActive
+					survivorRec.WasSuppressed = true
+					if survivorRec.SuppressionReason == "" && retiredRec.SuppressionReason != "" {
+						survivorRec.SuppressionReason = retiredRec.SuppressionReason
+					}
+					stories[survivor] = survivorRec
+				}
+			}
+
 			// Migrate the full key space, including signals older than
 			// BatchWindow: a merge is a key-space migration and is the
 			// documented exception to the stability rule.
@@ -508,6 +539,13 @@ func (t *Tracker[T]) recentreStory(
 	switch {
 	case latestAt.Before(now.Add(-t.cfg.ArchiveWindow)):
 		newState = StoryStateArchived
+	case prev.State == StoryStateSuppressed:
+		// Suppression is preserved through recent signal activity — only the
+		// archive window and an explicit Unsuppress/merge clear it. Without
+		// this the sweeper would silently reactivate every suppressed story
+		// with recent traffic, since a suppressed spam bucket is exactly the
+		// kind of story that keeps getting fresh members (spec 009 §2.3.3).
+		newState = StoryStateSuppressed
 	case latestAt.Before(now.Add(-t.cfg.SilenceWindow)):
 		newState = StoryStateDormant
 	default:
@@ -564,20 +602,22 @@ func sortedPlanKeys(p cluster.MergePlan) []uuid.UUID {
 	return out
 }
 
-// dedupeReassignments collapses EventSignalReassigned to one event per
-// (signal, story) pair, preserving order. Several facets of one signal landing
-// in one story is still one signal joining one story, and a subscriber that
-// synthesises per event must not be told about it once per facet.
+// dedupeReassignments collapses EventSignalReassigned and
+// EventSuppressedStorySignal to one event per (kind, signal, story) triple,
+// preserving order. Several facets of one signal landing in one story is
+// still one signal joining one story, and a subscriber that synthesises per
+// event must not be told about it once per facet.
 func dedupeReassignments[T any](events []StoryEvent[T]) []StoryEvent[T] {
-	type pair struct {
+	type key struct {
+		kind   EventKind
 		story  uuid.UUID
 		signal uuid.UUID
 	}
-	seen := make(map[pair]struct{}, len(events))
+	seen := make(map[key]struct{}, len(events))
 	out := events[:0]
 	for _, ev := range events {
-		if ev.Kind == EventSignalReassigned {
-			k := pair{ev.StoryID, ev.SignalID}
+		if ev.Kind == EventSignalReassigned || ev.Kind == EventSuppressedStorySignal {
+			k := key{ev.Kind, ev.StoryID, ev.SignalID}
 			if _, dup := seen[k]; dup {
 				continue
 			}

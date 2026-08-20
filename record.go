@@ -29,6 +29,8 @@ type storyRecord struct {
 	FrozenSigma        float64    `cbor:"10,keyasint,omitempty"`
 	ReactivatedAt      time.Time  `cbor:"11,keyasint,omitempty"`
 	StatsAt            time.Time  `cbor:"12,keyasint,omitempty"`
+	WasSuppressed      bool       `cbor:"13,keyasint,omitempty"`
+	SuppressionReason  string     `cbor:"14,keyasint,omitempty"`
 }
 
 // storyHot is the CBOR-serialised form of the hot metadata written by Ingest
@@ -80,31 +82,36 @@ func storyMetaFromRecord(id uuid.UUID, rec storyRecord) StoryMeta {
 		FrozenSigma:        rec.FrozenSigma,
 		ReactivatedAt:      rec.ReactivatedAt,
 		StatsAt:            rec.StatsAt,
+		WasSuppressed:      rec.WasSuppressed,
+		SuppressionReason:  rec.SuppressionReason,
 	}
 }
 
-// readStoryMeta reads and decodes story metadata for id from tx, overlaying
-// the hot state (keys.StoryHot) on top of the batch-owned record (keys.StoryMeta).
-func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
+// readStoryRecord reads and decodes the persisted record for id from tx,
+// overlaying the hot state (keys.StoryHot) on top of the batch-owned record
+// (keys.StoryMeta). It is the record-shaped counterpart of readStoryMeta,
+// used by callers that need to mutate and write the record back rather than
+// just read it.
+func (t *Tracker[T]) readStoryRecord(tx Tx, id uuid.UUID) (storyRecord, error) {
 	b, err := tx.Get(keys.StoryMeta(id))
 	if err != nil {
-		return StoryMeta{}, err
+		return storyRecord{}, err
 	}
 	if b == nil {
-		return StoryMeta{}, fmt.Errorf("story %s: %w", id, ErrNotFound)
+		return storyRecord{}, fmt.Errorf("story %s: %w", id, ErrNotFound)
 	}
 	var rec storyRecord
 	if err := cborStrictDecMode.Unmarshal(b, &rec); err != nil {
-		return StoryMeta{}, fmt.Errorf("decode story %s: %w", id, err)
+		return storyRecord{}, fmt.Errorf("decode story %s: %w", id, err)
 	}
 	bh, err := tx.Get(keys.StoryHot(id))
 	if err != nil {
-		return StoryMeta{}, err
+		return storyRecord{}, err
 	}
 	if bh != nil {
 		var hot storyHot
 		if err := cborStrictDecMode.Unmarshal(bh, &hot); err != nil {
-			return StoryMeta{}, fmt.Errorf("decode story hot %s: %w", id, err)
+			return storyRecord{}, fmt.Errorf("decode story hot %s: %w", id, err)
 		}
 		rec.State = hot.State
 		if hot.LastSignalAt.After(rec.LastSignalAt) {
@@ -113,6 +120,16 @@ func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
 		if !hot.ReactivatedAt.IsZero() {
 			rec.ReactivatedAt = hot.ReactivatedAt
 		}
+	}
+	return rec, nil
+}
+
+// readStoryMeta reads and decodes story metadata for id from tx, overlaying
+// the hot state (keys.StoryHot) on top of the batch-owned record (keys.StoryMeta).
+func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
+	rec, err := t.readStoryRecord(tx, id)
+	if err != nil {
+		return StoryMeta{}, err
 	}
 	return storyMetaFromRecord(id, rec), nil
 }

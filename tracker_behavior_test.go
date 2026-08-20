@@ -313,21 +313,33 @@ func TestTracker_Stories_Iterator(t *testing.T) {
 
 	activeID := uuid.NewSHA1(TrackerNamespace, []byte("iter-active"))
 	dormantID := uuid.NewSHA1(TrackerNamespace, []byte("iter-dormant"))
+	suppressedID := uuid.NewSHA1(TrackerNamespace, []byte("iter-suppressed"))
 	seedStory(t, tr, activeID, storyRecord{State: StoryStateActive, Centroid: []float32{1}, CreatedAt: time.Now()})
 	seedStory(t, tr, dormantID, storyRecord{State: StoryStateDormant, Centroid: []float32{1}, CreatedAt: time.Now()})
+	seedStory(t, tr, suppressedID, storyRecord{
+		State: StoryStateSuppressed, WasSuppressed: true, SuppressionReason: "spam",
+		Centroid: []float32{1}, CreatedAt: time.Now(),
+	})
 
 	ids := map[uuid.UUID]bool{}
 	for meta := range tr.Stories(StoryStateAny) {
 		ids[meta.ID] = true
 	}
-	assert.Equal(t, 2, len(ids))
+	assert.Equal(t, 3, len(ids))
 
 	ids = map[uuid.UUID]bool{}
 	for meta := range tr.Stories(StoryStateActive) {
 		ids[meta.ID] = true
 	}
-	assert.Len(t, ids, 1)
+	assert.Len(t, ids, 1, "Stories(StoryStateActive) must exclude suppressed and dormant stories")
 	assert.True(t, ids[activeID])
+
+	ids = map[uuid.UUID]bool{}
+	for meta := range tr.Stories(StoryStateSuppressed) {
+		ids[meta.ID] = true
+	}
+	assert.Len(t, ids, 1)
+	assert.True(t, ids[suppressedID])
 }
 
 func TestTracker_SignalsOf_Iterator(t *testing.T) {

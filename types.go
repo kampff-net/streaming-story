@@ -34,10 +34,27 @@ const (
 	// StoryStateAny is a sentinel for Stories() — iterates all states.
 	StoryStateAny StoryState = iota
 
-	StoryStateActive   // receiving signals or within SilenceWindow
-	StoryStateDormant  // no signals for SilenceWindow; membership locked; can reactivate
-	StoryStateArchived // no signals for ArchiveWindow; terminal; signals retained
+	StoryStateActive     // receiving signals or within SilenceWindow
+	StoryStateDormant    // no signals for SilenceWindow; membership locked; can reactivate
+	StoryStateArchived   // no signals for ArchiveWindow; terminal; signals retained
+	StoryStateSuppressed // marked unwanted (e.g. spam) via Tracker.Suppress; excluded from Active queries
 )
+
+// String returns the lower-case name of s, or "unknown" for an unrecognized value.
+func (s StoryState) String() string {
+	switch s {
+	case StoryStateActive:
+		return "active"
+	case StoryStateDormant:
+		return "dormant"
+	case StoryStateArchived:
+		return "archived"
+	case StoryStateSuppressed:
+		return "suppressed"
+	default:
+		return "unknown"
+	}
+}
 
 // Embedding is one facet's vector. It is an alias rather than a defined type:
 // every vector in this library and in its callers is already []float32, and a
@@ -99,6 +116,14 @@ type StoryMeta struct {
 	FrozenSigma        float64
 	ReactivatedAt      time.Time
 	StatsAt            time.Time
+
+	// WasSuppressed is set the moment a story is first suppressed and is
+	// never cleared, including across Unsuppress: it is the historical marker
+	// that this story was, at some point, judged unwanted.
+	WasSuppressed bool
+	// SuppressionReason is the reason passed to the most recent Suppress call.
+	// It is retained across Unsuppress and auto-unsuppression on merge.
+	SuppressionReason string
 }
 
 // EventKind identifies the type of a StoryEvent.
@@ -113,6 +138,9 @@ const (
 	EventStoryRetired                      // batch emptied the story; its record was deleted
 	EventStoryDormant                      // story crossed SilenceWindow
 	EventStoryArchived                     // story crossed ArchiveWindow
+	EventStorySuppressed                   // Tracker.Suppress marked the story suppressed
+	EventStoryUnsuppressed                 // Tracker.Unsuppress, or a merge, cleared suppression
+	EventSuppressedStorySignal             // a signal joined a story that remained suppressed
 	EventBatchComplete                     // one per batch run; BatchSummary is populated
 	EventBufferOverflow                    // subscriber channel full; events were dropped
 )

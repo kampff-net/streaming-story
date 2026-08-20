@@ -245,3 +245,24 @@ func (t *Tracker[T]) patchStoryIndex(id uuid.UUID, lastAt time.Time, reactivated
 		}
 	}
 }
+
+// patchStoryIndexState overwrites the in-memory state for a story after a
+// Suppress or Unsuppress commit. Those calls write the store directly,
+// outside the batch cycle that otherwise keeps storyIndex in sync, so without
+// this the Draft phase would keep matching against the pre-call state (and,
+// for Ingest's own hot write, could clobber the new state back) until the
+// next batch rebuild.
+func (t *Tracker[T]) patchStoryIndexState(id uuid.UUID, state StoryState) {
+	idx := t.storyIndex.Load()
+	if idx == nil {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for i, sid := range idx.ids {
+		if sid == id {
+			idx.metas[i].state = state
+			break
+		}
+	}
+}

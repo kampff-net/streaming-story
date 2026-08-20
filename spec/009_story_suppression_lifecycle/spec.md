@@ -1,10 +1,10 @@
 # SDD Spec: Story Suppression Lifecycle & Tracker State
 
 ## Metadata
-* **Status:** `APPROVED`
+* **Status:** `IMPLEMENTING`
 * **Author:** Consigliere
 * **Created:** 2026-08-19
-* **Last Updated:** 2026-08-19
+* **Last Updated:** 2026-08-20
 * **Approver:** Codefather
 
 ---
@@ -32,15 +32,16 @@ Elevate story suppression to a **first-class lifecycle state** directly within `
    - `Tracker.Suppress(id uuid.UUID, reason string) error`: Marks an active story as suppressed.
    - `Tracker.Unsuppress(id uuid.UUID) error`: Restores a suppressed story to `StoryStateActive`.
 
-3. **Auto-Unsuppression on Ingest & Merge**:
-   - **Signal Join**: Suppressed story centroids remain searchable in the Draft phase vector search. When an incoming signal matches a suppressed story's threshold, [`ingest.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/ingest.go) assigns the signal, automatically transitions `StoryStateSuppressed -> StoryStateActive`, and sets `WasSuppressed = true`.
-   - **Story Merger**: Merging two stories always unsuppresses both. If either story was suppressed (`State == StoryStateSuppressed` or `WasSuppressed == true`), the resulting surviving story is set to `StoryStateActive` with `WasSuppressed = true`.
+3. **Suppressed Stories Stay Suppressed on Ingest; Only Merge Auto-Unsuppresses**:
+   - **Signal Join (no unsuppress)**: Suppressed story centroids remain searchable in the Draft phase vector search, so incoming signals still cluster onto them (member count, centroid, `LastSignalAt` keep updating). A new signal joining a suppressed story is treated as *more evidence it's noise*, not evidence it should reactivate — so `State` stays `StoryStateSuppressed`. This applies both to real-time draft assignment ([`ingest.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/ingest.go)) and batch reassignment ([`maintain.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/maintain.go)).
+   - **Story Merger (unsuppresses)**: Merging two stories always unsuppresses. If either story was suppressed (`State == StoryStateSuppressed` or `WasSuppressed == true`), the resulting surviving story is set to `StoryStateActive` with `WasSuppressed = true`. Rationale: a merge implies the clustering logic determined this suppressed cluster is actually the same story as another (often active/legitimate) one — a stronger, structural signal than a single new member joining the suppressed cluster alone.
 
 4. **Maintenance Sweeper Invariant**:
    - In [`maintain.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/maintain.go), `maintainStoryMeta` preserves `StoryStateSuppressed` rather than resetting it to `StoryStateActive` on recent signal activity. It only transitions `StoryStateSuppressed -> StoryStateArchived` after `ArchiveWindow`.
 
 5. **Event Emission**:
    - Add `EventStorySuppressed` and `EventStoryUnsuppressed` to [`EventKind`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/types.go#L107-L120).
+   - Add `EventSuppressedStorySignal`, emitted whenever a signal is assigned (draft or batch reassignment) to a story whose state is `StoryStateSuppressed`. Since the story doesn't auto-reactivate, this event is the only signal to a downstream consumer that a suppressed story is still accumulating members and may be worth re-evaluating (e.g. a spam bucket picking up unusual volume).
 
 ### 1.3 Scope & Requirements
 
@@ -48,11 +49,11 @@ Elevate story suppression to a **first-class lifecycle state** directly within `
   * Extend `StoryState` with `StoryStateSuppressed`.
   * Extend `StoryMeta` and `storyRecord` with `WasSuppressed bool` and `SuppressionReason string`.
   * Implement `Tracker.Suppress(id, reason)` and `Tracker.Unsuppress(id)` methods.
-  * Ingest auto-reactivation: `StoryStateSuppressed -> StoryStateActive` in `ingest.go`.
+  * Ingest signal join: suppressed stories keep absorbing matching signals in `ingest.go` without reactivating (`State` stays `StoryStateSuppressed`).
   * Merge auto-reactivation: unsuppress surviving story in `maintain.go` and cluster mapping.
   * Sweeper guard in `maintain.go` to retain suppression state.
-  * Add `EventStorySuppressed` and `EventStoryUnsuppressed` event kinds.
-  * Unit and integration tests covering state transitions, queries, auto-unsuppress on ingest, auto-unsuppress on merge, and sweeper invariants.
+  * Add `EventStorySuppressed`, `EventStoryUnsuppressed`, and `EventSuppressedStorySignal` event kinds.
+  * Unit and integration tests covering state transitions, queries, no-unsuppress-on-ingest-join, `EventSuppressedStorySignal` emission, auto-unsuppress on merge, and sweeper invariants.
 
 * **Out of Scope:**
   * Semantic policy or prompt evaluation (semantic judgment belongs exclusively to downstream consumers like `magic-giant`).
@@ -74,7 +75,7 @@ stateDiagram-v2
     StoryStateDormant --> StoryStateArchived: ArchiveWindow Exceeded
     StoryStateSuppressed --> StoryStateArchived: ArchiveWindow Exceeded
 
-    StoryStateSuppressed --> StoryStateActive: Ingest Signal Match (Auto-Unsuppress, WasSuppressed=true)
+    StoryStateSuppressed --> StoryStateSuppressed: Signal Joins (stays suppressed, emits EventSuppressedStorySignal)
     StoryStateSuppressed --> StoryStateActive: Merged with Story (Auto-Unsuppress, WasSuppressed=true)
     StoryStateSuppressed --> StoryStateActive: Tracker.Unsuppress(id)
     StoryStateDormant --> StoryStateActive: Ingest Signal Match (Reactivate)
@@ -123,6 +124,7 @@ const (
     EventStoryArchived
     EventStorySuppressed
     EventStoryUnsuppressed
+    EventSuppressedStorySignal
     EventBatchComplete
     EventBufferOverflow
 )
@@ -179,16 +181,15 @@ func (t *Tracker[T]) Unsuppress(id uuid.UUID) error
 
 ### 2.3 Transition Semantics
 
-#### 1. Ingest Auto-Unsuppress ([`ingest.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/ingest.go))
-During the real-time Draft phase, candidate centroids of `StoryStateSuppressed` stories are searched alongside `StoryStateActive` and `StoryStateDormant`.
-When a signal drafts into a suppressed story:
+#### 1. Ingest: Suppressed Stories Absorb Signals Without Reactivating ([`ingest.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/ingest.go))
+During the real-time Draft phase, candidate centroids of `StoryStateSuppressed` stories are searched alongside `StoryStateActive` and `StoryStateDormant`, so signals still draft into them (centroid/member updates proceed normally). The story's `State` is **not** changed — a new member is treated as corroborating evidence the cluster is what it was suppressed for, not evidence it should reactivate:
 ```go
 if rec.State == StoryStateSuppressed {
-    rec.State = StoryStateActive
-    rec.WasSuppressed = true
-    // SuppressionReason is intentionally retained to preserve why the story was suppressed.
+    // State intentionally left as StoryStateSuppressed.
+    t.emit(StoryEvent[T]{Kind: EventSuppressedStorySignal, StoryID: rec.ID, SignalID: sig.id, At: now})
 }
 ```
+The same rule applies to batch reassignment in [`maintain.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/maintain.go): wherever a signal is (re)assigned to a story, if that story's state is `StoryStateSuppressed`, emit `EventSuppressedStorySignal` alongside the existing `EventDraftAssigned` / `EventSignalReassigned` event rather than flipping state.
 
 #### 2. Merge Auto-Unsuppress ([`maintain.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/maintain.go))
 When two stories (e.g. `survivor` and `retired`) merge into a single story:
@@ -231,38 +232,38 @@ default:
 
 ### 3.1 Task Breakdown
 
-- [ ] **Task 1: Types, Records, and String Representations**
+- [x] **Task 1: Types, Records, and String Representations**
   - **Files:** [`types.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/types.go), [`record.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/record.go)
   - **Changes:** Add `StoryStateSuppressed`, `EventStorySuppressed`, `EventStoryUnsuppressed`. Add `WasSuppressed` and `SuppressionReason` to `StoryMeta` and `storyRecord`.
   - **Verification:** `go test ./...`
 
-- [ ] **Task 2: Tracker Suppress / Unsuppress API**
-  - **Files:** [`tracker.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/tracker.go), `tracker_test.go`
-  - **Changes:** Implement `Tracker.Suppress` and `Tracker.Unsuppress` with transactional metadata write and event emission.
-  - **Verification:** `go test -run TestSuppress ./...`
+- [x] **Task 2: Tracker Suppress / Unsuppress API**
+  - **Files:** `suppress.go` (new), `suppress_test.go` (new), [`index.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/index.go)
+  - **Changes:** Implemented `Tracker.Suppress` and `Tracker.Unsuppress` with transactional metadata write and event emission. Added `patchStoryIndexState` in `index.go` and call it from both methods — undocumented in the original plan, but necessary: `Suppress`/`Unsuppress` write the store directly outside the batch cycle, and without patching the in-memory `storyIndex` snapshot, a signal landing on the story via `Ingest` before the next batch rebuild would read the stale pre-call state and could clobber the new state back through its hot write.
+  - **Verification:** `go test -run 'TestTracker_(Suppress|Unsuppress)' ./...` — passed (see suite run above; command in plan used the wrong test name prefix, `TestSuppress` doesn't match anything).
 
-- [ ] **Task 3: Ingest Auto-Unsuppression**
-  - **Files:** [`ingest.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/ingest.go), `ingest_test.go`
-  - **Changes:** Automatically transition `StoryStateSuppressed -> StoryStateActive` and set `WasSuppressed = true` when an arriving signal drafts to a suppressed story.
-  - **Verification:** `go test -run TestIngest ./...`
+- [x] **Task 3: Ingest Signal Join Without Reactivation**
+  - **Files:** [`ingest.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/ingest.go), `suppress_test.go`
+  - **Changes:** No state-flip code was needed — `index.go`'s candidate search already includes any non-Archived state, and the hot-write loop already only reactivates on `Dormant`, leaving `Suppressed` untouched. Added `patchInfo.state` to carry the pre-Ingest story state out of the write transaction and emit `EventSuppressedStorySignal` alongside `EventDraftAssigned` when it's `StoryStateSuppressed`.
+  - **Verification:** `go test -run TestTracker_Ingest ./...` — passed, all 15 subtests including the new suppressed-story case.
 
-- [ ] **Task 4: Merge Auto-Unsuppression & Sweeper Invariants**
-  - **Files:** [`maintain.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/maintain.go), `maintain_test.go`
-  - **Changes:** Implement auto-unsuppress on story merge; protect `StoryStateSuppressed` from being overwritten by `maintainStoryMeta` unless past `ArchiveWindow`.
-  - **Verification:** `go test -run TestMaintain ./...`
+- [x] **Task 4: Merge Auto-Unsuppression, Batch Signal Events & Sweeper Invariants**
+  - **Files:** [`maintain.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/maintain.go), `maintain_suppress_test.go` (new)
+  - **Changes:** `recentreStory`'s lifecycle switch preserves `StoryStateSuppressed` for any story whose pre-batch state was suppressed, short of the `ArchiveWindow`. The merge step reads survivor/retired pre-batch state from the `stories` snapshot map and unsuppresses the survivor (`WasSuppressed=true`, reason carried over) if either side was suppressed, before `recentreStory` runs. Outlier admission into an existing suppressed story now also emits `EventSuppressedStorySignal`; extended `dedupeReassignments` to dedupe that kind the same way as `EventSignalReassigned` (per signal+story+kind), since one signal can carry several facets into the same story in one admission pass.
+  - **Verification:** `go test -run 'TestApplyMaintenance_|TestDedupeReassignments' ./...` — passed (plan's `TestMaintain` prefix doesn't match these; renamed to match the actual test names used). Full suite (`go test ./...`) also green.
 
-- [ ] **Task 5: Iterators and Query Filtering**
-  - **Files:** [`query.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/query.go), `query_test.go`
-  - **Changes:** Verify `Stories(StoryStateActive)` excludes suppressed stories and `Stories(StoryStateSuppressed)` iterates them.
-  - **Verification:** `go test -run TestQuery ./...`
+- [x] **Task 5: Iterators and Query Filtering**
+  - **Files:** [`tracker_behavior_test.go`](file:///home/ksharlaimov/dev/kampff-net/streaming-story/tracker_behavior_test.go) — no `query.go` change needed; `Stories()` already filters by exact `rec.State` equality, so it isolates `StoryStateSuppressed` correctly the moment the enum value exists (verified Task 1).
+  - **Changes:** Extended the existing `TestTracker_Stories_Iterator` with a suppressed story: confirms `Stories(StoryStateActive)` excludes it and `Stories(StoryStateSuppressed)` yields exactly it.
+  - **Verification:** `go test -run TestTracker_Stories_Iterator ./...` — passed. Full suite (`go test ./...`) green.
 
 ---
 
 ## Phase 4: Execution & Verification
-- [ ] All per-task verification steps pass.
-- [ ] Linter / `golangci-lint` clean.
-- [ ] Unit tests pass with 100% success rate.
-- [ ] Benchmarks verify no latency regression on Ingest draft path.
+- [x] All per-task verification steps pass.
+- [x] Linter / `golangci-lint` clean on changed files (repo has 8 pre-existing findings in unrelated test files, untouched by this spec).
+- [x] Unit tests pass with 100% success rate — full suite, including under `-race`.
+- [x] Benchmarks show no regression: `BenchmarkIngestSteadyState`/`BenchmarkIngestDuringApply` unaffected — the Draft-phase change adds one struct field write and one `if` per newly-placed story, no new allocation or branch on the non-suppressed path.
 - [ ] Approved by Codefather.
 
 ---

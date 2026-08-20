@@ -125,6 +125,7 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 		lastAt      time.Time
 		reactivated bool
 		reactAt     time.Time
+		state       StoryState // state as of this Ingest call, before any reactivation
 	}
 	patched := make(map[uuid.UUID]patchInfo)
 
@@ -226,6 +227,7 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 				lastAt:      hot.LastSignalAt,
 				reactivated: reactivated,
 				reactAt:     hot.ReactivatedAt,
+				state:       meta.State,
 			}
 		}
 		return nil
@@ -247,6 +249,17 @@ func (t *Tracker[T]) Ingest(ctx context.Context, sig Signal[T]) ([]uuid.UUID, er
 			SignalID: sig.ID,
 			At:       eventNow,
 		})
+		// A suppressed story stays suppressed on a signal join (see Ingest's
+		// hot-write loop above); this is the only signal to a subscriber that
+		// it is still accumulating members and may be worth re-evaluating.
+		if patched[id].state == StoryStateSuppressed {
+			t.emit(StoryEvent[T]{
+				Kind:     EventSuppressedStorySignal,
+				StoryID:  id,
+				SignalID: sig.ID,
+				At:       eventNow,
+			})
+		}
 	}
 
 	return assigned, nil
