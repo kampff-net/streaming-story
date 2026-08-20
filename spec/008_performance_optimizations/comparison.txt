@@ -1,0 +1,167 @@
+Spec 008 — Task 7 Benchmark Comparison
+======================================
+
+Machine
+-------
+AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics, linux/amd64, go1.26.5.
+Otherwise idle. Both baseline.txt and new.txt were measured on this machine;
+a comparison across two machines measures the machines.
+
+Baseline: b5e8a55 (pre-implementation)
+After:    67bd978 + Task 8 revert
+Method:   go test -bench=. -benchmem -count 5 ./..., compared with benchstat.
+
+All latency and allocation figures below are MemStore numbers. MemStore is the
+only Store in this repo. The work this spec removes is on the read side, so on
+a durable store the remaining write transaction — page allocation and fsync —
+sets the floor and the end-to-end improvement is materially smaller. Do not
+read these as production promises (§2.7).
+
+These numbers are for the tree AFTER Task 8 reverted the two geometry changes.
+The revert cost nothing: measured against the pre-revert tree, every benchmark
+moved within noise (geomean -0.96%, all comparisons p > 0.05). Details in
+geometry_delta.txt.
+
+
+benchstat baseline.txt new.txt
+------------------------------
+goos: linux
+goarch: amd64
+pkg: go.kvsh.ch/streaming-story
+cpu: AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics  
+                     │  baseline.txt   │               new.txt               │
+                     │     sec/op      │    sec/op     vs base               │
+Batch-16                  2.140m ± ∞ ¹   1.672m ± ∞ ¹  -21.86% (p=0.008 n=5)
+BatchFacets/F1-16         4.917m ± ∞ ¹   1.790m ± ∞ ¹  -63.59% (p=0.008 n=5)
+BatchFacets/F3-16         7.418m ± ∞ ¹   3.470m ± ∞ ¹  -53.23% (p=0.008 n=5)
+IngestDuringApply-16      634.5n ± ∞ ¹   835.7n ± ∞ ¹  +31.71% (p=0.008 n=5)
+IngestSteadyState-16   1977.869µ ± ∞ ¹   9.269µ ± ∞ ¹  -99.53% (p=0.008 n=5)
+SignalsOf-16              422.6µ ± ∞ ¹   259.0µ ± ∞ ¹  -38.72% (p=0.008 n=5)
+geomean                   588.2µ         165.9µ        -71.80%
+¹ need >= 6 samples for confidence interval at level 0.95
+
+                     │  baseline.txt   │                new.txt                │
+                     │      B/op       │     B/op       vs base                │
+Batch-16                 860.4Ki ± ∞ ¹   777.8Ki ± ∞ ¹    -9.60% (p=0.008 n=5)
+BatchFacets/F1-16        2.127Mi ± ∞ ¹   1.401Mi ± ∞ ¹   -34.15% (p=0.008 n=5)
+BatchFacets/F3-16        3.163Mi ± ∞ ¹   2.325Mi ± ∞ ¹   -26.51% (p=0.008 n=5)
+IngestDuringApply-16       136.0 ± ∞ ¹     417.0 ± ∞ ¹  +206.62% (p=0.008 n=5)
+IngestSteadyState-16   258.319Ki ± ∞ ¹   5.687Ki ± ∞ ¹   -97.80% (p=0.008 n=5)
+SignalsOf-16            109.38Ki ± ∞ ¹   81.48Ki ± ∞ ¹   -25.50% (p=0.008 n=5)
+geomean                  168.4Ki         89.12Ki         -47.07%
+¹ need >= 6 samples for confidence interval at level 0.95
+
+                     │ baseline.txt │               new.txt               │
+                     │  allocs/op   │  allocs/op    vs base               │
+Batch-16               9.148k ± ∞ ¹   8.090k ± ∞ ¹  -11.57% (p=0.008 n=5)
+BatchFacets/F1-16      9.582k ± ∞ ¹   8.092k ± ∞ ¹  -15.55% (p=0.008 n=5)
+BatchFacets/F3-16      17.83k ± ∞ ¹   15.44k ± ∞ ¹  -13.42% (p=0.008 n=5)
+IngestDuringApply-16    6.000 ± ∞ ¹    9.000 ± ∞ ¹  +50.00% (p=0.008 n=5)
+IngestSteadyState-16   168.00 ± ∞ ¹    92.00 ± ∞ ¹  -45.24% (p=0.008 n=5)
+SignalsOf-16           1.812k ± ∞ ¹   1.412k ± ∞ ¹  -22.08% (p=0.008 n=5)
+geomean                1.191k         1.028k        -13.67%
+¹ need >= 6 samples for confidence interval at level 0.95
+
+pkg: go.kvsh.ch/streaming-story/internal/dist
+                      │ baseline.txt │              new.txt               │
+                      │    sec/op    │    sec/op     vs base              │
+CosineDistance-16       4.922µ ± ∞ ¹   4.945µ ± ∞ ¹       ~ (p=0.421 n=5)
+CosineDistanceUnit-16                  125.9n ± ∞ ¹
+geomean                 4.922µ         789.0n        +0.47%
+¹ need >= 6 samples for confidence interval at level 0.95
+
+                      │ baseline.txt │               new.txt               │
+                      │     B/op     │    B/op      vs base                │
+CosineDistance-16        0.000 ± ∞ ¹   0.000 ± ∞ ¹       ~ (p=1.000 n=5) ²
+CosineDistanceUnit-16                  0.000 ± ∞ ¹
+geomean                            ³                +0.00%               ³
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ summaries must be >0 to compute geomean
+
+                      │ baseline.txt │               new.txt               │
+                      │  allocs/op   │  allocs/op   vs base                │
+CosineDistance-16        0.000 ± ∞ ¹   0.000 ± ∞ ¹       ~ (p=1.000 n=5) ²
+CosineDistanceUnit-16                  0.000 ± ∞ ¹
+geomean                            ³                +0.00%               ³
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ summaries must be >0 to compute geomean
+
+
+§2.7 Targets
+------------
+
+| Metric | Target | Measured | Verdict |
+|---|---|---|---|
+| findNearestStories: zero store reads | zero | zero — searches activeStoryIndex in memory | MET |
+| findNearestStories: zero decodes | zero | zero — no CBOR decode on the path | MET |
+| findNearestStories: zero allocations per facet | zero | NOT zero — `cands` slice sized to the active population per call (index.go), plus `matches` | MISSED |
+| Steady-state Ingest latency | >=10x | 1977.9us -> 9.3us = 213x | MET |
+| BenchmarkBatch | >=5x | 2.140ms -> 1.672ms = 1.28x | MISSED |
+| BenchmarkBatchFacets/F1 | >=5x | 4.917ms -> 1.790ms = 2.75x | MISSED |
+| BenchmarkBatchFacets/F3 | >=5x | 7.418ms -> 3.470ms = 2.14x | MISSED |
+| Store footprint | >=50% reduction | 103519 -> 50393 bytes = -51.3% | MET |
+| Steady-state ingest allocations | >=90% reduction | bytes -97.8%; count -45.2% (168 -> 92) | MET on bytes, MISSED on count |
+| CosineDistanceUnit vs CosineDistance | >=2x at 1536 dim | 4829ns -> 123.5ns = 39x, but MOOT | see below |
+| Batch collect allocations | >=60% reduction | bytes 10454001 -> 4142787 = -60.4%; count 24307 -> 12635 = -48.0% | MET on bytes, MISSED on count |
+| activeStoryIndex resident memory | <= 8*dim+128 B/story, reported at 500 and 10k | 6312 B/story at dim=1536; 3.16 MB @ 500, 63.1 MB @ 10,000 (ceiling 12416) | MET |
+
+
+Shortfalls, stated plainly
+--------------------------
+
+1. Batch throughput: 1.28x-2.75x, against a >=5x target.
+   The target was set believing serialization dominated the batch. It does not.
+   CBOR and the collect-phase geometry took the serialization and vector cost
+   out — visible as -60.4% collect bytes and -34% BatchFacets/F1 B/op — but the
+   remaining time is clustering and maintenance, which this spec never touched.
+   5x was not reachable by the changes this spec contains. Reaching it means
+   attacking the clustering pass, which belongs to its own spec.
+
+2. The distance target is met and moot.
+   CosineDistanceUnit is 39x CosineDistance at 1536 dimensions, far past the
+   >=2x target, and that number is real. It buys nothing here. Every call site
+   the spec moved onto it measures a PROJECTED vector, which is not unit, and
+   making those vectors unit moved every cluster boundary in the corpus (§2.5).
+   Task 8 moved them all back. The pair ships correct, tested, benchmarked, and
+   uncalled. The 39x also explains itself: gonum ships amd64 assembly for the
+   dot product but runs a pure Go scalar loop for Nrm2, so removing the two norm
+   passes removed nearly all of the cost.
+
+3. findNearestStories still allocates.
+   The store reads and decodes are gone, which was the point. What remains is a
+   `cands` staging slice, materialized only to shorten the RLock hold, sized to
+   the active story population on every call. This is the direct cause of the
+   one regression in the suite:
+
+     IngestDuringApply   634.5ns -> 835.7ns  (+32%)
+                         136 B/op -> 417 B/op  (+207%)
+                         6 allocs/op -> 9 allocs/op  (+50%)
+
+   The old path read this metadata from the store under the write lock; the new
+   path copies it out of the index. Cheaper in absolute terms on the steady-state
+   path (which is 213x faster), more expensive on this one narrow benchmark that
+   measures Ingest latency while a batch holds the lock. The fix is to hold the
+   RLock across the distance loop, or to filter and score in one pass without
+   staging. Not done here; recorded.
+
+4. Allocation counts vs allocation bytes.
+   Two targets say "allocations" without saying which. Both are met on bytes and
+   missed on count. The changes replaced many small allocations with fewer large
+   ones and removed vector copies; bytes is the measure that tracks what was
+   changed. Recorded both ways rather than picking the flattering one.
+
+
+Peak batch heap
+---------------
+No transient copy of the collected set: projection is in place via
+geom.ProjectInPlace; corpusMeanOf and projectAll are gone. Resident cost is
+facets x dim x 4 bytes plus payload-free overhead. At the collect fixture size
+(400 signals x 3 facets x 256 dim) the collect phase allocates 4.14 MB per run,
+down from 10.45 MB.
+
+
+Geometry
+--------
+Unchanged. See geometry_delta.txt.

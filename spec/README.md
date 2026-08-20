@@ -13,6 +13,18 @@
 | 004 | KV Storage Schema & Persistence Layer | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](004_storage_persistence_layer/spec.md) |
 | 005 | Event Streaming & Iterators API | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](005_event_streaming_iterators/spec.md) |
 | 009 | Story Suppression Lifecycle & Tracker State | 🔷 `APPROVED` | 2026-08-19 | 2026-08-19 | [spec.md](009_story_suppression_lifecycle/spec.md) |
+| 008 | High-Throughput Performance & Latency Optimizations | 🔷 `EXECUTION` | 2026-08-18 | 2026-08-20 | [spec.md](008_performance_optimizations/spec.md) |
+
+> Tasks 0-8 implemented and measured; `comparison.txt` and `geometry_delta.txt`
+> record the numbers. Steady-state ingest is 213x faster, the store footprint
+> halved, collect allocations are down 60%. Task 8 was added after a
+> differential test against the pre-change tree found three logic changes inside
+> what was meant to be a storage-only spec; two were reverted at no measurable
+> cost and the reference corpus now reproduces the pre-change clustering on
+> every digit (§2.5). One item keeps it out of `COMPLETED`:
+> `BenchmarkIngestDuringApply` regressed 32%, traced to a staging slice in
+> `findNearestStories`. Batch throughput reached 1.3-2.8x against a 5x target;
+> the remaining cost is clustering, which this spec never touched.
 
 > Spec 006 supersedes the batch re-clustering pipeline in 002 and the cluster
 > mapping engine in 003. Both remain listed for the history.
@@ -41,6 +53,4 @@
 
 ## Proposed
 
-| # | Feature | Status | Created | Updated | Spec |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| 008 | High-Throughput Performance & Latency Optimizations | 💡 `PROPOSAL` | 2026-08-18 | 2026-08-19 | [spec.md](008_performance_optimizations/spec.md) |
+_None._

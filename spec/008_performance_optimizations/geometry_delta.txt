@@ -1,0 +1,154 @@
+Spec 008 — Geometry Delta
+=========================
+
+Result: NO GEOMETRY CHANGE.
+
+The reference corpus reproduces the pre-change clustering on every digit, and
+the stability suite is fully green against spec 006's pinned snapshot. This is
+what the spec's premise requires: 008 breaks the on-disk format and the public
+codec contract, and changes no math.
+
+It was not true when the implementation first landed. What follows is the
+measurement that found the difference, the bisect that attributed it, and the
+revert that closed it.
+
+Machine
+-------
+AMD Ryzen 7 PRO 7840U w/ Radeon 780M Graphics, linux/amd64, go1.26.5.
+
+Before: b5e8a55 (pre-implementation)
+After:  67bd978 + Task 8 revert
+Corpus: 596 vectors, dim 3072, one facet per signal.
+Command:
+  CORPUS=testdata/corpus_embeddings.txt go test -run TestCorpusProbe -v .
+
+
+Final state — before vs after
+-----------------------------
+
+                        BEFORE (b5e8a55)            AFTER (with Task 8 revert)
+  stories               32                          32
+  assigned              234                         234
+  outliers              362                         362
+  largest story         28                          28
+  size histogram        28 26 24 15 14 11 8 8 7     28 26 24 15 14 11 8 8 7
+                        7 7 5                       7 7 5
+
+  largest story geometry
+    n                   28                          28
+    radius              0.4595                      0.4595
+    gate                1.4158 (>0.55?)             1.4158 (>0.55?)
+    seedSep             0.8119                      0.8119
+    bestPartSep         0.3552                      0.3552
+    split               false                       false
+
+Identical on every field. Batches 1 through 5 are identical in both trees, so
+determinism and idempotency hold as they always did.
+
+Stability suite, both trees:
+  CORPUS=… REF006=… go test -run TestStability -v .
+  all six tests PASS, TestStability_SingleFacetMatchesSpec006 included.
+
+
+How the difference was found
+----------------------------
+
+Component-level differential. Both trees' `geom` and `dist` were copied into one
+scratch module under distinct import paths so the two versions link at once, and
+fed identical inputs. Divergence is reported as an angle, not as inequality: a
+bare != on float32 measures acos noise, not a change in the math.
+
+  Unit                                        bit-identical
+  Mean                                        bit-identical
+  Centroid, same input                        0.000 deg  (magnitude 12.46 -> 1.0,
+                                              which cosine does not see)
+  Project, single vector                      1.5e-06 deg  (acos noise)
+  Pairwise distance after projection          1.2e-07
+  CosineDistance vs CosineDistanceUnit
+    on genuinely unit vectors                 4.8e-07
+  ------------------------------------------------------------------
+  Centroid of a PROJECTED group               0.7175 deg     <-- diverged
+  Radius of a projected group                 +0.011113
+  Sigma of a projected group                  +0.005340
+
+Causation, not correlation: taking the OLD projected residuals, renormalizing
+each, and feeding them to the OLD Centroid reproduces the NEW centroid to
+0.000e+00 deg. Cosine distance is scale-invariant, so no pairwise distance ever
+moved. A centroid is a mean, and a mean is not scale-invariant. The old residual
+lengths spanned 0.4254 to 0.5196 — a 1.22x spread — and those lengths were
+implicit per-member weights. Renormalizing set every weight to 1.
+
+Sensitivity to how much mean is removed:
+
+  MeanRemoval   residual lengths     spread    centroid diverges
+  0.0           13.0225-14.8117      1.14x     0.0000 deg (Project returns early)
+  0.3            0.7645-0.7837       1.03x     0.0125 deg
+  0.6            0.5581-0.6089       1.09x     0.0775 deg
+  0.9            0.4254-0.5196       1.22x     0.7175 deg   <- the default
+  1.0            0.4113-0.5177       1.26x    94.9451 deg
+
+
+System-level bisect
+-------------------
+
+Component divergence does not tell you how much of the end result it explains.
+Each candidate was reverted against the reference corpus, one at a time:
+
+  tree                                     stories  assigned  outliers  largest  radius
+  pre (b5e8a55)                                 32       234       362       28  0.4595
+  post (67bd978)                                35       261       335       29  0.4561
+  post - residual renorm                        36       264       332       29  0.4593
+  post - residual renorm - threshold branch     36       264       332       29     -
+  post - unit mean only                         32       234       362       28  0.4599
+  post - residual renorm - unit mean            32       234       362       28  0.4595
+
+The last row is the pre-change result on every digit. The unit-mean change
+carries almost all of the difference; the residual renormalization accounts for
+one facet's placement on top of it; the threshold branch never fires on this
+corpus.
+
+
+What was changed, and what was reverted
+---------------------------------------
+
+1. REVERTED — the corpus mean was unit-normalized (`batch.go`,
+   `mean = geom.Unit(mean)`). `geom.Mean` returns the mean of unit vectors,
+   which is itself not unit; its length falls as the corpus spreads. `Project`
+   subtracts `Strength x Mean`, so normalizing the mean changed how much of the
+   shared direction came off: at the default MeanRemoval=0.9, roughly 0.72
+   became 0.90. Never declared anywhere. §2.5 explicitly claimed the corpus mean
+   was "bit-wise unaffected"; it was not.
+
+2. REVERTED — the projected residual was renormalized (`geom.ProjectInPlace`,
+   and `Projector.Project` through it). This one §2.5 did declare, as intended
+   and "not a regression to be tested away". It was required for
+   `CosineDistanceUnit` to be valid on residuals, so the norm-free distance and
+   the boundary shift were the same decision. Reverting it also reverts every
+   `*Unit` call site in `geom`, `internal/cluster`, and `index.go`.
+
+3. NOT REVERTED — `calcThreshold` gained a reactivation-staleness branch
+   (`threshold.go`): a story whose ReactivatedAt is newer than its StatsAt is
+   treated as cold-start. Latent on this corpus, so it does not appear in any
+   number above. It belongs to Task 6 rather than Task 5 and is left for its own
+   review, recorded here so it is not forgotten.
+
+
+What the revert cost
+--------------------
+
+Nothing measurable. Full benchmark suite, five runs, before and after the
+revert, compared with benchstat:
+
+  Batch                 ~ (p=0.151)
+  BatchFacets/F1        ~ (p=0.095)
+  BatchFacets/F3        ~ (p=0.095)
+  IngestDuringApply     ~ (p=0.056)
+  IngestSteadyState     ~ (p=0.548)
+  SignalsOf             ~ (p=0.548)
+  geomean            -0.96%
+
+Every comparison within noise; allocations identical. The 39x on the distance
+primitive never reached the batch, which is dominated by clustering. The gains
+this spec actually delivers — 213x steady-state ingest, -51% store footprint,
+-60% collect allocations — come from CBOR, the record split, and the in-memory
+story index. From the storage work, which is what the spec set out to change.

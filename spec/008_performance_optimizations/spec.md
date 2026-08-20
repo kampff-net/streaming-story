@@ -1,10 +1,10 @@
 # SDD Spec: 008 Performance & Latency Optimizations
 
 ## Metadata
-* **Status:** `PROPOSAL`
+* **Status:** `EXECUTION`
 * **Author:** Consigliere
 * **Created:** 2026-08-18
-* **Last Updated:** 2026-08-19
+* **Last Updated:** 2026-08-20
 * **Approver:** Codefather
 
 ---
@@ -56,6 +56,24 @@ specs**, so this one lands with less behavioral surface:
   profile that justifies it can be presented alongside it.
 * **`setFacetLoc`'s quadratic rewrite** of a signal's location set, described in
   §2.2.5.
+
+**Task 1 finding — gonum, re-verified against the pinned `v0.17.0`.** Both
+halves of §1.1's premise hold:
+
+* `f32.DotUnitary` ships `amd64` assembly. The declaration is in
+  `internal/asm/f32/stubs_amd64.go:67` with the implementation in
+  `dotunitary_amd64.s`; the pure Go fallback in `stubs_noasm.go:70` is reached
+  only off `amd64`. Nothing this spec does displaces it — `Dot` keeps routing
+  through `blas32`, and no SIMD library was added (§2.4).
+* `Nrm2` routes to `f32.L2NormUnitary`, which is pure Go in
+  `internal/asm/f32/l2norm.go:10`. No build tag, no assembly, no alternative
+  implementation.
+
+That asymmetry is the whole result. The dot product was already vectorized and
+the two norm passes were not, so removing the norms removed nearly all of the
+cost: 4829 ns to 123.5 ns at 1536 dimensions, a factor of 39 rather than the
+two-to-three §2.7 expected. gonum stays pinned; a bump that changes either file
+invalidates this finding and the number with it.
 
 `MemStore`'s $O(N \log N)$ key sort per scan was considered and dropped from scope: it is test-only infrastructure, and its cost is a constant factor on the benchmark harness rather than on any production path. Benchmarks are read as relative before/after measurements on the same store, never as absolute throughput.
 
@@ -128,6 +146,23 @@ All structured serialization standardizes on canonical `github.com/fxamacker/cbo
 with **integer keys**, matching `magic-giant`'s convention (`cbor:"N,keyasint"`).
 String keys would put a field name beside every float vector in a store whose
 whole point is compactness.
+
+**Task 1 findings — verified before any encoding code was written**, and covered
+by the three tests in `cbor_test.go`:
+
+* **`uuid.UUID` encodes as a byte string, not a 16-element array.** It is
+  `[16]byte` and implements `encoding.BinaryMarshaler`, which cbor honours: the
+  encoded form is 17 bytes, `0x50` (major type 2, length 16) followed by the raw
+  bytes. No explicit marshaling was needed
+  (`TestCBOR_UUIDEncoding`).
+* **`TimeRFC3339Nano` round-trips to nanosecond fidelity** through both the
+  lenient and the strict decode mode (`TestCBOR_TimeNanosecondRoundTrip`). The
+  option is pinned in `mustEncMode` alongside `TimeTag = EncTagNone`; the
+  default would have truncated to whole seconds.
+* **`ExtraDecErrorUnknownField` behaves as assumed on `keyasint` structs.** A
+  value carrying key `2` decodes cleanly under `cborDecMode` and errors under
+  `cborStrictDecMode` (`TestCBOR_StrictUnknownField`), which is exactly the
+  split the two modes were introduced for.
 
 ```go
 // Encode and decode options are pinned explicitly. The defaults are wrong for
@@ -851,13 +886,13 @@ rather than a discovery.
   path.
 * `Tracker[T]` public signatures unchanged.
 * `dist` gains `DotUnit` and `CosineDistanceUnit`; `CosineDistance` and
-  `CosineSimilarity` keep their current contracts and their existing callers.
-  The `*Unit` pair is used only where §2.2.3 establishes the invariant: the
-  clustering passes in `internal/cluster`, `geom.Measure`/`Radius` on projected
-  members, and the index search. Every other caller — anything measuring a
-  caller-supplied or store-loaded vector that has not been through `Project` —
-  stays on the guarded entry point, and Task 5 enumerates the call sites it
-  moved rather than converting by search-and-replace.
+  `CosineSimilarity` keep their current contracts and **all** of their callers.
+  The `*Unit` pair was moved onto the clustering passes, `geom.Measure`/`Radius`,
+  and the index search, and then moved back — every one of those paths measures
+  a projected residual, which is not unit (§2.5). The pair ships unused: it is
+  correct, tested, and benchmarked, and the invariant it needs holds for stored
+  embeddings before projection, which is where a future caller will find it.
+  Nothing in the library calls it today.
 * No new module dependency beyond `github.com/fxamacker/cbor/v2`. `gonum`
   remains the vector math, at its pinned version.
 * Internal only, listed because a reader of §2.2.2 will look for them:
@@ -883,44 +918,48 @@ Approved by the Codefather on 2026-08-19, recorded so they are not reopened:
 
 ### 2.5 Declared Behavioral Changes
 
-Two changes move cluster boundaries. Both are intended; neither is a regression
-to be tested away. A third — replacing `Split`'s medoid partitioning — was
-deferred out of this spec entirely (§1.1).
+**None. This section previously declared two, and both were withdrawn after the
+differential test in Task 8 measured them.** The record of what was claimed and
+what was found is kept here, because the claim was wrong in a way worth
+remembering.
 
-1. **Unit residuals change centroid direction.** Renormalizing a projected
-   vector changes no pairwise cosine — direction is preserved, which is exactly
-   why `Project` does not renormalize today, and why its doc comment says so.
-   What does change is `geom.Centroid`: it currently averages non-unit
-   residuals, so a longer residual pulls the mean harder. Renormalizing after
-   the mean subtraction (§2.2.3) makes every member weigh the same, moving the
-   centroid direction and with it membership, `Radius`, `MeanDistance`, and
-   `Sigma`. The `Project` doc comment is rewritten accordingly.
+**What was claimed.** That renormalizing the projected residual moves cluster
+boundaries, that this is intended rather than a regression, and that normalizing
+at ingest "changes nothing on its own" so "the corpus mean and every pairwise
+distance are bit-wise unaffected by where that normalization happened."
 
-   Note this comes from renormalizing the **residual**, not from normalizing at
-   ingest. Normalizing the input changes nothing on its own: `Project` already
-   calls `Unit` on what it is given, and `geom.Mean` already normalizes every
-   vector it sums, so the corpus mean and every pairwise distance are bit-wise
-   unaffected by where that normalization happened.
-2. **`1 - Dot` is not bit-identical to `dot / (‖a‖ · ‖b‖)`.** Removing the
-   division removes a rounding step, so distances shift in the last bits and an
-   exact tie can fall the other way. Normalizing at ingest instead of at each
-   read moves rounding in the same way: a vector is scaled once, at the door,
-   rather than on every comparison. Both are arithmetic, not policy, and are
-   listed so a small unexplained delta in the corpus probe is not mistaken for a
-   bug in the change above.
+**What was found.** The second half of that claim was false. Three logic changes
+had entered a spec whose whole premise (§1.2, §2.6) is that only the storage
+format changes:
 
-   What this does **not** cost is reproducibility. There is one dot product
-   implementation, chosen at compile time by `GOARCH` and not at runtime by CPU
-   feature detection (§2.4), so two machines of the same architecture produce
-   identical groupings — which is the property the stability suite and the
-   committed corpus snapshot depend on. Cross-architecture identity was never
-   claimed and is not claimed now.
+1. **The corpus mean was unit-normalized** (`batch.go`, `mean = geom.Unit(mean)`).
+   `geom.Mean` returns a mean of unit vectors, which is itself **not** unit —
+   its length falls as the corpus spreads. `Project` subtracts `Strength × Mean`,
+   so normalizing the mean changed how much of the shared direction was removed:
+   at the default `MeanRemoval = 0.9`, roughly 0.72 became 0.90. This was the
+   dominant cause and was never declared anywhere.
+2. **The projected residual was renormalized** (`geom.ProjectInPlace`). This one
+   was declared. Cosine distance is scale-invariant, so no pairwise distance
+   moved — but `Centroid` averages residuals, and a mean is not scale-invariant.
+   The old residual lengths (measured: 0.4254 to 0.5196, a 1.22x spread) were
+   implicit per-member weights; renormalizing set them all to 1.
+3. **A reactivation-staleness branch was added to `calcThreshold`**
+   (`threshold.go`), changing the admission threshold for a reactivated story.
+   Latent on the reference corpus, so it did not show up in the corpus probe.
+   New behavior in a performance change regardless. **Still present** — it is
+   Task 6's, not Task 5's, and is left for its own review.
 
-Acceptance for both: `corpus_probe` and the stability suite are run before and
-after, and the resulting group counts and sizes are recorded in
-`spec/008_performance_optimizations/geometry_delta.txt` with a one-line reading
-of whether separation held. Idempotency and determinism must hold exactly;
-groupings may move, and the record says by how much.
+**Resolution.** Items 1 and 2 were reverted. The reference corpus now reproduces
+the pre-change clustering on every digit, and `TestStability_SingleFacetMatchesSpec006`
+passes against spec 006's pinned snapshot. The revert cost nothing measurable:
+every benchmark moved within noise (`geomean -0.96%`, all comparisons `p > 0.05`).
+The `≥2x` distance target in §2.7 was met by the primitive in isolation and then
+made moot, because no production path holds unit vectors at the point it measures.
+
+**Acceptance, restated.** This spec changes the on-disk format and the public
+codec contract. It changes **no** geometry. `corpus_probe` and the stability
+suite must reproduce the pre-change grouping exactly, and `geometry_delta.txt`
+records that they do.
 
 ### 2.6 Compatibility
 
@@ -962,7 +1001,7 @@ results. No baseline exists until Task 0 runs.
 | `BenchmarkBatch` / `BenchmarkBatchFacets` | ≥5x | `MemStore` |
 | Store footprint | ≥50% reduction | Sum of encoded value bytes, all keys |
 | Steady-state ingest allocations | ≥90% reduction | `MemStore` |
-| `dist.CosineDistanceUnit` vs `dist.CosineDistance` | ≥2x at 1536 dimensions | n/a |
+| `dist.CosineDistanceUnit` vs `dist.CosineDistance` | ≥2x at 1536 dimensions — **moot**: met by the primitive (39x), but no production path holds unit vectors where it measures (§2.5) | n/a |
 | Batch collect allocations | ≥60% reduction (three `dim`-sized allocations per facet become one, §2.2.3) | `MemStore` |
 | Peak batch heap | No transient copy of the collected set; resident ≈ facets × dim × 4 bytes + payload-free overhead | `MemStore`, reported in absolute terms at the corpus size the stability suite uses |
 | Resident memory of `activeStoryIndex` | ≤ `8 × dim + 128` bytes per non-archived story, and reported in absolute terms at 500 and 10,000 stories | n/a |
@@ -1007,7 +1046,7 @@ this table.
 
 ### 3.1 Task Breakdown
 
-- [ ] **Task 0: Capture Pre-Optimization Benchmark Baseline**
+- [x] **Task 0: Capture Pre-Optimization Benchmark Baseline**
   - Run the existing benchmark suite; record timings and allocations.
   - Record the machine alongside the numbers — CPU model, `GOARCH`, Go version,
     and whether the machine was otherwise idle. A `-count 5` run compared across
@@ -1017,7 +1056,7 @@ this table.
   - **Files:** `bench_test.go`, `spec/008_performance_optimizations/baseline.txt`
   - **Verification:** `go test -bench=. -benchmem -count 5 ./... | tee spec/008_performance_optimizations/baseline.txt`, and `benchstat` is used for every before/after comparison in Task 7 — a bare pair of numbers from `-count 5` is not a result.
 
-- [ ] **Task 1: Add and Verify the CBOR Dependency**
+- [x] **Task 1: Add and Verify the CBOR Dependency**
   - Add `github.com/fxamacker/cbor/v2` at **v2.7.0** — the version `magic-giant`
     pins, confirmed present in the local module cache, so this task needs no
     network access.
@@ -1034,7 +1073,7 @@ this table.
   - **Files:** `go.mod`, `go.sum`, this spec (§1.1, §2.2.1)
   - **Verification:** `go mod tidy && go build ./... && go vet ./...`, plus a scratch round-trip test for each of the three items above
 
-- [ ] **Task 2: Full CBOR Cutover**
+- [x] **Task 2: Full CBOR Cutover**
   - Replace `json` marshaling in `record.go:88`, `record.go:99`, `record.go:399`,
     `record.go:425`, `ingest.go:305`, `query.go:47`, `batch.go:174` with
     `cborEncMode` / `cborStrictDecMode` (§2.2.1). Internal records use the strict
@@ -1058,7 +1097,7 @@ this table.
   - **Files:** `store.go`, `record.go`, `query.go`, `batch.go`, `ingest.go`, `types.go`, `HISTORY.md`, `examples/*/main.go`, `*_test.go`
   - **Verification:** `go test -v ./...`, and `grep -rn JSONCodec .` returns nothing
 
-- [ ] **Task 3: CBOR Location Index**
+- [x] **Task 3: CBOR Location Index**
   - Replace the hand-written JSON encoder and parser in `internal/keys` with
     CBOR-tagged `[]FacetLoc` (§2.2.5). `EncodeSignalLocSet` and
     `ParseSignalLocSet` become thin wrappers over the shared encode/decode
@@ -1066,7 +1105,7 @@ this table.
   - **Files:** `internal/keys/keys.go`, `internal/keys/keys_test.go`
   - **Verification:** `go test -v ./internal/keys ./...`, including round-trip of all three facet states and rejection of a truncated value and a legacy JSON value
 
-- [ ] **Task 4: Payload-Free Header Extraction for `collectBatch`**
+- [x] **Task 4: Payload-Free Header Extraction for `collectBatch`**
   - Implement `cborSignalHeader` **without a `Data` field** (§2.2.4) and the
     mandatory full-decode fallback for any codec that is not `CBORCodec[T]`,
     with a test that exercises the fallback through a custom codec. No
@@ -1074,7 +1113,7 @@ this table.
   - **Files:** `batch.go`, `record.go`, `codec_test.go`
   - **Verification:** `go test -v -run TestBatch ./...` plus an allocation assertion showing the header path allocates nothing proportional to payload size — measured with a large `T`, since a small one hides the difference
 
-- [ ] **Task 5: Unit Embeddings, Collect-Phase Geometry, Norm-Free Distance**
+- [x] **Task 5: Unit Embeddings, Collect-Phase Geometry, Norm-Free Distance**
   - **Normalize at ingest** (§2.2.3): unit-normalize every facet in `Ingest`
     immediately after dimension validation, before the canonical write and
     before the draft projection. Add and export `ErrZeroEmbedding`; reject a
@@ -1089,14 +1128,23 @@ this table.
     add `geom.ProjectInPlace`; delete `corpusMeanOf` and `projectAll`. Drop
     dimension-mismatched facets at collect and count them in the summary.
     `Projector` and `Projector.Project` stay for the ingest path.
+    **The accumulated mean must not be unit-normalized** — `geom.Mean` returns a
+    non-unit mean and `Project` subtracts a scaled multiple of it, so
+    normalizing changes how much of the shared direction is removed (§2.5).
+    **`ProjectInPlace` must not renormalize the residual**, for the same reason
+    the old `Project` did not.
   - Add `DotUnit` / `CosineDistanceUnit` in `internal/dist` alongside the
     existing guarded entry points, keeping the length guard and the clamp and
     dropping only the norms and the division. No new dependency; `Dot` keeps
     routing through `blas32`.
-  - Move only the call sites §2.3 enumerates onto the `*Unit` pair, and list
-    them in the commit message. Everything else stays on `CosineDistance`.
-  - Unit-normalize centroids at write time in `geom` and `record.go` — a
-    centroid of unit vectors is not itself unit.
+  - ~~Move only the call sites §2.3 enumerates onto the `*Unit` pair.~~
+    **Withdrawn (Task 8).** Every one of those paths measures a projected
+    residual, which is not unit. Making them unit required renormalizing the
+    residual, which moved every cluster boundary (§2.5). All call sites stay on
+    `CosineDistance`; the `*Unit` pair ships unused.
+  - Unit-normalize centroids at write time in `geom` and `record.go`. Retained:
+    `Centroid` returns `Unit(sum)` where it previously returned `sum/n`, which is
+    the same direction and therefore the same cosine — verified at 0.000 deg.
   - Add the invariant test (§2.2.3), and the no-established-mean batch test that
     covers the case which used to take the identity path.
   - Add `hostileStore` and run a batch and an ingest against it (§2.2.3);
@@ -1106,7 +1154,7 @@ this table.
   - **Files:** `ingest.go`, `types.go`, `query.go`, `points.go`, `batch.go`, `record.go`, `store.go`, `HISTORY.md`, `internal/dist/dist.go`, `internal/dist/dist_test.go`, `internal/geom/geom.go`, `internal/geom/geom_test.go`, `query_test.go`, `tracker_test.go`, `memstore_test.go`
   - **Verification:** `go test -v ./internal/dist ./internal/geom ./...`, then `corpus_probe` and stability; record the delta (§2.5) and the collect-phase allocation counts for §2.7
 
-- [ ] **Task 6: Split Story Record & In-Memory Story Index**
+- [x] **Task 6: Split Story Record & In-Memory Story Index**
   - **Split the story record** per §2.2.1: `storyRecord` (`s:{id}:m`, batch-owned,
     gains `StatsAt`) and `storyHot` (`s:{id}:h`, state and timestamps). Add
     `keys.StoryHot` and `keys.ParseStoryHot`.
@@ -1147,13 +1195,34 @@ this table.
   - **Files:** `internal/keys/keys.go`, `record.go`, `tracker.go`, `ingest.go`, `batch.go`, `maintain.go`, `threshold.go`, `query.go`, `README.md`, `tracker_behavior_test.go`, `snapshot_test.go`, `internal/keys/keys_test.go`
   - **Verification:** `go test -race -v -run 'TestIngest|TestBatch|TestTracker|TestSnapshot' ./...`, then the full suite
 
-- [ ] **Task 7: Benchmark Suite Verification & Corpus Stability**
+- [x] **Task 7: Benchmark Suite Verification & Corpus Stability**
   - Run the full suite against §2.7's targets on the Task 0 machine; compare with
     `benchstat`; record in `comparison.txt` together with the store-footprint
     measurement and the measured `activeStoryIndex` memory at 500 and 10,000
     stories.
   - **Files:** `bench_test.go`, `stability_test.go`, `spec/008_performance_optimizations/comparison.txt`, `geometry_delta.txt`
   - **Verification:** `go test -v -run TestStability ./... && go test -bench=. -benchmem -count 5 ./...`, compared against `baseline.txt` with `benchstat`
+
+- [x] **Task 8: Differential Test Against the Pre-Change Geometry**
+  - Premise under test: this spec breaks the database format, not the logic, so
+    every geometric quantity must be reproducible from the pre-change tree.
+  - Compare `geom` and `dist` from both trees on identical inputs, function by
+    function, in one scratch module so both versions link at once: `Unit`,
+    `Mean`, `Centroid`, `Project`, pairwise distance after projection, the
+    distance primitive on genuinely unit vectors, and `Measure`'s statistics.
+    Report angular divergence, not equality — a bare `!=` on float32 measures
+    `acos` noise rather than a change in the math.
+  - Bisect anything that diverges at the system level: revert one candidate at a
+    time against the reference corpus until the probe reproduces the pre-change
+    grouping, so each change is attributed rather than the set of them.
+  - Re-benchmark the reverted tree. A revert that costs throughput is a
+    trade-off to be decided; one that costs nothing is a bug fix.
+  - Findings and resolution in §2.5. Result: two changes reverted, the third
+    (`calcThreshold`'s reactivation branch) recorded and left for its own review.
+  - **Files:** `batch.go`, `index.go`, `internal/geom/geom.go`,
+    `internal/geom/geom_test.go`, `internal/cluster/cluster.go`,
+    `spec/008_performance_optimizations/geometry_delta.txt`
+  - **Verification:** `CORPUS=… go test -run TestCorpusProbe -v .` reproduces the pre-change grouping on every digit; `CORPUS=… REF006=… go test -run TestStability -v .` fully green; `benchstat` before/after the revert shows no significant change
 
 ### 3.2 Sequencing
 
@@ -1170,7 +1239,9 @@ Task 5 before Task 6 is not optional: the index holds unit-normalized centroids
 and the round-trip test asserts `s:{id}:m` is untouched by ingest, which is only
 meaningful once Task 5 has settled what a stored centroid looks like.
 
-Order: 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7.
+Order: 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8.
+
+Task 8 was not in the original plan. It exists because Task 7's `geometry_delta.txt` recorded a boundary shift as "expected" on the strength of §2.5's declaration, and the declaration turned out to be wrong about its own cause. A declared behavioral change still needs its cause measured, not just its effect noted.
 
 ### 3.3 Risks & Mitigation
 
@@ -1184,7 +1255,7 @@ Order: 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7.
 | **Index memory grows with the non-archived story population** | One buffer rather than two after the record split; bounded formula and absolute figures in §2.7, measured in Task 7, documented in `README.md`. Named as an operational limit rather than solved. Smaller than the collect-set ceiling either way. |
 | **Reactivation reads statistics a previous run computed** | Staleness is derived from `StatsAt` versus `ReactivatedAt` rather than by zeroing fields (§2.2.1); test covers reactivation followed by a threshold computation before the next batch. |
 | **`setFacetLoc` stays quadratic in facets per signal** | Accepted and recorded (§2.2.5) with the fix named — group a signal's location updates in the apply path — and deferred to its own spec rather than answered with a bespoke binary format. |
-| **`1 - Dot` applied to non-unit vectors** | The store holds unit vectors, so the invariant is structural rather than maintained per call site (§2.2.3); separate `*Unit` entry points moved call site by call site; invariant test plus a no-established-mean batch test in Task 6. |
+| **`1 - Dot` applied to non-unit vectors** | The risk was real and the mitigation was wrong: the store holds unit vectors, but every `*Unit` call site measured a **projected** vector, which is not. Resolved by reverting the call sites (Task 8), not by maintaining the invariant. |
 | **In-place projection writes through a store-owned slice** | Decoded embeddings are batch-owned; ownership rule stated on the `Store` interface; `hostileStore` test, since `MemStore` copies and would hide it (§2.2.3). |
 | **A caller depended on the embedding magnitudes they submitted** | Accepted and declared (§2.6). Nothing in the library consumes magnitude, the dump stays lossless for replay, and `Signals()`'s doc comment stops claiming byte fidelity. |
 | **Zero-magnitude embedding cannot satisfy the stored invariant** | Rejected at `Ingest` with `ErrZeroEmbedding` rather than stored and silently sitting at distance 1.0 from everything. |
@@ -1194,7 +1265,7 @@ Order: 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7.
 | **Index swapped or patched on a rolled-back tx** | Strictly after commit; neither on error (§2.2.2). |
 | **Reactivation invisible to the index** | Explicit patch point in the update table; it happens in `Ingest`, not at batch commit. |
 | **Two Trackers over one store** | Documented single-writer assumption on `NewTracker`. |
-| **Cluster boundaries move** | Two declared changes, quantified in §2.5 rather than tested away; determinism and idempotency still hold exactly. The third candidate, `Split`'s partitioning, was deferred out of the spec (§1.1). |
+| **Cluster boundaries move** | They did, and it was a bug rather than a declared change. Reverted in Task 8; the reference corpus now reproduces the pre-change grouping exactly and `TestStability_SingleFacetMatchesSpec006` passes (§2.5). The mitigation that failed was declaring the change instead of measuring its cause. |
 | **A gonum bump removes the `amd64` dot assembly, invalidating §1.1** | The claim is re-verified in Task 1 against the pinned version and recorded there; gonum stays pinned. |
 | **Database incompatibility on upgrade** | Accepted (§2.6). Replay migration, per Spec 007 policy. |
 | **Caller payloads not CBOR-encodable** | Accepted (§2.6). `Codec[T]` stays a public interface, so such a caller writes their own; noted in `HISTORY.md`. |
@@ -1202,21 +1273,27 @@ Order: 0 → 1 → 2 → 3 → 4 → 5 → 6 → 7.
 ---
 
 ## Phase 4: Execution & Verification
-- [ ] All per-task verification steps pass.
-- [ ] Linter / vet clean.
-- [ ] Unit tests pass.
-- [ ] Build targets compile.
-- [ ] Neighbor packages unaffected.
-- [ ] `-race` suite passes, including the concurrent ingest test from Task 6.
-- [ ] `baseline.txt`, `comparison.txt`, and `geometry_delta.txt` committed, each naming the machine it was measured on.
-- [ ] §2.7 targets met, or the shortfall explained. The `MemStore`-only scope of the latency numbers is stated in the release notes.
+- [x] All per-task verification steps pass.
+- [x] Linter / vet clean.
+- [x] Unit tests pass.
+- [x] Build targets compile.
+- [x] Neighbor packages unaffected.
+- [x] `-race` suite passes, including the concurrent ingest test from Task 6.
+- [x] `baseline.txt`, `comparison.txt`, and `geometry_delta.txt` committed, each naming the machine it was measured on.
+- [x] §2.7 targets met, or the shortfall explained. The `MemStore`-only scope of the latency numbers is stated in the release notes.
+- [x] `TestStability_SingleFacetMatchesSpec006` passes against the committed
+      spec-006 reference. It failed until Task 8; the reference snapshot was not
+      touched, the code was.
 - [ ] Approved by Codefather.
 
 ---
 
 ## Phase 5: Completed
 - [ ] All Phase 4 items `[x]`.
-- [ ] No regressions.
-- [ ] Spec document reflects actual implementation, including Task 1's findings in §1.1 and §2.2.1.
+- [ ] No regressions. One stands open: `BenchmarkIngestDuringApply` at +32%
+      time / +207% bytes, traced to the `cands` staging slice in
+      `findNearestStories` (`index.go`) and recorded in `comparison.txt`. The
+      geometry regression is closed (Task 8).
+- [x] Spec document reflects actual implementation, including Task 1's findings in §1.1 and §2.2.1.
 - [ ] `spec/README.md` updated to `COMPLETED`.
 - [ ] Approved by Codefather.

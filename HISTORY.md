@@ -291,7 +291,28 @@ windowed re-clustering. Set `OutlierTTL` directly and it stops mattering.
 
 **What it was.** Ingest preserved producer vector magnitudes in `Signal.Embeddings`, and distance computations normalized on every pairwise comparison.
 
-**Why it was removed.** Magnitude is unused by cosine similarity, centroids, and clustering. Recomputing norms on every distance comparison was the single most expensive linear algebra operation.
+**Why it was removed.** Magnitude is unused by cosine similarity, centroids, and clustering, and normalizing once at the door is cheaper than normalizing on every read.
 
-**What replaced it.** Normalization to unit vectors on ingest. The store holds unit vectors; `Signals()` returns normalized unit vectors; zero-magnitude embeddings are rejected at `Ingest` with `ErrZeroEmbedding`.
+**What replaced it.** Normalization to unit vectors on ingest. The store holds unit vectors; `Signals()` returns normalized unit vectors; zero-magnitude embeddings are rejected at `Ingest` with `ErrZeroEmbedding`. This is a change to what is stored and returned, not to any geometry: `Project` already normalized its input, so every distance and every centroid is unchanged.
+
+**What it did not buy.** The stated motive was also to drop the per-comparison norms, replacing `dot / (‖a‖·‖b‖)` with `1 - dot`. That part did not survive. Distances in this library are measured between *projected* vectors — the corpus mean subtracted — and a projected vector is not unit. Making them unit meant renormalizing the residual, which changes what `Centroid` averages and moved every cluster boundary in the reference corpus. `dist.CosineDistanceUnit` exists, is 39x faster in isolation, and has no caller. See `spec/008_performance_optimizations/geometry_delta.txt`.
+
+---
+
+## 9. Unit-normalizing the corpus mean
+
+**What it was.** For one commit, `collectBatch` finished its accumulated corpus mean with `geom.Unit(mean)`.
+
+**Why it was removed.** It was never intended and never declared. `geom.Mean` returns the mean of unit vectors, which is itself not unit — its length falls as the corpus spreads — and `Project` subtracts `Strength × Mean`. Normalizing the mean therefore changed how much of the shared direction came off: at the default `MeanRemoval = 0.9`, roughly 0.72 became 0.90. It shifted every cluster boundary in the reference corpus, and it was the dominant cause of a shift that had been attributed to something else.
+
+**What replaced it.** The mean is left unnormalized, as `geom.Mean` always returned it. Found by a differential test against the pre-change tree; the method and the numbers are in `spec/008_performance_optimizations/geometry_delta.txt`.
+
+**How the gains were measured.** Every latency and allocation figure quoted for
+spec 008 — including the 213x steady-state ingest improvement — was measured
+against `MemStore`, which is the only `Store` in this repo. The work removed is
+on the read side, so on a durable store such as bbolt the remaining write
+transaction (page allocation and `fsync`) sets the floor and the end-to-end
+improvement is materially smaller. No bbolt figure is quoted because none can be
+measured here. Full numbers, targets, and shortfalls are in
+`spec/008_performance_optimizations/comparison.txt`.
 
