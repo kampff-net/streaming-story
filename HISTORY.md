@@ -307,6 +307,8 @@ windowed re-clustering. Set `OutlierTTL` directly and it stops mattering.
 
 **What replaced it.** The mean is left unnormalized, as `geom.Mean` always returned it. Found by a differential test against the pre-change tree; the method and the numbers are in `spec/008_performance_optimizations/geometry_delta.txt`.
 
+The same test cleared a third candidate. `calcThreshold` derives reactivation staleness from `ReactivatedAt` versus `StatsAt` rather than from statistics zeroed at reactivation, because the record split leaves `Ingest` unable to write the fields it used to clear. Both routes return `AssignmentK × σ_global`, so the threshold is unchanged; the statistics now survive rather than being destroyed.
+
 **How the gains were measured.** Every latency and allocation figure quoted for
 spec 008 — including the 213x steady-state ingest improvement — was measured
 against `MemStore`, which is the only `Store` in this repo. The work removed is

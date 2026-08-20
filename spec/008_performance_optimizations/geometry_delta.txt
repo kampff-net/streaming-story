@@ -126,11 +126,25 @@ What was changed, and what was reverted
    the boundary shift were the same decision. Reverting it also reverts every
    `*Unit` call site in `geom`, `internal/cluster`, and `index.go`.
 
-3. NOT REVERTED — `calcThreshold` gained a reactivation-staleness branch
+3. KEPT — `calcThreshold` gained a reactivation-staleness branch
    (`threshold.go`): a story whose ReactivatedAt is newer than its StatsAt is
-   treated as cold-start. Latent on this corpus, so it does not appear in any
-   number above. It belongs to Task 6 rather than Task 5 and is left for its own
-   review, recorded here so it is not forgotten.
+   treated as cold-start. Investigated as a third candidate and cleared.
+
+   Pre-008, Ingest rewrote the whole story record on reactivation and zeroed
+   MeanDistance, Sigma, SignalCount and both frozen fields; calcThreshold then
+   fell through its SignalCount >= ColdStartMinSignals test and returned
+   AssignmentK x sigma_global. The record split makes that impossible, since
+   Ingest writes only s:{id}:h and does not own the statistics. Deriving
+   staleness from timestamps returns AssignmentK x sigma_global by the other
+   route -- the same value. Specified by Task 6, asserted by
+   TestTracker_Ingest_ReactivateClearsStats.
+
+   What changes is that the statistics survive instead of being destroyed.
+   calcThreshold is their only decision-making consumer and it ignores them
+   while stale, so no admission decision moves; a caller reading a
+   just-reactivated story now sees its real SignalCount rather than zero.
+   Latent on this corpus either way, which is why it appears in no number
+   above.
 
 
 What the revert cost

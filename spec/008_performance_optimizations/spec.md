@@ -943,13 +943,20 @@ format changes:
    moved — but `Centroid` averages residuals, and a mean is not scale-invariant.
    The old residual lengths (measured: 0.4254 to 0.5196, a 1.22x spread) were
    implicit per-member weights; renormalizing set them all to 1.
-3. **A reactivation-staleness branch was added to `calcThreshold`**
-   (`threshold.go`), changing the admission threshold for a reactivated story.
-   Latent on the reference corpus, so it did not show up in the corpus probe.
-   New behavior in a performance change regardless. **Still present** — it is
-   Task 6's, not Task 5's, and is left for its own review.
+3. **A reactivation-staleness branch in `calcThreshold`** (`threshold.go`).
+   Investigated and cleared, not a defect. Pre-008, `Ingest` rewrote the whole
+   story record on reactivation and zeroed `MeanDistance`, `Sigma`,
+   `SignalCount` and both frozen fields; `calcThreshold` then fell through its
+   `SignalCount >= ColdStartMinSignals` test and returned
+   `AssignmentK × σ_global`. The record split makes that impossible — `Ingest`
+   writes only `s:{id}:h` and does not own the statistics — so staleness is
+   derived from `ReactivatedAt` versus `StatsAt` instead. **The threshold is the
+   same value by either route.** Task 6 specified it and
+   `TestTracker_Ingest_ReactivateClearsStats` asserts it. What changes is that
+   the statistics survive rather than being destroyed, so a caller reading a
+   just-reactivated story sees its real `SignalCount` instead of zero. **Kept.**
 
-**Resolution.** Items 1 and 2 were reverted. The reference corpus now reproduces
+**Resolution.** Items 1 and 2 were reverted; item 3 was cleared on inspection. The reference corpus now reproduces
 the pre-change clustering on every digit, and `TestStability_SingleFacetMatchesSpec006`
 passes against spec 006's pinned snapshot. The revert cost nothing measurable:
 every benchmark moved within noise (`geomean -0.96%`, all comparisons `p > 0.05`).
@@ -1217,8 +1224,9 @@ this table.
     grouping, so each change is attributed rather than the set of them.
   - Re-benchmark the reverted tree. A revert that costs throughput is a
     trade-off to be decided; one that costs nothing is a bug fix.
-  - Findings and resolution in §2.5. Result: two changes reverted, the third
-    (`calcThreshold`'s reactivation branch) recorded and left for its own review.
+  - Findings and resolution in §2.5. Result: two changes reverted; a third
+    candidate (`calcThreshold`'s reactivation branch) was traced to the record
+    split, shown to produce the same threshold as the pre-008 path, and kept.
   - **Files:** `batch.go`, `index.go`, `internal/geom/geom.go`,
     `internal/geom/geom_test.go`, `internal/cluster/cluster.go`,
     `spec/008_performance_optimizations/geometry_delta.txt`
