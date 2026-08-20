@@ -80,11 +80,11 @@ func TestProjector(t *testing.T) {
 	t.Run("subtracts_the_scaled_mean_of_a_unit_input", func(t *testing.T) {
 		p := Projector{Mean: []float32{1, 0}, Strength: 0.5}
 		got := p.Project([]float32{0, 10}) // unit-normalizes to {0, 1}
-		// {0, 1} - 0.5 * {1, 0} = {-0.5, 1}, normalized to unit length
-		expectedNorm := float32(math.Sqrt(0.25 + 1.0))
-		assert.InDelta(t, -0.5/expectedNorm, got[0], 1e-6)
-		assert.InDelta(t, 1.0/expectedNorm, got[1], 1e-6)
-		assert.InDelta(t, 1.0, dist.Norm(got), 1e-6)
+		// {0, 1} - 0.5 * {1, 0} = {-0.5, 1}, left unnormalized: the residual's
+		// length is what weighs a member in its story's centroid.
+		assert.InDelta(t, -0.5, got[0], 1e-6)
+		assert.InDelta(t, 1.0, got[1], 1e-6)
+		assert.InDelta(t, math.Sqrt(1.25), dist.Norm(got), 1e-6)
 	})
 
 	t.Run("leaves_the_caller_slice_untouched", func(t *testing.T) {
@@ -99,10 +99,11 @@ func TestProjectInPlace(t *testing.T) {
 	v := []float32{0, 1}
 	ProjectInPlace(v, mean, 0.5)
 
-	expectedNorm := float32(math.Sqrt(0.25 + 1.0))
-	assert.InDelta(t, -0.5/expectedNorm, v[0], 1e-6)
-	assert.InDelta(t, 1.0/expectedNorm, v[1], 1e-6)
-	assert.InDelta(t, 1.0, dist.Norm(v), 1e-6)
+	// The residual is not renormalized. Renormalizing would make every member
+	// weigh the same in Centroid and move every cluster boundary in the corpus.
+	assert.InDelta(t, -0.5, v[0], 1e-6)
+	assert.InDelta(t, 1.0, v[1], 1e-6)
+	assert.InDelta(t, math.Sqrt(1.25), dist.Norm(v), 1e-6)
 }
 
 // projectAll is the shape callers use: centre a whole group against one mean.

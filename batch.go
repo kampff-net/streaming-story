@@ -289,7 +289,6 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 		for i, v := range meanSum {
 			mean[i] = v * inv
 		}
-		mean = geom.Unit(mean)
 	}
 
 	return signals, stories, evict, mean, droppedMismatches, nil

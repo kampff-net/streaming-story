@@ -180,7 +180,7 @@ func (t *Tracker[T]) findNearestStories(emb Embedding, now time.Time) []nearestS
 	var matches []nearestStory
 	for _, c := range cands {
 		vec := idx.recents[c.offset : c.offset+idx.dim]
-		d := dist.CosineDistanceUnit(emb, vec)
+		d := dist.CosineDistance(emb, vec)
 
 		sm := StoryMeta{
 			ID:                 c.id,

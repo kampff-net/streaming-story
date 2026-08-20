@@ -57,28 +57,25 @@ type Projector struct {
 	Strength float32
 }
 
-// ProjectInPlace centres v against mean and renormalizes it to unit length,
-// without allocating. v must be unit on entry and is unit on return.
+// ProjectInPlace centres v against mean without allocating. v must be unit on
+// entry; the residual it leaves behind is not renormalized.
+//
+// The result is deliberately not unit. Cosine distance is scale-invariant, so
+// the residual's length changes no pairwise comparison — but Centroid averages
+// these residuals, and a mean is not scale-invariant. Renormalizing here would
+// give every member equal weight in its story's centroid and move every cluster
+// boundary in the corpus. Callers that need a unit vector normalize explicitly.
 func ProjectInPlace(v, mean []float32, strength float32) {
 	if len(v) != len(mean) || len(v) == 0 || strength == 0 {
 		return
 	}
-	var sum float64
 	for i := range v {
 		v[i] -= strength * mean[i]
-		sum += float64(v[i]) * float64(v[i])
-	}
-	if sum == 0 {
-		return
-	}
-	inv := float32(1.0 / math.Sqrt(sum))
-	for i := range v {
-		v[i] *= inv
 	}
 }
 
-// Project returns emb as a unit vector with Strength × Mean subtracted and
-// renormalized to unit length.
+// Project returns emb as a unit vector with Strength × Mean subtracted. The
+// result is not renormalized; see ProjectInPlace.
 func (p Projector) Project(emb []float32) []float32 {
 	if len(p.Mean) != len(emb) || len(emb) == 0 || p.Strength == 0 {
 		// No mean established yet, or a dimensionality mismatch the caller
@@ -160,7 +157,7 @@ func Radius(vecs [][]float32) float64 {
 	c := Centroid(vecs)
 	var r float64
 	for _, v := range vecs {
-		if d := dist.CosineDistanceUnit(v, c); d > r {
+		if d := dist.CosineDistance(v, c); d > r {
 			r = d
 		}
 	}
@@ -190,7 +187,7 @@ func Measure(vecs [][]float32, times []time.Time) Stats {
 	}
 	var sum, sumSq float64
 	for i, v := range vecs {
-		d := dist.CosineDistanceUnit(v, st.Centroid)
+		d := dist.CosineDistance(v, st.Centroid)
 		st.Dists = append(st.Dists, d)
 		sum += d
 		sumSq += d * d

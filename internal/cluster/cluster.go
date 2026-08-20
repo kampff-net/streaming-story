@@ -136,7 +136,7 @@ func Grow(pts []Point, p Params) [][]int {
 	degree := make([]int, n)
 	for i := range n {
 		for j := i + 1; j < n; j++ {
-			if dist.CosineDistanceUnit(pts[i].Vec, pts[j].Vec) <= p.Assign {
+			if dist.CosineDistance(pts[i].Vec, pts[j].Vec) <= p.Assign {
 				degree[i]++
 				degree[j]++
 			}
@@ -166,7 +166,7 @@ func Grow(pts []Point, p Params) [][]int {
 				if used[j] || inGroup[j] {
 					continue
 				}
-				if d := dist.CosineDistanceUnit(pts[j].Vec, centre); d <= bestD {
+				if d := dist.CosineDistance(pts[j].Vec, centre); d <= bestD {
 					best, bestD = j, d
 				}
 			}
@@ -201,7 +201,7 @@ func CompactToRadius(pts []Point, group []int, radius float64) []int {
 		centre := Centroid(pts, group)
 		worst, worstD := -1, radius
 		for gi, i := range group {
-			if d := dist.CosineDistanceUnit(pts[i].Vec, centre); d > worstD {
+			if d := dist.CosineDistance(pts[i].Vec, centre); d > worstD {
 				worst, worstD = gi, d
 			}
 		}
@@ -343,8 +343,8 @@ func Split(pts []Point, radius float64, p Params) (Division, bool) {
 	for range 10 {
 		left, right = left[:0], right[:0]
 		for i := range pts {
-			if dist.CosineDistanceUnit(pts[i].Vec, pts[a].Vec) <=
-				dist.CosineDistanceUnit(pts[i].Vec, pts[b].Vec) {
+			if dist.CosineDistance(pts[i].Vec, pts[a].Vec) <=
+				dist.CosineDistance(pts[i].Vec, pts[b].Vec) {
 				left = append(left, i)
 			} else {
 				right = append(right, i)
@@ -363,7 +363,7 @@ func Split(pts []Point, radius float64, p Params) (Division, bool) {
 	if distinctIDs(pts, left) < p.MinSize || distinctIDs(pts, right) < p.MinSize {
 		return Division{}, false
 	}
-	if dist.CosineDistanceUnit(Centroid(pts, left), Centroid(pts, right)) <= p.Split {
+	if dist.CosineDistance(Centroid(pts, left), Centroid(pts, right)) <= p.Split {
 		return Division{}, false
 	}
 
@@ -383,7 +383,7 @@ func TwoMedoids(pts []Point) (int, int) {
 	bestA, bestB, best := -1, -1, -1.0
 	for i := range pts {
 		for j := i + 1; j < len(pts); j++ {
-			d := dist.CosineDistanceUnit(pts[i].Vec, pts[j].Vec)
+			d := dist.CosineDistance(pts[i].Vec, pts[j].Vec)
 			if d > best || (d == best && bestA >= 0 && less(pts[i], pts[bestA])) {
 				bestA, bestB, best = i, j, d
 			}
@@ -399,7 +399,7 @@ func medoidOf(pts []Point, part []int) int {
 	for _, i := range part {
 		var sum float64
 		for _, j := range part {
-			sum += dist.CosineDistanceUnit(pts[i].Vec, pts[j].Vec)
+			sum += dist.CosineDistance(pts[i].Vec, pts[j].Vec)
 		}
 		if best == -1 || sum < bestSum ||
 			(sum == bestSum && less(pts[i], pts[best])) {
@@ -454,7 +454,7 @@ func PlanMerges(
 		if len(ca) == 0 || len(cb) == 0 {
 			return false
 		}
-		return dist.CosineDistanceUnit(ca, cb) <= p.Merge
+		return dist.CosineDistance(ca, cb) <= p.Merge
 	}, 2)
 
 	plan := make(MergePlan)
@@ -517,7 +517,7 @@ func CompactMergeGroup(ids []uuid.UUID, members map[uuid.UUID][]Point, p Params)
 				continue
 			}
 			mc := geom.Centroid(vecsOf(members[id]))
-			if d := dist.CosineDistanceUnit(mc, c); d > worstD {
+			if d := dist.CosineDistance(mc, c); d > worstD {
 				worst, worstD = i, d
 			}
 		}
