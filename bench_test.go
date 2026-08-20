@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
+
+	"go.kvsh.ch/streaming-story/internal/geom"
 )
 
 const benchDim = 8
@@ -265,7 +269,6 @@ func BenchmarkSignalsOf(b *testing.B) {
 	}
 }
 
-
 // TestStoreFootprint measures the sum of encoded value bytes across all keys
 // in a populated store after a batch pass, matching the §2.7 footprint metric.
 func TestStoreFootprint(t *testing.T) {
@@ -305,3 +308,124 @@ func TestStoreFootprint(t *testing.T) {
 	t.Logf("STORE_FOOTPRINT_BYTES: %d (across %d keys)", totalBytes, len(ms.data))
 }
 
+// collectAllocFixture builds a tracker holding a batch's worth of multi-facet
+// signals at a realistic dimension. benchDim is deliberately tiny, which hides
+// the per-facet vector allocations the collect phase is measured for.
+func collectAllocFixture(t *testing.T) (*Tracker[string], time.Time) {
+	t.Helper()
+
+	const (
+		signals = 400
+		facets  = 3
+		dim     = 256
+	)
+
+	rng := rand.New(rand.NewSource(7))
+	now := time.Now()
+
+	tr, err := NewTracker[string](Config[string]{
+		Store:         newMemStore(),
+		Codec:         CBORCodec[string]{},
+		BatchInterval: time.Hour,
+		MinStorySize:  3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+
+	for i := range signals {
+		embs := make([]Embedding, facets)
+		for f := range embs {
+			v := make([]float32, dim)
+			for j := range v {
+				v[j] = float32(rng.NormFloat64()) * 0.02
+			}
+			v[((i+f)%8)*2]++
+			embs[f] = v
+		}
+		sig := Signal[string]{
+			ID:         uuid.New(),
+			At:         now.Add(-time.Duration(i) * time.Second),
+			Embeddings: embs,
+		}
+		if _, err := tr.Ingest(context.Background(), sig); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tr.runBatch()
+
+	return tr, now
+}
+
+// TestCollectPhaseAllocs measures the allocation cost of the batch collect
+// phase — collection plus the mean-removal projection — against the §2.7
+// target of a 60% reduction. The figure is reported, not asserted: the
+// comparison lives in the spec's comparison file, since a threshold here would
+// pin a number that only means something beside its baseline.
+func TestCollectPhaseAllocs(t *testing.T) {
+	tr, now := collectAllocFixture(t)
+
+	const runs = 5
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for range runs {
+		var (
+			signals []batchFacet
+			mean    []float32
+		)
+		if err := tr.cfg.Store.View(func(tx Tx) error {
+			var err error
+			signals, _, _, mean, _, err = tr.collectBatch(tx, now)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(mean) > 0 && tr.cfg.MeanRemoval > 0 {
+			strength := float32(tr.cfg.MeanRemoval)
+			for i := range signals {
+				geom.ProjectInPlace(signals[i].emb, mean, strength)
+			}
+		}
+	}
+	runtime.ReadMemStats(&after)
+
+	t.Logf("COLLECT_PHASE: %d B/op, %d allocs/op",
+		(after.TotalAlloc-before.TotalAlloc)/runs,
+		(after.Mallocs-before.Mallocs)/runs)
+}
+
+// TestActiveStoryIndexMemory reports the resident cost of activeStoryIndex at
+// the two populations §2.7 names, against its ceiling of 8*dim+128 bytes per
+// non-archived story. The index is built directly rather than through a batch:
+// the cost is a function of story count and dimension, and ingesting 10,000
+// stories to learn that would measure the ingest path instead.
+func TestActiveStoryIndexMemory(t *testing.T) {
+	const dim = 1536
+
+	perStoryCeiling := 8*dim + 128
+
+	for _, stories := range []int{500, 10000} {
+		idx := &activeStoryIndex{
+			dim:     dim,
+			ids:     make([]uuid.UUID, stories),
+			recents: make([]float32, stories*dim),
+			metas:   make([]activeStoryMeta, stories),
+		}
+
+		total := int(unsafe.Sizeof(*idx)) +
+			len(idx.ids)*int(unsafe.Sizeof(uuid.UUID{})) +
+			len(idx.recents)*int(unsafe.Sizeof(float32(0))) +
+			len(idx.metas)*int(unsafe.Sizeof(activeStoryMeta{}))
+		perStory := total / stories
+
+		t.Logf("INDEX_MEMORY: stories=%d dim=%d total=%d bytes, per-story=%d bytes (ceiling %d)",
+			stories, dim, total, perStory, perStoryCeiling)
+
+		if perStory > perStoryCeiling {
+			t.Errorf("index costs %d bytes per story, over the %d ceiling",
+				perStory, perStoryCeiling)
+		}
+	}
+}
