@@ -1,7 +1,7 @@
 # SDD Spec: 008 Performance & Latency Optimizations
 
 ## Metadata
-* **Status:** `EXECUTION`
+* **Status:** `COMPLETED`
 * **Author:** Consigliere
 * **Created:** 2026-08-18
 * **Last Updated:** 2026-08-20
@@ -1292,16 +1292,20 @@ Task 8 was not in the original plan. It exists because Task 7's `geometry_delta.
 - [x] `TestStability_SingleFacetMatchesSpec006` passes against the committed
       spec-006 reference. It failed until Task 8; the reference snapshot was not
       touched, the code was.
-- [ ] Approved by Codefather.
+- [x] Approved by Codefather.
 
 ---
 
 ## Phase 5: Completed
-- [ ] All Phase 4 items `[x]`.
-- [ ] No regressions. One stands open: `BenchmarkIngestDuringApply` at +32%
-      time / +207% bytes, traced to the `cands` staging slice in
-      `findNearestStories` (`index.go`) and recorded in `comparison.txt`. The
-      geometry regression is closed (Task 8).
+- [x] All Phase 4 items `[x]`.
+- [x] No regressions, with one **accepted** exception:
+      `BenchmarkIngestDuringApply` at +32% time / +207% bytes, traced to the
+      `cands` staging slice in `findNearestStories` (`index.go`) and recorded in
+      `comparison.txt`. Accepted by the Approver as an edge case — it measures
+      `Ingest` latency while a batch holds the write lock, and the steady-state
+      path it trades against is 213x faster. Accepted, not fixed; the remedy is
+      named in `comparison.txt` for whoever wants it.
+      The geometry regression is closed (Task 8).
 - [x] Spec document reflects actual implementation, including Task 1's findings in §1.1 and §2.2.1.
-- [ ] `spec/README.md` updated to `COMPLETED`.
-- [ ] Approved by Codefather.
+- [x] `spec/README.md` updated to `COMPLETED`.
+- [x] Approved by Codefather.

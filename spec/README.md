@@ -13,18 +13,6 @@
 | 004 | KV Storage Schema & Persistence Layer | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](004_storage_persistence_layer/spec.md) |
 | 005 | Event Streaming & Iterators API | 🔷 `DESIGN` | 2026-08-11 | 2026-08-11 | [spec.md](005_event_streaming_iterators/spec.md) |
 | 009 | Story Suppression Lifecycle & Tracker State | 🔷 `APPROVED` | 2026-08-19 | 2026-08-19 | [spec.md](009_story_suppression_lifecycle/spec.md) |
-| 008 | High-Throughput Performance & Latency Optimizations | 🔷 `EXECUTION` | 2026-08-18 | 2026-08-20 | [spec.md](008_performance_optimizations/spec.md) |
-
-> Tasks 0-8 implemented and measured; `comparison.txt` and `geometry_delta.txt`
-> record the numbers. Steady-state ingest is 213x faster, the store footprint
-> halved, collect allocations are down 60%. Task 8 was added after a
-> differential test against the pre-change tree found three logic changes inside
-> what was meant to be a storage-only spec; two were reverted at no measurable
-> cost and the reference corpus now reproduces the pre-change clustering on
-> every digit (§2.5). One item keeps it out of `COMPLETED`:
-> `BenchmarkIngestDuringApply` regressed 32%, traced to a staging slice in
-> `findNearestStories`. Batch throughput reached 1.3-2.8x against a 5x target;
-> the remaining cost is clustering, which this spec never touched.
 
 > Spec 006 supersedes the batch re-clustering pipeline in 002 and the cluster
 > mapping engine in 003. Both remain listed for the history.
@@ -42,6 +30,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 006 | Centroid-Based Incremental Clustering | ✅ `COMPLETED` | 2026-08-16 | 2026-08-17 | [spec.md](006_centroid_incremental_clustering/spec.md) |
 | 007 | Multi-Facet Signals & Many-to-Many Membership | ✅ `COMPLETED` | 2026-08-18 | 2026-08-18 | [spec.md](007_multi_facet_signals/spec.md) |
+| 008 | High-Throughput Performance & Latency Optimizations | ✅ `COMPLETED` | 2026-08-18 | 2026-08-20 | [spec.md](008_performance_optimizations/spec.md) |
 
 > Implemented, then revised in five places once measured against the reference
 > corpus: centred geometry, promotion by centroid growth, outlier admission, the
@@ -50,6 +39,21 @@
 > approaches are in [HISTORY.md](../HISTORY.md). One item remains open: no
 > pre-change benchmark baseline was captured, so batch-run performance is
 > unverified rather than known-good.
+
+> Spec 008: CBOR replaces JSON across every record and the default codec, the story record
+> splits into batch-owned and ingest-owned halves, and an in-memory
+> `activeStoryIndex` takes `findNearestStories` off the store entirely.
+> Steady-state ingest is 213x faster, the store footprint halved, batch collect
+> allocations fell 60%. Batch throughput reached 1.3-2.8x against a 5x target:
+> the batch is dominated by clustering, not serialization, and this spec never
+> touched clustering. `BenchmarkIngestDuringApply` regressed 32%, accepted as an
+> edge case with the remedy named in `comparison.txt`.
+>
+> Task 8 was added late. A differential test against the pre-change tree found
+> three logic changes inside a spec whose premise is that only the storage
+> format changes; two were reverted at no measurable cost, the third was cleared
+> on inspection. §2.5 keeps the record, because the change that did the most
+> damage was the one nobody had declared.
 
 ## Proposed
 
