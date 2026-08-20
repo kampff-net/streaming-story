@@ -60,8 +60,7 @@ go get go.kvsh.ch/streaming-story
 
 ### 1. Create a tracker
 
-`CBORCodec[T]` and `MemStore` ship with the library, so a working tracker needs
-no custom types:
+`MemStore` ships with the library for tests, and signals are persisted using canonical CBOR:
 
 ```go
 package main
@@ -81,8 +80,7 @@ type Article struct {
 
 func main() {
 	tracker, err := story.NewTracker(story.Config[Article]{
-		Store:         story.NewMemStore(),        // required; swap for bbolt/LevelDB in production
-		Codec:         story.CBORCodec[Article]{}, // required
+		Store:         story.NewMemStore(), // required; swap for bbolt/LevelDB in production
 		BatchInterval: 30 * time.Minute,
 		OnBatchError:  func(err error) { log.Printf("batch: %v", err) },
 	})
@@ -117,15 +115,6 @@ func main() {
 Use `tracker.SignalID(domainKey)` rather than `uuid.NewSHA1` directly — it
 honours a configured `Namespace`. Deterministic IDs make re-ingesting the same
 signal a no-op.
-
-A custom `Codec` is only needed for binary encodings:
-
-```go
-type Codec[T any] interface {
-	Encode(sig Signal[T]) ([]byte, error)
-	Decode(b []byte) (Signal[T], error)
-}
-```
 
 ### 2. Subscribe to events
 
@@ -219,7 +208,7 @@ re-embedding.
 ## Configuration Reference
 
 `Config` has no dead fields: every parameter below is read by the running
-tracker. Only `Store` and `Codec` are required, and every other field defaults —
+tracker. Only `Store` is required, and every other field defaults —
 a zero value always means "use the default", so no parameter can be *set* to
 zero. `MeanRemoval: 0` yields 0.9; pass a small epsilon if you genuinely want
 raw geometry (you do not — see [Tuning](#tuning)).
@@ -234,7 +223,6 @@ or above `AssignThreshold`, `SplitThreshold` at or below `MergeThreshold` or abo
 | Parameter | Effect |
 |---|---|
 | `Store` | The persistence backend. Must give lexicographic byte ordering — the range scans over the time index and story prefixes depend on it. `NewMemStore()` for tests. |
-| `Codec` | Encodes and decodes `Signal[T]`. `CBORCodec[T]{}` by default; supply a custom one for a non-CBOR format. |
 
 ### Identity
 

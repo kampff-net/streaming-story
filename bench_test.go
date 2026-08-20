@@ -39,7 +39,6 @@ func BenchmarkBatch(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour, // the ticker must not fire mid-benchmark
 		MinStorySize:  3,
 	})
@@ -80,7 +79,6 @@ func BenchmarkBatchFacets(b *testing.B) {
 
 			tr, err := NewTracker[string](Config[string]{
 				Store:         newMemStore(),
-				Codec:         CBORCodec[string]{},
 				BatchInterval: time.Hour,
 				MinStorySize:  3,
 			})
@@ -124,7 +122,6 @@ func BenchmarkIngestDuringApply(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:           newMemStore(),
-		Codec:           CBORCodec[string]{},
 		BatchInterval:   time.Hour,
 		IngestBufferCap: 1 << 20, // large enough that the benchmark never blocks
 	})
@@ -172,7 +169,6 @@ func BenchmarkIngestSteadyState(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})
@@ -217,7 +213,6 @@ func BenchmarkSignalsOf(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})
@@ -280,7 +275,6 @@ func TestStoreFootprint(t *testing.T) {
 	ms := newMemStore()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         ms,
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})
@@ -325,7 +319,6 @@ func collectAllocFixture(t *testing.T) (*Tracker[string], time.Time) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})

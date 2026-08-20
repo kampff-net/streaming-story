@@ -212,8 +212,8 @@ func (t *Tracker[T]) Signals() iter.Seq2[Signal[T], error] {
 				if _, ok := keys.ParseCanonicalSignal(key); !ok {
 					return nil
 				}
-				sig, err := t.cfg.Codec.Decode(val)
-				if err != nil {
+				var sig Signal[T]
+				if err := cborDecMode.Unmarshal(val, &sig); err != nil {
 					if !yield(Signal[T]{}, err) {
 						return errStopIteration
 					}

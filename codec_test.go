@@ -1,7 +1,6 @@
 package story
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -15,9 +14,8 @@ type codecPayload struct {
 	Score int
 }
 
-func TestCBORCodec(t *testing.T) {
+func TestSignalCBORRoundTrip(t *testing.T) {
 	t.Run("round_trips_a_signal", func(t *testing.T) {
-		var c CBORCodec[codecPayload]
 		want := Signal[codecPayload]{
 			ID:         uuid.New(),
 			At:         time.Date(2024, 6, 1, 12, 0, 0, 123456789, time.UTC),
@@ -25,10 +23,11 @@ func TestCBORCodec(t *testing.T) {
 			Data:       codecPayload{Title: "headline", Score: 7},
 		}
 
-		b, err := c.Encode(want)
+		b, err := cborEncMode.Marshal(want)
 		require.NoError(t, err)
 
-		got, err := c.Decode(b)
+		var got Signal[codecPayload]
+		err = cborDecMode.Unmarshal(b, &got)
 		require.NoError(t, err)
 		assert.Equal(t, want.ID, got.ID)
 		assert.True(t, want.At.Equal(got.At))
@@ -38,8 +37,8 @@ func TestCBORCodec(t *testing.T) {
 	})
 
 	t.Run("malformed_input_returns_an_error", func(t *testing.T) {
-		var c CBORCodec[codecPayload]
-		_, err := c.Decode([]byte{0xff, 0xff})
+		var got Signal[codecPayload]
+		err := cborDecMode.Unmarshal([]byte{0xff, 0xff}, &got)
 		require.Error(t, err)
 	})
 }
@@ -120,7 +119,6 @@ func TestTrackerSignalID(t *testing.T) {
 		ns := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 			Namespace:     ns,
 		})
@@ -183,57 +181,5 @@ func TestCBORSignalHeader_SkipsPayload(t *testing.T) {
 
 	t.Logf("Allocs: small=%f, large=%f", allocsSmall, allocsLarge)
 	assert.InDelta(t, allocsSmall, allocsLarge, 1.0, "header decode must allocate constant memory regardless of payload size")
-}
-
-type customJSONCodec[T any] struct{}
-
-func (customJSONCodec[T]) Encode(sig Signal[T]) ([]byte, error) {
-	// Simple manual byte framing or custom JSON
-	return cborEncMode.Marshal(sig)
-}
-
-func (customJSONCodec[T]) Decode(b []byte) (Signal[T], error) {
-	var sig Signal[T]
-	err := cborDecMode.Unmarshal(b, &sig)
-	return sig, err
-}
-
-func TestCustomCodec_BatchFallback(t *testing.T) {
-	// A tracker with a non-CBORCodec implementation must fall back to Codec.Decode in collectBatch
-	tr, err := NewTracker[string](Config[string]{
-		Store:         newMemStore(),
-		Codec:         customJSONCodec[string]{},
-		BatchInterval: time.Hour,
-		MinStorySize:  2,
-	})
-	require.NoError(t, err)
-	defer tr.Close()
-
-	now := time.Now()
-	_, err = tr.Ingest(context.Background(), Signal[string]{
-		ID:         uuid.New(),
-		At:         now,
-		Embeddings: []Embedding{[]float32{1, 0}},
-		Data:       "custom-codec-1",
-	})
-	require.NoError(t, err)
-
-	_, err = tr.Ingest(context.Background(), Signal[string]{
-		ID:         uuid.New(),
-		At:         now,
-		Embeddings: []Embedding{[]float32{1, 0.01}},
-		Data:       "custom-codec-2",
-	})
-	require.NoError(t, err)
-
-	// Run batch to trigger collectBatch with the custom codec fallback
-	tr.runBatch()
-
-	// Verify stories were created
-	count := 0
-	for range tr.Stories(StoryStateAny) {
-		count++
-	}
-	assert.Equal(t, 1, count)
 }
 

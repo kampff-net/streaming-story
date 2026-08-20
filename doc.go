@@ -26,10 +26,9 @@
 // on rather than drawn at random, so replaying a signal stream against a fresh
 // store reproduces the same story IDs.
 //
-// Create a Tracker by supplying a Config with at least a Store and Codec:
+// Create a Tracker by supplying a Config with at least a Store:
 //
 //	t, err := story.NewTracker(story.Config[MyData]{
 //	    Store: myStore,
-//	    Codec: myCodec,
 //	})
 package story

@@ -17,18 +17,12 @@ import (
 func minimalConfig() Config[string] {
 	return Config[string]{
 		Store: newMemStore(),
-		Codec: CBORCodec[string]{},
 	}
 }
 
 func TestConfig_validate(t *testing.T) {
 	t.Run("nil_store_returns_error", func(t *testing.T) {
-		cfg := Config[string]{Codec: CBORCodec[string]{}}
-		require.Error(t, cfg.validate())
-	})
-
-	t.Run("nil_codec_returns_error", func(t *testing.T) {
-		cfg := Config[string]{Store: newMemStore()}
+		cfg := Config[string]{}
 		require.Error(t, cfg.validate())
 	})
 
@@ -215,26 +209,26 @@ func TestConfig_validate(t *testing.T) {
 // --- MaxFacetsPerSignal (spec 007 §2.2.5) ---
 
 func TestConfig_MaxFacetsPerSignalDefault(t *testing.T) {
-	cfg := Config[string]{Store: newMemStore(), Codec: CBORCodec[string]{}}
+	cfg := Config[string]{Store: newMemStore()}
 	require.NoError(t, cfg.validate())
 	assert.Equal(t, 8, cfg.MaxFacetsPerSignal)
 }
 
 func TestConfig_MaxFacetsPerSignalBounds(t *testing.T) {
 	for _, n := range []int{-1, keys.MaxFacet + 1} {
-		cfg := Config[string]{Store: newMemStore(), Codec: CBORCodec[string]{}, MaxFacetsPerSignal: n}
+		cfg := Config[string]{Store: newMemStore(), MaxFacetsPerSignal: n}
 		err := cfg.validate()
 		require.Error(t, err, "MaxFacetsPerSignal %d must be rejected", n)
 		assert.Contains(t, err.Error(), "MaxFacetsPerSignal")
 	}
 
-	cfg := Config[string]{Store: newMemStore(), Codec: CBORCodec[string]{}, MaxFacetsPerSignal: keys.MaxFacet}
+	cfg := Config[string]{Store: newMemStore(), MaxFacetsPerSignal: keys.MaxFacet}
 	assert.NoError(t, cfg.validate())
 }
 
 func TestConfig_IngestRejectsTooManyFacets(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
-		Store: newMemStore(), Codec: CBORCodec[string]{},
+		Store: newMemStore(),
 		BatchInterval: time.Hour, MaxFacetsPerSignal: 2,
 	})
 	require.NoError(t, err)

@@ -24,15 +24,15 @@ import, so those packages can be reshaped freely.
 
 | Package | Holds |
 |---|---|
-| `story` (root) | Public types, `Config`, `Store`/`Tx`, `MemStore`, `CBORCodec`, and the `Tracker`: ingest, batch orchestration, persistence, events. |
+| `story` (root) | Public types, `Config`, `Store`/`Tx`, `MemStore`, and the `Tracker`: ingest, batch orchestration, persistence, events. |
 | `internal/geom` | Vector geometry: the corpus mean, the projector that centres against it, group statistics, the quadratic angular bound. |
 | `internal/cluster` | Grouping decisions over an index-based `Point`: growth, cliques, split, merge planning. Pure — no store, no clock, no `Config`. |
 | `internal/keys` | The KV key schema and its parsers. Nothing else assembles a key. |
 | `internal/dist` | Cosine distance over BLAS. |
 
 Root files are grouped by function, not by type: `types.go` (public types and
-events), `config.go` (knobs and validation), `store.go` (the `Store`/`Tx`/`Codec`
-contracts plus `MemStore` and `JSONCodec`), `tracker.go` (lifecycle, batch loop,
+events), `config.go` (knobs and validation), `store.go` (the `Store`/`Tx`
+contracts plus `MemStore`), `cbor.go` (canonical CBOR encoding), `tracker.go` (lifecycle, batch loop,
 subscriber fan-out), `ingest.go` (the Draft path), `threshold.go` (admission
 radius policy, shared by Draft and by outlier admission), `batch.go` (collection,
 apply window, snapshot, buffer drain), `maintain.go` (the pass itself),
@@ -104,7 +104,7 @@ A buffered `Ingest` still returns a provisional story ID. It is computed from `d
 
 ### Library Conveniences
 
-- `story.CBORCodec[T]` is the shipped default `Codec`; supply a custom one only for a non-CBOR format.
+- Canonical CBOR is the built-in and only signal encoding used for persistence.
 - `Tracker.SignalID(domainKey)` derives the UUID v5 signal ID under `Config.Namespace`. Prefer it over calling `uuid.NewSHA1(story.TrackerNamespace, ...)` directly, which ignores a configured namespace.
 - `Config.OnBatchError` is the only way to observe a failed batch run: a failure leaves the store untouched, returns an empty summary, and the next tick retries.
 - `Config.InitialSigmaGlobal` (default 0.25) is the σ_global stand-in before the first batch measures one. Until then every story is in cold-start, so this single value decides the Draft assignment radius.

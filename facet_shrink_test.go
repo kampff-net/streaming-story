@@ -45,7 +45,6 @@ func shrinkTracker(t *testing.T) *Tracker[string] {
 	t.Helper()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour, // the ticker must not fire mid-test
 		MinStorySize:  2,
 	})

@@ -123,7 +123,6 @@ func TestHostileStore_IngestAndBatch(t *testing.T) {
 	store := newHostileStore()
 	tr, err := NewTracker[string](Config[string]{
 		Store:           store,
-		Codec:           CBORCodec[string]{},
 		BatchInterval:   time.Hour,
 		MinStorySize:    2,
 		AssignThreshold: 0.3,

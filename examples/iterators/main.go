@@ -15,7 +15,6 @@ func main() {
 	store := story.NewMemStore()
 	cfg := story.Config[SimplePayload]{
 		Store: store,
-		Codec: story.CBORCodec[SimplePayload]{},
 	}
 
 	tracker, err := story.NewTracker(cfg)

@@ -29,7 +29,6 @@ func TestOnBatchError(t *testing.T) {
 		var got []error
 		tr, err := NewTracker[string](Config[string]{
 			Store:         &errWriteStore{Store: NewMemStore(), err: want},
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 			OnBatchError: func(err error) {
 				mu.Lock()
@@ -51,7 +50,6 @@ func TestOnBatchError(t *testing.T) {
 	t.Run("absent_callback_is_not_fatal", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         &errWriteStore{Store: NewMemStore(), err: errors.New("boom")},
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -66,7 +64,6 @@ func TestIngestDoesNotOutliveClose(t *testing.T) {
 	// so a concurrent Ingest either completes or reports the closed tracker.
 	tr, err := NewTracker[string](Config[string]{
 		Store:         NewMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)

@@ -144,9 +144,6 @@ type Config[T any] struct {
 	IngestBufferCap int // signals buffered in memory during batch Apply (default: 10_000)
 	EventBufferSize int // per-subscriber channel buffer depth (default: 512)
 
-	// Codec encodes and decodes Signal[T] for persistence. Required.
-	Codec Codec[T]
-
 	// OnBatchError, if set, is called with any error that aborts a batch run.
 	// A failed run leaves the store untouched and the next tick retries, so
 	// this is the only way to observe batch failures. It is called from the
@@ -158,9 +155,6 @@ type Config[T any] struct {
 func (c *Config[T]) validate() error {
 	if c.Store == nil {
 		return fmt.Errorf("story: Config.Store is required")
-	}
-	if c.Codec == nil {
-		return fmt.Errorf("story: Config.Codec is required")
 	}
 
 	if c.Namespace == (uuid.UUID{}) {

@@ -6,9 +6,7 @@ import (
 	"sync"
 )
 
-// The persistence and encoding contracts, and the implementations shipped
-// for them: MemStore for tests and small deployments, CBORCodec as the
-// default payload encoding.
+// The persistence contract and the in-memory implementation shipped with the library.
 
 // Store is the persistence interface used by Tracker.
 //
@@ -57,33 +55,6 @@ type Tx interface {
 	// ScanPrefix calls fn for every key that begins with prefix, in ascending
 	// key order. Iteration stops when fn returns a non-nil error.
 	ScanPrefix(prefix []byte, fn func(key, val []byte) error) error
-}
-
-// Codec encodes and decodes Signal[T] values for persistence.
-type Codec[T any] interface {
-	Encode(sig Signal[T]) ([]byte, error)
-	Decode(b []byte) (Signal[T], error)
-}
-
-// CBORCodec encodes signals with canonical CBOR (github.com/fxamacker/cbor/v2)
-// using integer keys. It is the default choice.
-type CBORCodec[T any] struct{}
-
-// Compile-time interface check.
-var _ Codec[struct{}] = CBORCodec[struct{}]{}
-
-// Encode implements Codec.
-func (CBORCodec[T]) Encode(sig Signal[T]) ([]byte, error) {
-	return cborEncMode.Marshal(sig)
-}
-
-// Decode implements Codec.
-func (CBORCodec[T]) Decode(b []byte) (Signal[T], error) {
-	var sig Signal[T]
-	if err := cborDecMode.Unmarshal(b, &sig); err != nil {
-		return Signal[T]{}, err
-	}
-	return sig, nil
 }
 
 // MemStore is a thread-safe in-memory Store implementation suitable for tests and lightweight usage.

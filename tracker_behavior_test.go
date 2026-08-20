@@ -383,7 +383,6 @@ func TestTracker_Ingest_ExcludesStaleStories(t *testing.T) {
 func TestTracker_Subscribe_AfterCloseReturnsClosedChannel(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
@@ -397,7 +396,6 @@ func TestTracker_Subscribe_AfterCloseReturnsClosedChannel(t *testing.T) {
 func TestTracker_Close_IsIdempotent(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
@@ -652,7 +650,6 @@ func TestTracker_Ingest_AveragedVectorOrphansButFacetsPlace(t *testing.T) {
 	newSeeded := func() *Tracker[string] {
 		tr, err := NewTracker[string](Config[string]{
 			Store:           newMemStore(),
-			Codec:           CBORCodec[string]{},
 			BatchInterval:   time.Hour,
 			AssignThreshold: 0.20,
 			MergeThreshold:  0.10,

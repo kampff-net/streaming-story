@@ -19,7 +19,6 @@ func newTestTracker(t *testing.T) *Tracker[string] {
 	t.Helper()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
@@ -66,12 +65,7 @@ func TestNewTracker(t *testing.T) {
 	})
 
 	t.Run("nil_store_returns_error", func(t *testing.T) {
-		_, err := NewTracker[string](Config[string]{Codec: CBORCodec[string]{}})
-		require.Error(t, err)
-	})
-
-	t.Run("nil_codec_returns_error", func(t *testing.T) {
-		_, err := NewTracker[string](Config[string]{Store: newMemStore()})
+		_, err := NewTracker[string](Config[string]{})
 		require.Error(t, err)
 	})
 
@@ -86,7 +80,6 @@ func TestNewTracker(t *testing.T) {
 
 		tr, err := NewTracker[string](Config[string]{
 			Store:         ms,
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -117,7 +110,6 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("returns_without_blocking", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -135,7 +127,6 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("closes_subscriber_channels", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -177,7 +168,6 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("does_not_block_on_full_channel", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:           newMemStore(),
-			Codec:           CBORCodec[string]{},
 			BatchInterval:   time.Hour,
 			EventBufferSize: 1,
 		})
@@ -207,7 +197,6 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("no_op_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -384,7 +373,6 @@ func TestTracker_Ingest(t *testing.T) {
 	t.Run("returns_error_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -395,17 +383,6 @@ func TestTracker_Ingest(t *testing.T) {
 		})
 		require.Error(t, err)
 	})
-}
-
-// errDecodeFailed is returned by failingDecodeCodec to prove that a codec
-// failure reaches the caller unchanged.
-var errDecodeFailed = errors.New("codec decode failed")
-
-// failingDecodeCodec encodes normally but always fails to decode.
-type failingDecodeCodec[T any] struct{ CBORCodec[T] }
-
-func (failingDecodeCodec[T]) Decode([]byte) (Signal[T], error) {
-	return Signal[T]{}, errDecodeFailed
 }
 
 func TestTracker_Signal(t *testing.T) {
@@ -556,7 +533,7 @@ func TestTracker_Signal(t *testing.T) {
 		assert.True(t, errors.Is(err, ErrNotFound))
 	})
 
-	t.Run("codec_error_propagates_not_ErrNotFound", func(t *testing.T) {
+	t.Run("decode_error_propagates_not_ErrNotFound", func(t *testing.T) {
 		tr := newTestTracker(t)
 		sigID := uuid.New()
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
@@ -569,26 +546,6 @@ func TestTracker_Signal(t *testing.T) {
 		assert.Contains(t, err.Error(), "decode signal")
 	})
 
-	t.Run("codec_decode_error_propagates_not_ErrNotFound", func(t *testing.T) {
-		tr, err := NewTracker[string](Config[string]{
-			Store:         newMemStore(),
-			Codec:         failingDecodeCodec[string]{},
-			BatchInterval: time.Hour,
-		})
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = tr.Close() })
-
-		sigID := uuid.New()
-		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
-			return tx.Put(keys.CanonicalSignal(sigID), []byte("payload"))
-		}))
-
-		_, err = tr.Signal(sigID)
-		require.Error(t, err)
-		assert.False(t, errors.Is(err, ErrNotFound))
-		assert.True(t, errors.Is(err, errDecodeFailed))
-	})
-
 	// Signal must behave like the other read accessors after Close: whatever
 	// the store does with reads post-close, Story and Signal agree.
 	t.Run("after_close_matches_other_accessors", func(t *testing.T) {
@@ -596,7 +553,7 @@ func TestTracker_Signal(t *testing.T) {
 		sigID := uuid.New()
 		storyID := uuid.New()
 		sig := Signal[string]{ID: sigID, Data: "post-close-signal"}
-		b, err := tr.cfg.Codec.Encode(sig)
+		b, err := cborEncMode.Marshal(sig)
 		require.NoError(t, err)
 		require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 			if err := tx.Put(keys.CanonicalSignal(sigID), b); err != nil {

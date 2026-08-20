@@ -13,7 +13,6 @@ import (
 
 func TestSplitRecord_ColdStartPopulatesIndex(t *testing.T) {
 	store := NewMemStore()
-	codec := CBORCodec[string]{}
 
 	storyID := uuid.New()
 	now := time.Now()
@@ -50,7 +49,6 @@ func TestSplitRecord_ColdStartPopulatesIndex(t *testing.T) {
 	// Open a fresh tracker over this store.
 	tr, err := NewTracker[string](Config[string]{
 		Store:         store,
-		Codec:         codec,
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)
@@ -69,11 +67,9 @@ func TestSplitRecord_ColdStartPopulatesIndex(t *testing.T) {
 
 func TestSplitRecord_IngestNeverMutatesStoryMeta(t *testing.T) {
 	store := NewMemStore()
-	codec := CBORCodec[string]{}
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         store,
-		Codec:         codec,
 		BatchInterval: time.Hour,
 	})
 	require.NoError(t, err)

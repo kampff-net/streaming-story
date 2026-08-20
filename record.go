@@ -178,7 +178,7 @@ func (t *Tracker[T]) writeCanonicalSignal(tx Tx, sig Signal[T]) error {
 	if existing != nil {
 		return nil
 	}
-	encoded, err := t.cfg.Codec.Encode(sig)
+	encoded, err := cborEncMode.Marshal(sig)
 	if err != nil {
 		return fmt.Errorf("encode signal: %w", err)
 	}
@@ -234,7 +234,7 @@ func (t *Tracker[T]) reconcileFacetCount(tx Tx, id uuid.UUID, want int) error {
 	}
 
 	stored.Embeddings = stored.Embeddings[:want]
-	encoded, err := t.cfg.Codec.Encode(stored)
+	encoded, err := cborEncMode.Marshal(stored)
 	if err != nil {
 		return fmt.Errorf("encode signal: %w", err)
 	}
@@ -252,8 +252,8 @@ func (t *Tracker[T]) readCanonicalSignal(tx Tx, id uuid.UUID) (Signal[T], bool, 
 	if b == nil {
 		return Signal[T]{}, false, nil
 	}
-	sig, err := t.cfg.Codec.Decode(b)
-	if err != nil {
+	var sig Signal[T]
+	if err := cborDecMode.Unmarshal(b, &sig); err != nil {
 		return Signal[T]{}, false, fmt.Errorf("decode signal %s: %w", id, err)
 	}
 	return sig, true, nil
@@ -269,8 +269,7 @@ type cborSignalHeader struct {
 }
 
 // readSignalHeader reads timestamp and embeddings from the canonical record,
-// skipping the caller payload T when the configured codec is CBORCodec[T].
-// For custom codecs, it falls back to full Decode.
+// skipping the caller payload T.
 func (t *Tracker[T]) readSignalHeader(tx Tx, id uuid.UUID) (time.Time, []Embedding, bool, error) {
 	b, err := tx.Get(keys.CanonicalSignal(id))
 	if err != nil {
@@ -279,18 +278,11 @@ func (t *Tracker[T]) readSignalHeader(tx Tx, id uuid.UUID) (time.Time, []Embeddi
 	if b == nil {
 		return time.Time{}, nil, false, nil
 	}
-	if _, isCBOR := t.cfg.Codec.(CBORCodec[T]); isCBOR {
-		var hdr cborSignalHeader
-		if err := cborDecMode.Unmarshal(b, &hdr); err != nil {
-			return time.Time{}, nil, false, fmt.Errorf("decode signal header %s: %w", id, err)
-		}
-		return hdr.At, hdr.Embeddings, true, nil
+	var hdr cborSignalHeader
+	if err := cborDecMode.Unmarshal(b, &hdr); err != nil {
+		return time.Time{}, nil, false, fmt.Errorf("decode signal header %s: %w", id, err)
 	}
-	sig, err := t.cfg.Codec.Decode(b)
-	if err != nil {
-		return time.Time{}, nil, false, fmt.Errorf("decode signal %s: %w", id, err)
-	}
-	return sig.At, sig.Embeddings, true, nil
+	return hdr.At, hdr.Embeddings, true, nil
 }
 
 // Facet placement. A facet lives in exactly one of three states: under a story,

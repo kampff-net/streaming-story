@@ -90,7 +90,6 @@ func TestProvisionalStory(t *testing.T) {
 		t.Helper()
 		tr, err := NewTracker[string](Config[string]{
 			Store:         NewMemStore(),
-			Codec:         CBORCodec[string]{},
 			BatchInterval: time.Hour,
 		})
 		require.NoError(t, err)
@@ -173,7 +172,6 @@ func TestIngestDuringApplyReturnsProvisionalStory(t *testing.T) {
 	}
 	tr, err := NewTracker[string](Config[string]{
 		Store:         store,
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		MinStorySize:  3,
 	})

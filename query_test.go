@@ -168,7 +168,8 @@ func storeInvariants(t *testing.T, tr *Tracker[string]) {
 			if !ok {
 				return nil
 			}
-			sig, err := tr.cfg.Codec.Decode(val)
+			var sig Signal[string]
+			err := cborDecMode.Unmarshal(val, &sig)
 			require.NoError(t, err)
 			records[id] = len(sig.Embeddings)
 			return nil
@@ -281,7 +282,6 @@ func TestStoreInvariants_HoldForMultiFacetSignals(t *testing.T) {
 func TestStoreInvariants_HoldAfterEviction(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		Codec:         CBORCodec[string]{},
 		BatchInterval: time.Hour,
 		OutlierTTL:    time.Nanosecond,
 	})

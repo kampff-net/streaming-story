@@ -24,7 +24,6 @@ func main() {
 	// Configure the Tracker
 	cfg := story.Config[ArticlePayload]{
 		Store:         store,
-		Codec:         story.CBORCodec[ArticlePayload]{},
 		BatchWindow:   24 * time.Hour,
 		BatchInterval: 30 * time.Minute,
 	}

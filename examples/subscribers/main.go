@@ -23,7 +23,6 @@ func main() {
 	store := story.NewMemStore()
 	cfg := story.Config[NewsPayload]{
 		Store:           store,
-		Codec:           story.CBORCodec[NewsPayload]{},
 		BatchInterval:   500 * time.Millisecond,
 		EventBufferSize: 128,
 		// A demo corpus is far narrower than a real one, so leave more of the
