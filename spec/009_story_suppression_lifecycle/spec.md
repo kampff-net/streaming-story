@@ -1,10 +1,10 @@
 # SDD Spec: Story Suppression Lifecycle & Tracker State
 
 ## Metadata
-* **Status:** `IMPLEMENTING`
+* **Status:** `COMPLETED`
 * **Author:** Consigliere
 * **Created:** 2026-08-19
-* **Last Updated:** 2026-08-20
+* **Last Updated:** 2026-08-26
 * **Approver:** Codefather
 
 ---
@@ -264,13 +264,13 @@ default:
 - [x] Linter / `golangci-lint` clean on changed files (repo has 8 pre-existing findings in unrelated test files, untouched by this spec).
 - [x] Unit tests pass with 100% success rate — full suite, including under `-race`.
 - [x] Benchmarks show no regression: `BenchmarkIngestSteadyState`/`BenchmarkIngestDuringApply` unaffected — the Draft-phase change adds one struct field write and one `if` per newly-placed story, no new allocation or branch on the non-suppressed path.
-- [ ] Approved by Codefather.
+- [x] Approved by Codefather.
 
 ---
 
 ## Phase 5: Completed
-- [ ] All Phase 4 items `[x]`.
-- [ ] No regressions.
-- [ ] Spec document reflects actual implementation.
-- [ ] `spec/README.md` updated to `COMPLETED`.
-- [ ] Approved by Codefather.
+- [x] All Phase 4 items `[x]`.
+- [x] No regressions.
+- [x] Spec document reflects actual implementation.
+- [x] `spec/README.md` updated to `COMPLETED`.
+- [x] Approved by Codefather.
