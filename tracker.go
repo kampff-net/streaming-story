@@ -74,12 +74,7 @@ func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 		return nil, fmt.Errorf("story: load calibration state: %w", err)
 	}
 
-	var idx *activeStoryIndex
-	err := cfg.Store.View(func(tx Tx) error {
-		var err error
-		idx, err = t.buildActiveStoryIndex(tx)
-		return err
-	})
+	idx, err := t.buildActiveStoryIndex(cfg.Store)
 	if err != nil {
 		return nil, fmt.Errorf("story: build story index: %w", err)
 	}

@@ -55,11 +55,7 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 		mean              []float32
 		droppedMismatches int
 	)
-	err := t.cfg.Store.View(func(tx Tx) error {
-		var err error
-		signals, stories, evict, mean, droppedMismatches, err = t.collectBatch(tx, now)
-		return err
-	})
+	signals, stories, evict, mean, droppedMismatches, err := t.collectBatch(t.cfg.Store, now)
 	if err != nil {
 		t.reportBatchError(fmt.Errorf("story: batch collect: %w", err))
 		return &BatchSummary{}
@@ -87,12 +83,10 @@ func (t *Tracker[T]) runBatchCore() *BatchSummary {
 	summary.DimensionMismatchesDropped = droppedMismatches
 
 	// Rebuild and atomically swap activeStoryIndex with the updated store state
-	var newIdx *activeStoryIndex
-	_ = t.cfg.Store.View(func(tx Tx) error {
-		var err error
-		newIdx, err = t.buildActiveStoryIndex(tx)
-		return err
-	})
+	newIdx, err := t.buildActiveStoryIndex(t.cfg.Store)
+	if err != nil {
+		t.reportBatchError(fmt.Errorf("story: rebuild story index: %w", err))
+	}
 	if newIdx != nil {
 		t.storyIndex.Store(newIdx)
 	}
@@ -136,10 +130,9 @@ func (t *Tracker[T]) drainBuffer() {
 // Membership is read in full rather than windowed because the lifetime
 // centroid is the mean of every member; reading a window would compute a
 // centre that slides as old signals age out.
-func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.UUID]storyRecord, []uuid.UUID, []float32, int, error) {
+func (t *Tracker[T]) collectBatch(r Reader, now time.Time) ([]batchFacet, map[uuid.UUID]storyRecord, []uuid.UUID, []float32, int, error) {
 	var (
 		signals           []batchFacet
-		stories           = make(map[uuid.UUID]storyRecord)
 		evict             []uuid.UUID
 		meanSum           []float32
 		meanCount         int
@@ -147,8 +140,23 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 	)
 	dim := int(t.dim.Load())
 
+	// Collection runs in phases, and the phase boundaries are the point: the
+	// Reader contract forbids calling back into the store from inside a scan
+	// callback, so every marker is copied out first and every record is read
+	// afterwards, with no scan open. Markers are 24 bytes each — the records
+	// they name are what would be expensive to hold.
+	stories, order, err := t.collectStories(r)
+	if err != nil {
+		return nil, nil, nil, nil, 0, err
+	}
+
+	markers, err := collectMarkers(r, order)
+	if err != nil {
+		return nil, nil, nil, nil, 0, err
+	}
+
 	// A signal with several facets is named by several markers, so a batch
-	// that decoded per marker decoded it once per facet. Cache what a
+	// that decoded per marker would decode it once per facet. Cache what a
 	// batchFacet actually needs and nothing else: holding the whole record
 	// would keep every payload in the batch alive for the length of the
 	// collect, and the payload is the bulk of it.
@@ -161,7 +169,7 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 		if s, ok := sigCache[sigID]; ok {
 			return s, s != nil, nil
 		}
-		at, embs, found, err := t.readSignalHeader(tx, sigID)
+		at, embs, found, err := t.readSignalHeader(r, sigID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -174,92 +182,34 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 		return c, true, nil
 	}
 
-	err := tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
-		id, ok := keys.ParseStoryMeta(key)
-		if !ok {
-			return nil
-		}
-		var rec storyRecord
-		if err := cborStrictDecMode.Unmarshal(val, &rec); err != nil {
-			return nil
-		}
-		if rec.State == StoryStateArchived {
-			return nil
-		}
-		stories[id] = rec
+	outlierCutoff := t.lastBatch.Add(-t.cfg.OutlierTTL)
 
-		// Collect every member facet. The lifetime centroid is the mean of all
-		// of them (spec 006 §2.7), so a window-scoped read would compute a
-		// different, drifting centre. The markers carry no payload, so each
-		// referenced signal is read from its canonical record.
-		prefix := keys.FacetPrefix(id)
-		return tx.ScanPrefix(prefix, func(key, _ []byte) error {
-			sigID, facet, ok := keys.ParseFacetMember(key, prefix)
-			if !ok {
-				return nil
-			}
-			sig, found, err := getSignal(sigID)
-			if err != nil {
-				return err
-			}
-			if !found || facet >= len(sig.embs) {
-				// A marker with no record behind it, or naming a facet the
-				// record does not have. Skip rather than fail: the store
-				// invariant test is what catches this, and a batch run must
-				// not be stopped by one bad key.
-				return nil
-			}
-			emb := sig.embs[facet]
-			if dim > 0 && len(emb) != dim {
-				droppedMismatches++
-				return nil
-			}
-			if len(meanSum) == 0 {
-				meanSum = make([]float32, len(emb))
-			}
-			for i, v := range emb {
-				meanSum[i] += v
-			}
-			meanCount++
-			signals = append(signals, batchFacet{
-				id:      sigID,
-				facet:   facet,
-				at:      sig.at,
-				emb:     emb,
-				storyID: id,
-			})
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, nil, nil, nil, 0, err
-	}
-
-	// Outliers: collect those within lastBatch − OutlierTTL and flag the rest
-	// for eviction. The reference is lastBatch, not wall-clock now, so
-	// maintenance pauses do not cause mass eviction.
-	err = tx.ScanPrefix(keys.OutlierPrefix(), func(key, _ []byte) error {
-		sigID, facet, ok := keys.ParseOutlierFacet(key)
-		if !ok {
-			return nil
-		}
-		sig, found, err := getSignal(sigID)
+	for _, m := range markers {
+		sig, found, err := getSignal(m.sigID)
 		if err != nil {
-			return err
+			return nil, nil, nil, nil, 0, err
 		}
-		if !found || facet >= len(sig.embs) {
-			return nil
+		if !found || m.facet >= len(sig.embs) {
+			// A marker with no record behind it, or naming a facet the record
+			// does not have. Skip rather than fail: the store invariant test
+			// is what catches this, and a batch run must not be stopped by one
+			// bad key.
+			continue
 		}
-		// The TTL is a property of the signal's timestamp, so every unplaced
-		// facet of an aged signal is evicted in the same pass.
-		if sig.at.Before(t.lastBatch.Add(-t.cfg.OutlierTTL)) {
-			evict = append(evict, sigID)
-			return nil
+
+		// The outlier TTL is a property of the signal's timestamp, so every
+		// unplaced facet of an aged signal is evicted in the same pass. The
+		// reference is lastBatch, not wall-clock now, so maintenance pauses do
+		// not cause mass eviction.
+		if m.outlier && sig.at.Before(outlierCutoff) {
+			evict = append(evict, m.sigID)
+			continue
 		}
-		emb := sig.embs[facet]
+
+		emb := sig.embs[m.facet]
 		if dim > 0 && len(emb) != dim {
 			droppedMismatches++
-			return nil
+			continue
 		}
 		if len(meanSum) == 0 {
 			meanSum = make([]float32, len(emb))
@@ -269,17 +219,13 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 		}
 		meanCount++
 		signals = append(signals, batchFacet{
-			id:      sigID,
-			facet:   facet,
+			id:      m.sigID,
+			facet:   m.facet,
 			at:      sig.at,
 			emb:     emb,
-			storyID: uuid.Nil,
-			outlier: true,
+			storyID: m.storyID,
+			outlier: m.outlier,
 		})
-		return nil
-	})
-	if err != nil {
-		return nil, nil, nil, nil, 0, err
 	}
 
 	var mean []float32
@@ -292,6 +238,83 @@ func (t *Tracker[T]) collectBatch(tx Tx, now time.Time) ([]batchFacet, map[uuid.
 	}
 
 	return signals, stories, evict, mean, droppedMismatches, nil
+}
+
+// collectStories reads every non-archived story record. It returns the records
+// keyed by ID and the IDs in store order, because map iteration order is random
+// and the order stories are visited decides the order of the collected facets —
+// which the batch's output must not depend on the runtime for.
+func (t *Tracker[T]) collectStories(r Reader) (map[uuid.UUID]storyRecord, []uuid.UUID, error) {
+	stories := make(map[uuid.UUID]storyRecord)
+	var order []uuid.UUID
+
+	err := r.ScanPrefix([]byte("s:"), func(key, val []byte) error {
+		id, ok := keys.ParseStoryMeta(key)
+		if !ok {
+			return nil
+		}
+		var rec storyRecord
+		if err := cborStrictDecMode.Unmarshal(val, &rec); err != nil {
+			return nil
+		}
+		if rec.State == StoryStateArchived {
+			return nil
+		}
+		stories[id] = rec
+		order = append(order, id)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return stories, order, nil
+}
+
+// batchMarker names one membership marker: which signal, which of its facets,
+// and where the facet sits. Markers carry no payload, so the record each one
+// refers to is read separately.
+type batchMarker struct {
+	sigID   uuid.UUID
+	facet   int
+	storyID uuid.UUID // uuid.Nil for an outlier
+	outlier bool
+}
+
+// collectMarkers copies out every membership marker: one scan per story in the
+// given order, then one over the outlier bucket. Membership is read in full
+// rather than windowed because the lifetime centroid is the mean of every
+// member; reading a window would compute a centre that slides as old signals
+// age out.
+func collectMarkers(r Reader, order []uuid.UUID) ([]batchMarker, error) {
+	var markers []batchMarker
+
+	for _, id := range order {
+		prefix := keys.FacetPrefix(id)
+		err := r.ScanPrefix(prefix, func(key, _ []byte) error {
+			sigID, facet, ok := keys.ParseFacetMember(key, prefix)
+			if !ok {
+				return nil
+			}
+			markers = append(markers, batchMarker{sigID: sigID, facet: facet, storyID: id})
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err := r.ScanPrefix(keys.OutlierPrefix(), func(key, _ []byte) error {
+		sigID, facet, ok := keys.ParseOutlierFacet(key)
+		if !ok {
+			return nil
+		}
+		markers = append(markers, batchMarker{sigID: sigID, facet: facet, outlier: true})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return markers, nil
 }
 
 // sampleGroup is a group of signal indices for stratified sampling.
@@ -375,5 +398,3 @@ func migrateFacets(tx Tx, from, to uuid.UUID) error {
 	}
 	return nil
 }
-
-

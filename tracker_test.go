@@ -243,13 +243,9 @@ func TestTracker_saveCalibState(t *testing.T) {
 	}))
 
 	var got calibState
-	require.NoError(t, ms.View(func(tx Tx) error {
-		b, err := tx.Get(keys.CalibState())
-		if err != nil {
-			return err
-		}
-		return cborStrictDecMode.Unmarshal(b, &got)
-	}))
+	b, err := ms.Get(keys.CalibState())
+	require.NoError(t, err)
+	require.NoError(t, cborStrictDecMode.Unmarshal(b, &got))
 
 	assert.Equal(t, 32, got.Dim)
 	assert.Equal(t, 0.99, got.SigmaGlobal)
@@ -259,10 +255,7 @@ func TestTracker_saveCalibState(t *testing.T) {
 func TestTracker_readStoryMeta(t *testing.T) {
 	t.Run("missing_key_returns_ErrNotFound", func(t *testing.T) {
 		tr := &Tracker[string]{cfg: Config[string]{Store: newMemStore()}}
-		err := tr.cfg.Store.View(func(tx Tx) error {
-			_, e := tr.readStoryMeta(tx, uuid.New())
-			return e
-		})
+		_, err := tr.readStoryMeta(tr.cfg.Store, uuid.New())
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, ErrNotFound))
 	})
@@ -284,11 +277,8 @@ func TestTracker_readStoryMeta(t *testing.T) {
 
 		tr := &Tracker[string]{cfg: Config[string]{Store: ms}}
 		var meta StoryMeta
-		require.NoError(t, ms.View(func(tx Tx) error {
-			var e error
-			meta, e = tr.readStoryMeta(tx, id)
-			return e
-		}))
+		meta, err := tr.readStoryMeta(ms, id)
+		require.NoError(t, err)
 
 		assert.Equal(t, id, meta.ID)
 		assert.Equal(t, StoryStateActive, meta.State)
@@ -487,11 +477,8 @@ func TestTracker_Signal(t *testing.T) {
 		tr.runBatch()
 
 		// The signal now lives under story A; Signal must follow the index.
-		require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-			assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyB, trackedID, 0)), "signal must leave retired story B")
-			assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyA, trackedID, 0)), "signal must land under survivor story A")
-			return nil
-		}))
+		assert.Nil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyB, trackedID, 0)), "signal must leave retired story B")
+		assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyA, trackedID, 0)), "signal must land under survivor story A")
 
 		after, err := tr.Signal(trackedID)
 		require.NoError(t, err)

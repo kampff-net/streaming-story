@@ -1,6 +1,7 @@
 package story
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,25 +12,22 @@ func newMemStore() *MemStore {
 	return NewMemStore()
 }
 
+// errTestStop stops a scan early in tests that assert on that path.
+var errTestStop = errors.New("stop")
+
 func TestMemStore_PutGet(t *testing.T) {
 	ms := newMemStore()
 	key := []byte("k")
 
 	require.NoError(t, ms.Update(func(tx Tx) error { return tx.Put(key, []byte("v")) }))
-	require.NoError(t, ms.View(func(tx Tx) error {
-		v, err := tx.Get(key)
-		require.NoError(t, err)
-		assert.Equal(t, []byte("v"), v)
-		return nil
-	}))
+	v, err := ms.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), v)
 
 	// Get returns nil for missing keys, not an empty slice.
-	require.NoError(t, ms.View(func(tx Tx) error {
-		v, err := tx.Get([]byte("missing"))
-		require.NoError(t, err)
-		assert.Nil(t, v)
-		return nil
-	}))
+	v, err = ms.Get([]byte("missing"))
+	require.NoError(t, err)
+	assert.Nil(t, v)
 }
 
 func TestMemStore_PutRejectsEmptyValue(t *testing.T) {
@@ -43,21 +41,13 @@ func TestMemStore_GetReturnsCopy(t *testing.T) {
 	key := []byte("k")
 	require.NoError(t, ms.Update(func(tx Tx) error { return tx.Put(key, []byte("original")) }))
 
-	var first []byte
-	require.NoError(t, ms.View(func(tx Tx) error {
-		v, err := tx.Get(key)
-		require.NoError(t, err)
-		first = v
-		first[0] = 'X'
-		return nil
-	}))
+	first, err := ms.Get(key)
+	require.NoError(t, err)
+	first[0] = 'X'
 
-	require.NoError(t, ms.View(func(tx Tx) error {
-		v, err := tx.Get(key)
-		require.NoError(t, err)
-		assert.Equal(t, "original", string(v), "mutation of a returned slice must not corrupt the store")
-		return nil
-	}))
+	v, err := ms.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, "original", string(v), "mutation of a returned slice must not corrupt the store")
 }
 
 func TestMemStore_Delete(t *testing.T) {
@@ -67,12 +57,9 @@ func TestMemStore_Delete(t *testing.T) {
 	// Deleting a missing key is not an error.
 	require.NoError(t, ms.Update(func(tx Tx) error { return tx.Delete([]byte("a")) }))
 
-	require.NoError(t, ms.View(func(tx Tx) error {
-		v, err := tx.Get([]byte("a"))
-		require.NoError(t, err)
-		assert.Nil(t, v)
-		return nil
-	}))
+	v, err := ms.Get([]byte("a"))
+	require.NoError(t, err)
+	assert.Nil(t, v)
 }
 
 func TestMemStore_DeletePrefix(t *testing.T) {
@@ -87,17 +74,14 @@ func TestMemStore_DeletePrefix(t *testing.T) {
 	}))
 	require.NoError(t, ms.Update(func(tx Tx) error { return tx.DeletePrefix([]byte("s:")) }))
 
-	require.NoError(t, ms.View(func(tx Tx) error {
-		for _, k := range [][]byte{[]byte("s:a"), []byte("s:ab"), []byte("s:b")} {
-			v, err := tx.Get(k)
-			require.NoError(t, err)
-			assert.Nil(t, v, "key %q must be deleted", k)
-		}
-		v, err := tx.Get([]byte("o:x"))
+	for _, k := range [][]byte{[]byte("s:a"), []byte("s:ab"), []byte("s:b")} {
+		v, err := ms.Get(k)
 		require.NoError(t, err)
-		assert.NotNil(t, v, "unrelated key must survive")
-		return nil
-	}))
+		assert.Nil(t, v, "key %q must be deleted", k)
+	}
+	v, err := ms.Get([]byte("o:x"))
+	require.NoError(t, err)
+	assert.NotNil(t, v, "unrelated key must survive")
 }
 
 func TestMemStore_ScanPrefix(t *testing.T) {
@@ -112,21 +96,17 @@ func TestMemStore_ScanPrefix(t *testing.T) {
 	}))
 
 	var got []string
-	require.NoError(t, ms.View(func(tx Tx) error {
-		return tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
-			got = append(got, string(key))
-			return nil
-		})
+	require.NoError(t, ms.ScanPrefix([]byte("s:"), func(key, val []byte) error {
+		got = append(got, string(key))
+		return nil
 	}))
 	assert.Equal(t, []string{"s:a", "s:b", "s:c"}, got)
 
 	// fn error stops iteration.
 	var n int
-	err := ms.View(func(tx Tx) error {
-		return tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
-			n++
-			return errStopIteration
-		})
+	err := ms.ScanPrefix([]byte("s:"), func(key, val []byte) error {
+		n++
+		return errTestStop
 	})
 	require.Error(t, err)
 	assert.Equal(t, 1, n)
@@ -144,11 +124,9 @@ func TestMemStore_ScanRange(t *testing.T) {
 	}))
 
 	var got []string
-	require.NoError(t, ms.View(func(tx Tx) error {
-		return tx.ScanRange([]byte("b"), []byte("d"), func(key, val []byte) error {
-			got = append(got, string(key))
-			return nil
-		})
+	require.NoError(t, ms.ScanRange([]byte("b"), []byte("d"), func(key, val []byte) error {
+		got = append(got, string(key))
+		return nil
 	}))
 	assert.Equal(t, []string{"b", "c"}, got, "ScanRange is [from, to) exclusive of to")
 }

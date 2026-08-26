@@ -97,14 +97,9 @@ func seedStory(t *testing.T, tr *Tracker[string], id uuid.UUID, rec storyRecord)
 	require.NoError(t, tr.cfg.Store.Update(func(tx Tx) error {
 		return tr.writeStoryMeta(tx, id, time.Time{}, rec)
 	}))
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		idx, err := tr.buildActiveStoryIndex(tx)
-		if err != nil {
-			return err
-		}
-		tr.storyIndex.Store(idx)
-		return nil
-	}))
+	idx, err := tr.buildActiveStoryIndex(tr.cfg.Store)
+	require.NoError(t, err)
+	tr.storyIndex.Store(idx)
 }
 
 func TestTracker_Ingest_ReingestIsIdempotent(t *testing.T) {
@@ -145,11 +140,9 @@ func TestTracker_Ingest_ReingestIsIdempotent(t *testing.T) {
 	}
 
 	var stored int
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		return tx.ScanPrefix(keys.FacetPrefix(storyID), func(key, val []byte) error {
-			stored++
-			return nil
-		})
+	require.NoError(t, tr.cfg.Store.ScanPrefix(keys.FacetPrefix(storyID), func(key, val []byte) error {
+		stored++
+		return nil
 	}))
 	assert.Equal(t, 1, stored)
 }
@@ -189,20 +182,17 @@ func TestTracker_Ingest_CrossStoryMoveReingestDoesNotDuplicate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []uuid.UUID{storyB}, assigned2)
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyA, sig.ID, 0)), "no membership may remain under the old story")
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyB, sig.ID, 0)), "the moved facet must stay put")
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyA, sig.ID, 0)), "no membership may remain under the old story")
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyB, sig.ID, 0)), "the moved facet must stay put")
 
-		var markers int
-		for _, prefix := range [][]byte{keys.FacetPrefix(storyA), keys.FacetPrefix(storyB)} {
-			require.NoError(t, tx.ScanPrefix(prefix, func(key, val []byte) error {
-				markers++
-				return nil
-			}))
-		}
-		assert.Equal(t, 1, markers, "exactly one membership must exist across both stories")
-		return nil
-	}))
+	var markers int
+	for _, prefix := range [][]byte{keys.FacetPrefix(storyA), keys.FacetPrefix(storyB)} {
+		require.NoError(t, tr.cfg.Store.ScanPrefix(prefix, func(key, val []byte) error {
+			markers++
+			return nil
+		}))
+	}
+	assert.Equal(t, 1, markers, "exactly one membership must exist across both stories")
 }
 
 func TestTracker_Ingest_DeletesOutlierCopyOnAssignment(t *testing.T) {
@@ -227,11 +217,8 @@ func TestTracker_Ingest_DeletesOutlierCopyOnAssignment(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []uuid.UUID{storyID}, assigned)
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sig.ID, 0)), "stale outlier marker must be removed")
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyID, sig.ID, 0)))
-		return nil
-	}))
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.OutlierFacet(sig.ID, 0)), "stale outlier marker must be removed")
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyID, sig.ID, 0)))
 }
 
 func TestTracker_Ingest_MonotonicLastSignalAt(t *testing.T) {
@@ -274,11 +261,8 @@ func TestTracker_Ingest_ReactivateClearsStats(t *testing.T) {
 	})
 
 	var metaBytesBefore []byte
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		b, err := tx.Get(keys.StoryMeta(storyID))
-		metaBytesBefore = b
-		return err
-	}))
+	metaBytesBefore, err := tr.cfg.Store.Get(keys.StoryMeta(storyID))
+	require.NoError(t, err)
 
 	assigned, err := tr.Ingest(context.Background(), Signal[string]{
 		ID: uuid.New(), At: time.Now(), Embeddings: []Embedding{[]float32{0.98, 0.02}},
@@ -300,12 +284,9 @@ func TestTracker_Ingest_ReactivateClearsStats(t *testing.T) {
 	assert.Equal(t, tr.cfg.AssignmentK*0.2, thresh)
 
 	// Ensure s:{id}:m is byte-identical: Ingest never touches s:m
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		b, err := tx.Get(keys.StoryMeta(storyID))
-		require.NoError(t, err)
-		assert.Equal(t, metaBytesBefore, b, "s:m must be byte-identical before and after ingest")
-		return nil
-	}))
+	b, err := tr.cfg.Store.Get(keys.StoryMeta(storyID))
+	require.NoError(t, err)
+	assert.Equal(t, metaBytesBefore, b, "s:m must be byte-identical before and after ingest")
 }
 
 func TestTracker_Stories_Iterator(t *testing.T) {
@@ -322,20 +303,23 @@ func TestTracker_Stories_Iterator(t *testing.T) {
 	})
 
 	ids := map[uuid.UUID]bool{}
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		ids[meta.ID] = true
 	}
 	assert.Equal(t, 3, len(ids))
 
 	ids = map[uuid.UUID]bool{}
-	for meta := range tr.Stories(StoryStateActive) {
+	for meta, err := range tr.Stories(StoryStateActive) {
+		require.NoError(t, err)
 		ids[meta.ID] = true
 	}
 	assert.Len(t, ids, 1, "Stories(StoryStateActive) must exclude suppressed and dormant stories")
 	assert.True(t, ids[activeID])
 
 	ids = map[uuid.UUID]bool{}
-	for meta := range tr.Stories(StoryStateSuppressed) {
+	for meta, err := range tr.Stories(StoryStateSuppressed) {
+		require.NoError(t, err)
 		ids[meta.ID] = true
 	}
 	assert.Len(t, ids, 1)
@@ -433,22 +417,17 @@ func TestWriteStoryMeta_TimeIndexMaintenance(t *testing.T) {
 
 	// No duplicate index entries for the same story.
 	var n int
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		return tx.ScanPrefix([]byte("t:"), func(key, val []byte) error {
-			n++
-			return nil
-		})
+	require.NoError(t, tr.cfg.Store.ScanPrefix([]byte("t:"), func(key, val []byte) error {
+		n++
+		return nil
 	}))
 	assert.Equal(t, 1, n)
 }
 
 func assertTimeIndex(t *testing.T, tr *Tracker[string], storyID uuid.UUID, at time.Time) {
 	t.Helper()
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		v := mustGet(t, tx, keys.TimeIndex(at.Unix(), storyID))
-		require.NotNil(t, v, "time index entry missing for %v", at)
-		return nil
-	}))
+	v := mustGet(t, tr.cfg.Store, keys.TimeIndex(at.Unix(), storyID))
+	require.NotNil(t, v, "time index entry missing for %v", at)
 }
 
 func TestPersistStory_LifecycleTransitions(t *testing.T) {
@@ -576,11 +555,8 @@ func TestCollectBatch_OutlierEviction(t *testing.T) {
 
 	var signals []batchFacet
 	var evict []uuid.UUID
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		var err error
-		signals, _, evict, _, _, err = tr.collectBatch(tx, time.Now())
-		return err
-	}))
+	signals, _, evict, _, _, err := tr.collectBatch(tr.cfg.Store, time.Now())
+	require.NoError(t, err)
 
 	require.Len(t, evict, 1)
 	assert.Equal(t, expire.ID, evict[0])
@@ -599,11 +575,8 @@ func TestTracker_saveCalibState_RoundTrip(t *testing.T) {
 	require.NoError(t, ms.Update(func(tx Tx) error { return tr.saveCalibState(tx) }))
 
 	var b []byte
-	require.NoError(t, ms.View(func(tx Tx) error {
-		var err error
-		b, err = tx.Get(keys.CalibState())
-		return err
-	}))
+	b, err := ms.Get(keys.CalibState())
+	require.NoError(t, err)
 	var s calibState
 	require.NoError(t, cborStrictDecMode.Unmarshal(b, &s))
 	assert.Equal(t, 4, s.Dim)
@@ -642,14 +615,11 @@ func TestTracker_Ingest_FacetsReachDifferentStories(t *testing.T) {
 	assert.Equal(t, storyIDSet(storyX, storyY), assigned,
 		"a two-facet signal must join both stories its facets match")
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyX, sig.ID, 0)))
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyY, sig.ID, 1)))
-		// Each facet belongs to exactly one story (invariant 1).
-		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyY, sig.ID, 0)))
-		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyX, sig.ID, 1)))
-		return nil
-	}))
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyX, sig.ID, 0)))
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyY, sig.ID, 1)))
+	// Each facet belongs to exactly one story (invariant 1).
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyY, sig.ID, 0)))
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyX, sig.ID, 1)))
 }
 
 // The averaged single vector this design replaces would fall between the two
@@ -754,16 +724,13 @@ func TestTracker_Ingest_PartiallyPlacedSignal(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []uuid.UUID{storyID}, assigned)
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyID, sig.ID, 0)), "matching facet is placed")
-		assert.NotNil(t, mustGet(t, tx, keys.OutlierFacet(sig.ID, 1)), "non-matching facet waits as an outlier")
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyID, sig.ID, 0)), "matching facet is placed")
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.OutlierFacet(sig.ID, 1)), "non-matching facet waits as an outlier")
 
-		locs, hasIndex, err := readSignalLocSet(tx, sig.ID)
-		require.NoError(t, err)
-		require.True(t, hasIndex)
-		assert.Equal(t, []keys.FacetLoc{{StoryID: storyID}, {IsOutlier: true}}, locs)
-		return nil
-	}))
+	locs, hasIndex, err := readSignalLocSet(tr.cfg.Store, sig.ID)
+	require.NoError(t, err)
+	require.True(t, hasIndex)
+	assert.Equal(t, []keys.FacetLoc{{StoryID: storyID}, {IsOutlier: true}}, locs)
 }
 
 // Re-ingest is a no-op at the signal level once any facet is placed: a late

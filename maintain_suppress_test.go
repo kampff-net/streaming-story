@@ -105,10 +105,7 @@ drain:
 	require.NotNil(t, summary)
 	require.GreaterOrEqual(t, summary.StoriesMerged, 1)
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keys.StoryMeta(storyB)), "retired story B metadata must be deleted")
-		return nil
-	}))
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.StoryMeta(storyB)), "retired story B metadata must be deleted")
 
 	meta, err := tr.Story(storyA)
 	require.NoError(t, err)

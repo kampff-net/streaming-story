@@ -1,7 +1,6 @@
 package story
 
 import (
-	"errors"
 	"fmt"
 	"iter"
 
@@ -23,38 +22,54 @@ func (t *Tracker[T]) SignalID(domainKey string) uuid.UUID {
 
 // Story returns current metadata for a single story.
 func (t *Tracker[T]) Story(id uuid.UUID) (StoryMeta, error) {
-	var meta StoryMeta
-	err := t.cfg.Store.View(func(tx Tx) error {
-		var err error
-		meta, err = t.readStoryMeta(tx, id)
-		return err
-	})
-	return meta, err
+	return t.readStoryMeta(t.cfg.Store, id)
 }
 
 // Stories returns an iterator over stories in the given state.
 // Pass StoryStateAny to iterate all stories.
-func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta] {
-	return func(yield func(StoryMeta) bool) {
-		_ = t.cfg.Store.View(func(tx Tx) error {
-			return tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
-				id, ok := keys.ParseStoryMeta(key)
-				if !ok {
-					return nil
-				}
-				var rec storyRecord
-				if err := cborStrictDecMode.Unmarshal(val, &rec); err != nil {
-					return nil
-				}
-				if state != StoryStateAny && rec.State != state {
-					return nil
-				}
-				if !yield(storyMetaFromRecord(id, rec)) {
-					return errors.New("stop iteration")
-				}
+//
+// A store failure is yielded once, with a zero StoryMeta, and ends the
+// iteration. A story record that fails to decode is yielded as its own error
+// and iteration continues, so one corrupt record does not hide the rest.
+func (t *Tracker[T]) Stories(state StoryState) iter.Seq2[StoryMeta, error] {
+	return func(yield func(StoryMeta, error) bool) {
+		// StoryMeta is small and fixed-size, so the whole selection is
+		// materialised before anything is yielded. See scanDistinctIDs for why
+		// nothing is yielded from inside a scan. A per-record decode failure
+		// rides along in order rather than being collected separately, so the
+		// caller sees errors where the bad records actually sat.
+		type entry struct {
+			meta StoryMeta
+			err  error
+		}
+		var entries []entry
+
+		err := t.cfg.Store.ScanPrefix([]byte("s:"), func(key, val []byte) error {
+			id, ok := keys.ParseStoryMeta(key)
+			if !ok {
 				return nil
-			})
+			}
+			var rec storyRecord
+			if err := cborStrictDecMode.Unmarshal(val, &rec); err != nil {
+				entries = append(entries, entry{err: fmt.Errorf("decode story record %s: %w", id, err)})
+				return nil
+			}
+			if state != StoryStateAny && rec.State != state {
+				return nil
+			}
+			entries = append(entries, entry{meta: storyMetaFromRecord(id, rec)})
+			return nil
 		})
+		if err != nil {
+			yield(StoryMeta{}, err)
+			return
+		}
+
+		for _, e := range entries {
+			if !yield(e.meta, e.err) {
+				return
+			}
+		}
 	}
 }
 
@@ -64,41 +79,17 @@ func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta] {
 func (t *Tracker[T]) SignalsOf(storyID uuid.UUID) iter.Seq2[Signal[T], error] {
 	return func(yield func(Signal[T], error) bool) {
 		prefix := keys.FacetPrefix(storyID)
-		_ = t.cfg.Store.View(func(tx Tx) error {
-			// A signal contributing several facets to one story is still one
-			// member, so it is yielded once. Facet keys of a signal are
-			// contiguous and sorted, so remembering the last ID suffices.
-			var last uuid.UUID
-			seen := false
-			return tx.ScanPrefix(prefix, func(key, _ []byte) error {
-				sigID, _, ok := keys.ParseFacetMember(key, prefix)
-				if !ok {
-					return nil
-				}
-				if seen && sigID == last {
-					return nil
-				}
-				last, seen = sigID, true
-
-				sig, found, err := t.readCanonicalSignal(tx, sigID)
-				if err != nil {
-					if !yield(Signal[T]{}, err) {
-						return errStopIteration
-					}
-					return nil
-				}
-				if !found {
-					// A membership marker with no record behind it. The store
-					// invariant forbids this; skip rather than yield a zero
-					// signal that a caller would read as real.
-					return nil
-				}
-				if !yield(sig, nil) {
-					return errStopIteration
-				}
-				return nil
-			})
+		// A signal contributing several facets to one story is still one
+		// member, so it is yielded once.
+		ids, err := scanDistinctIDs(t.cfg.Store, prefix, func(key []byte) (uuid.UUID, bool) {
+			id, _, ok := keys.ParseFacetMember(key, prefix)
+			return id, ok
 		})
+		if err != nil {
+			yield(Signal[T]{}, err)
+			return
+		}
+		t.yieldSignals(ids, yield)
 	}
 }
 
@@ -115,16 +106,11 @@ type Placement struct {
 // sorted and de-duplicated. An empty slice means every facet is an outlier or
 // the signal is unknown; use Signal to distinguish the two.
 func (t *Tracker[T]) StoriesOf(signalID uuid.UUID) ([]uuid.UUID, error) {
-	var out []uuid.UUID
-	err := t.cfg.Store.View(func(tx Tx) error {
-		locs, _, err := readSignalLocSet(tx, signalID)
-		if err != nil {
-			return err
-		}
-		out = placedStories(locs)
-		return nil
-	})
-	return out, err
+	locs, _, err := readSignalLocSet(t.cfg.Store, signalID)
+	if err != nil {
+		return nil, err
+	}
+	return placedStories(locs), nil
 }
 
 // FacetsOfSignal returns one Placement per facet of signalID, in facet order,
@@ -132,19 +118,15 @@ func (t *Tracker[T]) StoriesOf(signalID uuid.UUID) ([]uuid.UUID, error) {
 // StoriesOf: it reports not just which stories claimed the signal but which of
 // its facets each story claimed, and which facets nothing claimed at all.
 func (t *Tracker[T]) FacetsOfSignal(signalID uuid.UUID) ([]Placement, error) {
-	var out []Placement
-	err := t.cfg.Store.View(func(tx Tx) error {
-		locs, _, err := readSignalLocSet(tx, signalID)
-		if err != nil {
-			return err
-		}
-		out = make([]Placement, len(locs))
-		for facet, loc := range locs {
-			out[facet] = Placement{SignalID: signalID, Facet: facet, StoryID: loc.StoryID}
-		}
-		return nil
-	})
-	return out, err
+	locs, _, err := readSignalLocSet(t.cfg.Store, signalID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Placement, len(locs))
+	for facet, loc := range locs {
+		out[facet] = Placement{SignalID: signalID, Facet: facet, StoryID: loc.StoryID}
+	}
+	return out, nil
 }
 
 // FacetsOfStory returns an iterator over every facet the story holds, ordered
@@ -154,18 +136,27 @@ func (t *Tracker[T]) FacetsOfSignal(signalID uuid.UUID) ([]Placement, error) {
 func (t *Tracker[T]) FacetsOfStory(storyID uuid.UUID) iter.Seq2[Placement, error] {
 	return func(yield func(Placement, error) bool) {
 		prefix := keys.FacetPrefix(storyID)
-		_ = t.cfg.Store.View(func(tx Tx) error {
-			return tx.ScanPrefix(prefix, func(key, _ []byte) error {
-				sigID, facet, ok := keys.ParseFacetMember(key, prefix)
-				if !ok {
-					return nil
-				}
-				if !yield(Placement{SignalID: sigID, Facet: facet, StoryID: storyID}, nil) {
-					return errStopIteration
-				}
+		// A Placement is three small fields, so the story's whole membership is
+		// materialised rather than read back one key at a time.
+		var out []Placement
+		err := t.cfg.Store.ScanPrefix(prefix, func(key, _ []byte) error {
+			sigID, facet, ok := keys.ParseFacetMember(key, prefix)
+			if !ok {
 				return nil
-			})
+			}
+			out = append(out, Placement{SignalID: sigID, Facet: facet, StoryID: storyID})
+			return nil
 		})
+		if err != nil {
+			yield(Placement{}, err)
+			return
+		}
+
+		for _, p := range out {
+			if !yield(p, nil) {
+				return
+			}
+		}
 	}
 }
 
@@ -181,19 +172,14 @@ func (t *Tracker[T]) FacetsOfStory(storyID uuid.UUID) iter.Seq2[Placement, error
 // Callers that need to know which stories hold the signal should use StoriesOf,
 // or FacetsOfSignal for the per-facet detail.
 func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error) {
-	var sig Signal[T]
-	err := t.cfg.Store.View(func(tx Tx) error {
-		s, found, err := t.readCanonicalSignal(tx, id)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("signal %s: %w", id, ErrNotFound)
-		}
-		sig = s
-		return nil
-	})
-	return sig, err
+	sig, found, err := t.readCanonicalSignal(t.cfg.Store, id)
+	if err != nil {
+		return Signal[T]{}, err
+	}
+	if !found {
+		return Signal[T]{}, fmt.Errorf("signal %s: %w", id, ErrNotFound)
+	}
+	return sig, nil
 }
 
 // Signals returns an iterator over every signal in the store, in signal-ID
@@ -207,24 +193,12 @@ func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error) {
 // exact clustering without requiring original embedding sources.
 func (t *Tracker[T]) Signals() iter.Seq2[Signal[T], error] {
 	return func(yield func(Signal[T], error) bool) {
-		_ = t.cfg.Store.View(func(tx Tx) error {
-			return tx.ScanPrefix(keys.CanonicalPrefix(), func(key, val []byte) error {
-				if _, ok := keys.ParseCanonicalSignal(key); !ok {
-					return nil
-				}
-				var sig Signal[T]
-				if err := cborDecMode.Unmarshal(val, &sig); err != nil {
-					if !yield(Signal[T]{}, err) {
-						return errStopIteration
-					}
-					return nil
-				}
-				if !yield(sig, nil) {
-					return errStopIteration
-				}
-				return nil
-			})
-		})
+		ids, err := scanDistinctIDs(t.cfg.Store, keys.CanonicalPrefix(), keys.ParseCanonicalSignal)
+		if err != nil {
+			yield(Signal[T]{}, err)
+			return
+		}
+		t.yieldSignals(ids, yield)
 	}
 }
 
@@ -233,39 +207,75 @@ func (t *Tracker[T]) Signals() iter.Seq2[Signal[T], error] {
 // is missing or undecodable are skipped so one bad entry does not stop iteration.
 func (t *Tracker[T]) Outliers() iter.Seq2[Signal[T], error] {
 	return func(yield func(Signal[T], error) bool) {
-		_ = t.cfg.Store.View(func(tx Tx) error {
-			var last uuid.UUID
-			seen := false
-			return tx.ScanPrefix(keys.OutlierPrefix(), func(key, _ []byte) error {
-				sigID, _, ok := keys.ParseOutlierFacet(key)
-				if !ok {
-					return nil
-				}
-				if seen && sigID == last {
-					return nil
-				}
-				last, seen = sigID, true
-
-				sig, found, err := t.readCanonicalSignal(tx, sigID)
-				if err != nil {
-					if !yield(Signal[T]{}, err) {
-						return errStopIteration
-					}
-					return nil
-				}
-				if !found {
-					return nil
-				}
-				if !yield(sig, nil) {
-					return errStopIteration
-				}
-				return nil
-			})
+		ids, err := scanDistinctIDs(t.cfg.Store, keys.OutlierPrefix(), func(key []byte) (uuid.UUID, bool) {
+			id, _, ok := keys.ParseOutlierFacet(key)
+			return id, ok
 		})
+		if err != nil {
+			yield(Signal[T]{}, err)
+			return
+		}
+		t.yieldSignals(ids, yield)
 	}
 }
 
-// errStopIteration terminates a range scan early; the caller checks for it
-// with errors.Is to distinguish a requested stop from a real failure.
-var errStopIteration = errors.New("stop iteration")
+// scanDistinctIDs collects the distinct IDs under prefix into a slice.
+//
+// It exists so that no public iterator yields from inside a scan. A store may
+// hold a read transaction open for the duration of a scan, and caller code
+// reached through yield is free to write back to the Tracker — which blocks on
+// that very read on bbolt, and on MemStore's non-reentrant RWMutex. Collecting
+// the IDs first costs 16 bytes each and lets every yield run with the store
+// released.
+//
+// Keys of one ID are contiguous and sorted, so remembering the last one is
+// enough to de-duplicate a signal that contributes several facets.
+func scanDistinctIDs(r Reader, prefix []byte, parse func(key []byte) (uuid.UUID, bool)) ([]uuid.UUID, error) {
+	var out []uuid.UUID
+	var last uuid.UUID
+	seen := false
 
+	err := r.ScanPrefix(prefix, func(key, _ []byte) error {
+		id, ok := parse(key)
+		if !ok {
+			return nil
+		}
+		if seen && id == last {
+			return nil
+		}
+		last, seen = id, true
+		out = append(out, id)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// yieldSignals reads each signal by ID and yields it, one standalone read at a
+// time, so the store is never held while yield runs. This is why the ID list is
+// materialised first rather than the signals themselves: a Signal carries its
+// embeddings, and a whole corpus of them will not fit in memory.
+//
+// A signal whose canonical record is gone by the time it is read is skipped.
+// The record may have been evicted since the scan, or — the case that always
+// had to be handled — a membership marker may point at nothing. Either way a
+// zero signal the caller would read as real is worse than an omission.
+func (t *Tracker[T]) yieldSignals(ids []uuid.UUID, yield func(Signal[T], error) bool) {
+	for _, id := range ids {
+		sig, found, err := t.readCanonicalSignal(t.cfg.Store, id)
+		if err != nil {
+			if !yield(Signal[T]{}, err) {
+				return
+			}
+			continue
+		}
+		if !found {
+			continue
+		}
+		if !yield(sig, nil) {
+			return
+		}
+	}
+}

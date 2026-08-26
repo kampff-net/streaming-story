@@ -52,28 +52,22 @@ func TestMoveFacetToStory_MaintainsLocationIndex(t *testing.T) {
 	require.NoError(t, ms.Update(func(tx Tx) error {
 		return moveFacetToStory(tx, uuid.Nil, storyA, sigID, facet)
 	}))
-	require.NoError(t, ms.View(func(tx Tx) error {
-		locs, hasIndex, err := readSignalLocSet(tx, sigID)
-		require.NoError(t, err)
-		require.True(t, hasIndex)
-		assert.Equal(t, []keys.FacetLoc{{StoryID: storyA}}, locs)
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyA, sigID, facet)))
-		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sigID, facet)), "outlier marker must be cleared")
-		return nil
-	}))
+	locs, hasIndex, err := readSignalLocSet(ms, sigID)
+	require.NoError(t, err)
+	require.True(t, hasIndex)
+	assert.Equal(t, []keys.FacetLoc{{StoryID: storyA}}, locs)
+	assert.NotNil(t, mustGet(t, ms, keys.FacetMember(storyA, sigID, facet)))
+	assert.Nil(t, mustGet(t, ms, keys.OutlierFacet(sigID, facet)), "outlier marker must be cleared")
 
 	// story A -> story B: the old membership must not linger.
 	require.NoError(t, ms.Update(func(tx Tx) error {
 		return moveFacetToStory(tx, storyA, storyB, sigID, facet)
 	}))
-	require.NoError(t, ms.View(func(tx Tx) error {
-		locs, _, err := readSignalLocSet(tx, sigID)
-		require.NoError(t, err)
-		assert.Equal(t, []keys.FacetLoc{{StoryID: storyB}}, locs)
-		assert.Nil(t, mustGet(t, tx, keys.FacetMember(storyA, sigID, facet)))
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyB, sigID, facet)))
-		return nil
-	}))
+	locs, _, err = readSignalLocSet(ms, sigID)
+	require.NoError(t, err)
+	assert.Equal(t, []keys.FacetLoc{{StoryID: storyB}}, locs)
+	assert.Nil(t, mustGet(t, ms, keys.FacetMember(storyA, sigID, facet)))
+	assert.NotNil(t, mustGet(t, ms, keys.FacetMember(storyB, sigID, facet)))
 }
 
 // Two facets of one signal converging on the same survivor must both survive:
@@ -97,16 +91,13 @@ func TestMigrateFacets_KeepsBothFacetsOfOneSignal(t *testing.T) {
 		return migrateFacets(tx, retired, survivor)
 	}))
 
-	require.NoError(t, ms.View(func(tx Tx) error {
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(survivor, sigID, 0)))
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(survivor, sigID, 1)))
-		assert.Nil(t, mustGet(t, tx, keys.FacetMember(retired, sigID, 0)))
+	assert.NotNil(t, mustGet(t, ms, keys.FacetMember(survivor, sigID, 0)))
+	assert.NotNil(t, mustGet(t, ms, keys.FacetMember(survivor, sigID, 1)))
+	assert.Nil(t, mustGet(t, ms, keys.FacetMember(retired, sigID, 0)))
 
-		locs, _, err := readSignalLocSet(tx, sigID)
-		require.NoError(t, err)
-		assert.Equal(t, []keys.FacetLoc{{StoryID: survivor}, {StoryID: survivor}}, locs)
-		return nil
-	}))
+	locs, _, err := readSignalLocSet(ms, sigID)
+	require.NoError(t, err)
+	assert.Equal(t, []keys.FacetLoc{{StoryID: survivor}, {StoryID: survivor}}, locs)
 }
 
 // Eviction must clear the outlier marker, the location index, and — because
@@ -125,14 +116,11 @@ func TestEvictionDropsFacetsIndexAndRecord(t *testing.T) {
 		return evictOutlierFacets(tx, sigID)
 	}))
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		_, hasIndex, err := readSignalLocSet(tx, sigID)
-		require.NoError(t, err)
-		assert.False(t, hasIndex, "evicted outlier must drop its location-index entry")
-		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sigID, 0)))
-		assert.Nil(t, mustGet(t, tx, keys.CanonicalSignal(sigID)), "no facet remains, so the record goes too")
-		return nil
-	}))
+	_, hasIndex, err := readSignalLocSet(tr.cfg.Store, sigID)
+	require.NoError(t, err)
+	assert.False(t, hasIndex, "evicted outlier must drop its location-index entry")
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.OutlierFacet(sigID, 0)))
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.CanonicalSignal(sigID)), "no facet remains, so the record goes too")
 }
 
 // The lifetime rule: a signal with a placed facet keeps its canonical record
@@ -161,17 +149,14 @@ func TestEviction_KeepsRecordWhileAFacetIsPlaced(t *testing.T) {
 		return evictOutlierFacets(tx, sigID)
 	}))
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.NotNil(t, mustGet(t, tx, keys.CanonicalSignal(sigID)), "a placed facet keeps the record alive")
-		assert.NotNil(t, mustGet(t, tx, keys.FacetMember(storyID, sigID, 0)), "placed facet is untouched")
-		assert.Nil(t, mustGet(t, tx, keys.OutlierFacet(sigID, 1)), "unplaced facet is evicted")
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.CanonicalSignal(sigID)), "a placed facet keeps the record alive")
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.FacetMember(storyID, sigID, 0)), "placed facet is untouched")
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.OutlierFacet(sigID, 1)), "unplaced facet is evicted")
 
-		locs, hasIndex, err := readSignalLocSet(tx, sigID)
-		require.NoError(t, err)
-		require.True(t, hasIndex)
-		assert.Equal(t, []keys.FacetLoc{{StoryID: storyID}, {}}, locs)
-		return nil
-	}))
+	locs, hasIndex, err := readSignalLocSet(tr.cfg.Store, sigID)
+	require.NoError(t, err)
+	require.True(t, hasIndex)
+	assert.Equal(t, []keys.FacetLoc{{StoryID: storyID}, {}}, locs)
 }
 
 func TestRunBatch_StoryCreationFromOutliers(t *testing.T) {
@@ -194,13 +179,10 @@ func TestRunBatch_StoryCreationFromOutliers(t *testing.T) {
 	}
 
 	// All signals are outliers (no story exists yet).
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		var n int
-		err := tx.ScanPrefix([]byte("o:"), func(key, val []byte) error { n++; return nil })
-		require.NoError(t, err)
-		assert.Equal(t, len(embeddings), n)
-		return nil
-	}))
+	var n int
+	err := tr.cfg.Store.ScanPrefix([]byte("o:"), func(key, val []byte) error { n++; return nil })
+	require.NoError(t, err)
+	assert.Equal(t, len(embeddings), n)
 
 	tr.runBatch()
 
@@ -281,11 +263,8 @@ drain:
 	assert.GreaterOrEqual(t, summary.StoriesMerged, 1)
 
 	// A survives; B is gone.
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		assert.Nil(t, mustGet(t, tx, keys.StoryMeta(storyB)), "retired story B metadata must be deleted")
-		assert.NotNil(t, mustGet(t, tx, keys.StoryMeta(storyA)), "survivor story A metadata must exist")
-		return nil
-	}))
+	assert.Nil(t, mustGet(t, tr.cfg.Store, keys.StoryMeta(storyB)), "retired story B metadata must be deleted")
+	assert.NotNil(t, mustGet(t, tr.cfg.Store, keys.StoryMeta(storyA)), "survivor story A metadata must exist")
 
 	var merged bool
 	for _, ev := range events {
@@ -338,9 +317,11 @@ func drainSummary(events []StoryEvent[string]) *BatchSummary {
 }
 
 // mustGet is a test helper returning the value for key or failing the test.
-func mustGet(t *testing.T, tx Tx, key []byte) []byte {
+// It takes a Reader so the same call works against a store and inside a write
+// transaction.
+func mustGet(t *testing.T, r Reader, key []byte) []byte {
 	t.Helper()
-	v, err := tx.Get(key)
+	v, err := r.Get(key)
 	require.NoError(t, err)
 	return v
 }

@@ -21,11 +21,9 @@ import (
 func storeKeys(t *testing.T, tr *Tracker[string]) []string {
 	t.Helper()
 	var out []string
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		return tx.ScanPrefix([]byte(""), func(key, _ []byte) error {
-			out = append(out, string(key))
-			return nil
-		})
+	require.NoError(t, tr.cfg.Store.ScanPrefix([]byte(""), func(key, _ []byte) error {
+		out = append(out, string(key))
+		return nil
 	}))
 	return out
 }

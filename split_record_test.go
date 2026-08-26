@@ -87,12 +87,9 @@ func TestSplitRecord_IngestNeverMutatesStoryMeta(t *testing.T) {
 	})
 
 	var metaBytesBefore []byte
-	require.NoError(t, store.View(func(tx Tx) error {
-		b, err := tx.Get(keys.StoryMeta(storyID))
-		metaBytesBefore = make([]byte, len(b))
-		copy(metaBytesBefore, b)
-		return err
-	}))
+	b, err := store.Get(keys.StoryMeta(storyID))
+	require.NoError(t, err)
+	metaBytesBefore = append([]byte(nil), b...)
 
 	// Ingest 5 signals matching this story.
 	for i := 0; i < 5; i++ {
@@ -106,10 +103,7 @@ func TestSplitRecord_IngestNeverMutatesStoryMeta(t *testing.T) {
 		assert.Equal(t, []uuid.UUID{storyID}, assigned)
 	}
 
-	require.NoError(t, store.View(func(tx Tx) error {
-		b, err := tx.Get(keys.StoryMeta(storyID))
-		require.NoError(t, err)
-		assert.Equal(t, metaBytesBefore, b, "s:m must remain strictly byte-identical through multiple ingest calls")
-		return nil
-	}))
+	b, err = store.Get(keys.StoryMeta(storyID))
+	require.NoError(t, err)
+	assert.Equal(t, metaBytesBefore, b, "s:m must remain strictly byte-identical through multiple ingest calls")
 }

@@ -13,12 +13,18 @@ import (
 	"go.kvsh.ch/streaming-story/internal/dist"
 )
 
-// hostileStore is a test Store wrapper that allocates fresh byte slices on reads,
-// records all returned slices, and clobbers them with garbage bytes (0xCC) immediately
-// when the transaction completes.
+// hostileStore is a test Store wrapper that allocates fresh byte slices on
+// reads, records every slice it returns, and clobbers them with garbage bytes
+// (0xCC) the moment they stop being valid under the Reader contract: at the end
+// of the enclosing Update for a transactional read, and at the next store call
+// for a standalone one. Any code that retained a store slice reads 0xCC.
 type hostileStore struct {
 	mu   sync.Mutex
 	impl *MemStore
+
+	// stale holds the buffers handed out by the previous standalone read; they
+	// are poisoned when the next call arrives.
+	stale [][]byte
 }
 
 func newHostileStore() *hostileStore {
@@ -29,29 +35,81 @@ func (h *hostileStore) Close() error {
 	return h.impl.Close()
 }
 
-func (h *hostileStore) View(fn func(tx Tx) error) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	var returned [][]byte
-	htx := &hostileTx{
-		tx:       &memTx{store: h.impl},
-		trackBuf: func(b []byte) []byte {
-			if b == nil {
-				return nil
-			}
-			cp := bytes.Clone(b)
-			returned = append(returned, cp)
-			return cp
-		},
-	}
-	err := fn(htx)
-	// Poison all buffers returned during this transaction
-	for _, b := range returned {
+func poison(bufs [][]byte) {
+	for _, b := range bufs {
 		for i := range b {
 			b[i] = 0xCC
 		}
 	}
+}
+
+// tracker returns a copying tracker plus the slice recording what it handed out.
+func tracker() (func([]byte) []byte, *[][]byte) {
+	var returned [][]byte
+	return func(b []byte) []byte {
+		if b == nil {
+			return nil
+		}
+		cp := bytes.Clone(b)
+		returned = append(returned, cp)
+		return cp
+	}, &returned
+}
+
+// standalone runs a single non-transactional read. Buffers from the previous
+// standalone read are poisoned on entry, which is exactly when the Reader
+// contract says they expire.
+func (h *hostileStore) standalone(fn func(tx Tx, track func([]byte) []byte) error) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	poison(h.stale)
+	track, returned := tracker()
+	err := fn(&memTx{store: h.impl}, track)
+	h.stale = *returned
+	return err
+}
+
+func (h *hostileStore) Get(key []byte) ([]byte, error) {
+	var out []byte
+	err := h.standalone(func(tx Tx, track func([]byte) []byte) error {
+		b, err := tx.Get(key)
+		if err != nil {
+			return err
+		}
+		out = track(b)
+		return nil
+	})
+	return out, err
+}
+
+// Scans poison on return: a scan hands its slices to the callback, and the
+// contract ends them when that callback returns.
+func (h *hostileStore) ScanRange(from, to []byte, fn func(key, val []byte) error) error {
+	return h.scan(fn, func(tx Tx, wrapped func(key, val []byte) error) error {
+		return tx.ScanRange(from, to, wrapped)
+	})
+}
+
+func (h *hostileStore) ScanPrefix(prefix []byte, fn func(key, val []byte) error) error {
+	return h.scan(fn, func(tx Tx, wrapped func(key, val []byte) error) error {
+		return tx.ScanPrefix(prefix, wrapped)
+	})
+}
+
+func (h *hostileStore) scan(fn func(key, val []byte) error, run func(Tx, func(key, val []byte) error) error) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	poison(h.stale)
+	h.stale = nil
+
+	err := run(&memTx{store: h.impl}, func(key, val []byte) error {
+		track, returned := tracker()
+		ferr := fn(track(key), track(val))
+		poison(*returned)
+		return ferr
+	})
 	return err
 }
 
@@ -59,25 +117,12 @@ func (h *hostileStore) Update(fn func(tx Tx) error) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	var returned [][]byte
-	htx := &hostileTx{
-		tx:       &memTx{store: h.impl},
-		trackBuf: func(b []byte) []byte {
-			if b == nil {
-				return nil
-			}
-			cp := bytes.Clone(b)
-			returned = append(returned, cp)
-			return cp
-		},
-	}
-	err := fn(htx)
-	// Poison all buffers returned during this transaction
-	for _, b := range returned {
-		for i := range b {
-			b[i] = 0xCC
-		}
-	}
+	poison(h.stale)
+	h.stale = nil
+
+	track, returned := tracker()
+	err := fn(&hostileTx{tx: &memTx{store: h.impl}, trackBuf: track})
+	poison(*returned)
 	return err
 }
 
@@ -118,6 +163,11 @@ func (hx *hostileTx) ScanPrefix(prefix []byte, fn func(key, val []byte) error) e
 		return fn(hx.trackBuf(key), hx.trackBuf(val))
 	})
 }
+
+var (
+	_ Store = (*hostileStore)(nil)
+	_ Tx    = (*hostileTx)(nil)
+)
 
 func TestHostileStore_IngestAndBatch(t *testing.T) {
 	store := newHostileStore()
@@ -168,7 +218,8 @@ func TestHostileStore_IngestAndBatch(t *testing.T) {
 
 	// Query stories and signals
 	var stories []StoryMeta
-	for s := range tr.Stories(StoryStateAny) {
+	for s, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		stories = append(stories, s)
 	}
 	assert.NotEmpty(t, stories)

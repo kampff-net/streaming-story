@@ -22,7 +22,8 @@ import (
 func membership(t *testing.T, tr *Tracker[string]) map[uuid.UUID]uuid.UUID {
 	t.Helper()
 	out := make(map[uuid.UUID]uuid.UUID)
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		for sig, err := range tr.SignalsOf(meta.ID) {
 			require.NoError(t, err)
 			out[sig.ID] = meta.ID

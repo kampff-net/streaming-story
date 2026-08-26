@@ -34,11 +34,11 @@ type activeStoryMeta struct {
 }
 
 // buildActiveStoryIndex constructs an activeStoryIndex by scanning s: keys in the store.
-func (t *Tracker[T]) buildActiveStoryIndex(tx Tx) (*activeStoryIndex, error) {
+func (t *Tracker[T]) buildActiveStoryIndex(r Reader) (*activeStoryIndex, error) {
 	records := make(map[uuid.UUID]storyRecord)
 	hots := make(map[uuid.UUID]storyHot)
 
-	err := tx.ScanPrefix([]byte("s:"), func(key, val []byte) error {
+	err := r.ScanPrefix([]byte("s:"), func(key, val []byte) error {
 		if id, ok := keys.ParseStoryMeta(key); ok {
 			var rec storyRecord
 			if err := cborStrictDecMode.Unmarshal(val, &rec); err != nil {

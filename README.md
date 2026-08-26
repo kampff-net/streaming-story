@@ -168,7 +168,11 @@ coarse progress and query the store for detail, or raise `EventBufferSize`.
 ### 3. Read stories and signals
 
 ```go
-for meta := range tracker.Stories(story.StoryStateActive) { // StoryStateAny for all
+for meta, err := range tracker.Stories(story.StoryStateActive) { // StoryStateAny for all
+	if err != nil {
+		log.Printf("read error: %v", err)
+		continue
+	}
 	log.Printf("story %s: %d signals, radius %.3f, created %s",
 		meta.ID, meta.SignalCount, meta.Radius, meta.CreatedAt.Format(time.RFC3339))
 

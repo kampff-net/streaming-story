@@ -162,63 +162,58 @@ func storeInvariants(t *testing.T, tr *Tracker[string]) {
 	referenced := map[uuid.UUID]int{} // signal -> markers pointing at it
 	owner := map[facetRef]uuid.UUID{} // facet -> the one story holding it
 
-	require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-		if err := tx.ScanPrefix(keys.CanonicalPrefix(), func(key, val []byte) error {
-			id, ok := keys.ParseCanonicalSignal(key)
-			if !ok {
-				return nil
-			}
-			var sig Signal[string]
-			err := cborDecMode.Unmarshal(val, &sig)
-			require.NoError(t, err)
-			records[id] = len(sig.Embeddings)
+	require.NoError(t, tr.cfg.Store.ScanPrefix(keys.CanonicalPrefix(), func(key, val []byte) error {
+		id, ok := keys.ParseCanonicalSignal(key)
+		if !ok {
 			return nil
-		}); err != nil {
-			return err
 		}
+		var sig Signal[string]
+		err := cborDecMode.Unmarshal(val, &sig)
+		require.NoError(t, err)
+		records[id] = len(sig.Embeddings)
+		return nil
+	}))
 
-		// Facet markers under every story.
-		for meta := range tr.Stories(StoryStateAny) {
-			prefix := keys.FacetPrefix(meta.ID)
-			if err := tx.ScanPrefix(prefix, func(key, _ []byte) error {
-				sigID, facet, ok := keys.ParseFacetMember(key, prefix)
-				if !ok {
-					return nil
-				}
-				referenced[sigID]++
-				n, has := records[sigID]
-				assert.Truef(t, has, "facet marker for signal %s has no canonical record", sigID)
-				assert.Lessf(t, facet, n, "facet %d of signal %s is past the record's facet count", facet, sigID)
-
-				// Invariant 1: a facet belongs to at most one story.
-				ref := facetRef{sigID, facet}
-				if prev, dup := owner[ref]; dup {
-					t.Errorf("facet %d of signal %s is in two stories: %s and %s", facet, sigID, prev, meta.ID)
-				}
-				owner[ref] = meta.ID
-				return nil
-			}); err != nil {
-				return err
-			}
-		}
-
-		// Outlier markers.
-		return tx.ScanPrefix(keys.OutlierPrefix(), func(key, _ []byte) error {
-			sigID, facet, ok := keys.ParseOutlierFacet(key)
+	// Facet markers under every story.
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
+		prefix := keys.FacetPrefix(meta.ID)
+		require.NoError(t, tr.cfg.Store.ScanPrefix(prefix, func(key, _ []byte) error {
+			sigID, facet, ok := keys.ParseFacetMember(key, prefix)
 			if !ok {
 				return nil
 			}
 			referenced[sigID]++
 			n, has := records[sigID]
-			assert.Truef(t, has, "outlier marker for signal %s has no canonical record", sigID)
+			assert.Truef(t, has, "facet marker for signal %s has no canonical record", sigID)
 			assert.Lessf(t, facet, n, "facet %d of signal %s is past the record's facet count", facet, sigID)
 
-			// A facet is either placed or an outlier, never both.
-			if story, placed := owner[facetRef{sigID, facet}]; placed {
-				t.Errorf("facet %d of signal %s is both in story %s and in the outlier bucket", facet, sigID, story)
+			// Invariant 1: a facet belongs to at most one story.
+			ref := facetRef{sigID, facet}
+			if prev, dup := owner[ref]; dup {
+				t.Errorf("facet %d of signal %s is in two stories: %s and %s", facet, sigID, prev, meta.ID)
 			}
+			owner[ref] = meta.ID
 			return nil
-		})
+		}))
+	}
+
+	// Outlier markers.
+	require.NoError(t, tr.cfg.Store.ScanPrefix(keys.OutlierPrefix(), func(key, _ []byte) error {
+		sigID, facet, ok := keys.ParseOutlierFacet(key)
+		if !ok {
+			return nil
+		}
+		referenced[sigID]++
+		n, has := records[sigID]
+		assert.Truef(t, has, "outlier marker for signal %s has no canonical record", sigID)
+		assert.Lessf(t, facet, n, "facet %d of signal %s is past the record's facet count", facet, sigID)
+
+		// A facet is either placed or an outlier, never both.
+		if story, placed := owner[facetRef{sigID, facet}]; placed {
+			t.Errorf("facet %d of signal %s is both in story %s and in the outlier bucket", facet, sigID, story)
+		}
+		return nil
 	}))
 
 	for id := range records {
@@ -335,7 +330,8 @@ func TestReadAPI_BothDirectionsAgree(t *testing.T) {
 
 	// story -> signals, built independently
 	byStory := map[uuid.UUID]map[uuid.UUID]bool{}
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		for sig, err := range tr.SignalsOf(meta.ID) {
 			require.NoError(t, err)
 			if byStory[sig.ID] == nil {
@@ -488,4 +484,3 @@ func TestOutliers_YieldsSignalOncePerSignal(t *testing.T) {
 	require.Len(t, outliers, 1, "multi-facet outlier signal must be yielded exactly once")
 	assert.Equal(t, sig.ID, outliers[0].ID)
 }
-

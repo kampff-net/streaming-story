@@ -23,7 +23,8 @@ import (
 func storySnapshot(t *testing.T, tr *Tracker[string]) map[uuid.UUID][]uuid.UUID {
 	t.Helper()
 	out := make(map[uuid.UUID][]uuid.UUID)
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		var ids []uuid.UUID
 		for sig, err := range tr.SignalsOf(meta.ID) {
 			require.NoError(t, err)
@@ -193,7 +194,8 @@ func drain(ch <-chan StoryEvent[string]) []StoryEvent[string] {
 func corpusSnapshot(t *testing.T, tr *Tracker[string]) string {
 	t.Helper()
 	var lines []string
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		var ids []string
 		for sig, err := range tr.SignalsOf(meta.ID) {
 			require.NoError(t, err)

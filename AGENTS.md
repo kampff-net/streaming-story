@@ -87,7 +87,16 @@ During the Apply phase an `applyInProgress` flag redirects `Ingest` calls into a
 
 The flag covers **only the write transaction** — collection is read-only and clustering touches no store, so writers are not stalled for those phases.
 
-A buffered `Ingest` still returns a provisional story ID. It is computed from `draftSnapshot`, an immutable copy of the story metadata the batch already collected, published for the Apply window. The lookup **must not touch the store**: the `Store` contract does not promise `View` may run concurrently with `Update`, and single-lock backends (`MemStore` included) would block the caller for the whole Apply — the exact stall the buffer exists to prevent. The drain re-ingests each buffered signal for real; that placement is authoritative.
+A buffered `Ingest` still returns a provisional story ID. It is computed from `draftSnapshot`, an immutable copy of the story metadata the batch already collected, published for the Apply window. The lookup **must not touch the store**: the `Store` contract does not promise a read may run concurrently with `Update`, and single-lock backends (`MemStore` included) would block the caller for the whole Apply — the exact stall the buffer exists to prevent. The drain re-ingests each buffered signal for real; that placement is authoritative.
+
+## Store Contract — Two Rules
+
+`Store` embeds `Reader` (`Get`, `ScanRange`, `ScanPrefix`) and reads are plain calls; `Update` is the only transaction. There is no `View` — a read transaction held across caller code deadlocks any read-modify-write (bbolt blocks a growing write on live read transactions; `MemStore`'s `RWMutex` is not reentrant).
+
+1. **Never call the `Store` from inside a scan callback**, and never write from one. Copy the keys out, let the scan return, then read or write. See `collectBatch`, which is phased for this, and `migrateFacets`. Calling back into the same `Tx` is fine.
+2. **Never yield to caller code from inside a scan.** Public iterators materialise first: whole values when small, otherwise just the ID list (`scanDistinctIDs`) with records read between yields (`yieldSignals`).
+
+Adding a read path? Take a `Reader`, not a `Tx`, so it works from both the store and inside a write transaction.
 
 ### Key Space
 

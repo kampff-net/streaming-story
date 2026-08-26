@@ -3,22 +3,70 @@ package story
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
 // The persistence contract and the in-memory implementation shipped with the library.
 
-// Store is the persistence interface used by Tracker.
+// Reader is the read surface of a store, shared by Store and Tx.
 //
-// Implementations must be safe for concurrent use; the Tracker serialises
-// writes internally but may call View concurrently with other View calls.
+// Every method is self-contained: an implementation must not keep a read
+// transaction, lock, or snapshot open once the call returns. Callers therefore
+// never hold store resources across their own code, which is what makes it safe
+// to write to the store from inside a read result — the trap a callback-scoped
+// read transaction sets.
+//
+// The one place caller code does run inside an implementation is the fn passed
+// to ScanRange and ScanPrefix. That fn belongs to this package and never
+// re-enters the Store; see the scan documentation below.
+//
+// Every key and value a Reader hands out is owned by the implementation, which
+// may return memory it does not copy — a page of a memory-mapped file, say. A
+// caller must not mutate one, and must not retain one past its validity: for a
+// value from Get, until the next call on the same Reader; for a key or value
+// passed to a scan callback, until that callback returns. Anything needed for
+// longer must be copied.
 //
 // Key ordering must be lexicographic over the raw byte slice — this is what
 // bbolt, LevelDB, and most embedded KV stores provide out of the box.
-// Range scan methods rely on this ordering for efficient prefix and time-index lookups.
+// The scan methods rely on this ordering for prefix and time-index lookups.
+type Reader interface {
+	// Get returns the value for key, or nil if the key does not exist.
+	Get(key []byte) ([]byte, error)
+
+	// ScanRange calls fn for every key in [from, to) in ascending key order.
+	// An empty to means "to the end of the key space". Iteration stops when fn
+	// returns a non-nil error; that error is returned by ScanRange.
+	//
+	// An implementation may hold a read transaction, lock, or snapshot for the
+	// duration of the scan, so fn must not call any method of the Store — not
+	// another scan, not Get, and not Update. On bbolt a write that grows the
+	// file blocks on every open read transaction, and on MemStore the RWMutex
+	// is not reentrant; both deadlock. This package copies the keys it needs
+	// out of the scan and reads the records after it returns.
+	//
+	// Calling back into the same Tx is allowed and is not the same thing: those
+	// calls stay inside one transaction the implementation already holds.
+	ScanRange(from, to []byte, fn func(key, val []byte) error) error
+
+	// ScanPrefix calls fn for every key that begins with prefix, in ascending
+	// key order. Iteration stops when fn returns a non-nil error. The same
+	// no-reentry rule as ScanRange applies.
+	//
+	// Deleting or writing keys from fn is likewise not allowed: cursor
+	// behaviour under concurrent mutation is undefined on most backends.
+	// Collect what is to change, then apply it after the scan.
+	ScanPrefix(prefix []byte, fn func(key, val []byte) error) error
+}
+
+// Store is the persistence interface used by Tracker.
+//
+// Implementations must be safe for concurrent use. Reads go straight through
+// the embedded Reader; only writes are transactional, because only writes need
+// to be atomic across several keys.
 type Store interface {
-	// View executes fn inside a read-only transaction.
-	View(fn func(tx Tx) error) error
+	Reader
 
 	// Update executes fn inside a read-write transaction.
 	// Concurrent Update calls are serialised by the implementation.
@@ -28,15 +76,12 @@ type Store interface {
 	Close() error
 }
 
-// Tx is a single key-value transaction provided to Store.View and Store.Update callbacks.
-// Tx values must not be used outside the callback they are passed to.
-// All byte slices passed to or returned from Tx callbacks (keys and values in Get,
-// ScanPrefix, ScanRange) are owned by the store only for the duration of the callback/transaction.
-// Callers must not mutate them and must not retain references past transaction completion.
+// Tx is a read-write transaction provided to the Store.Update callback.
+// Tx values must not be used outside the callback they are passed to, and
+// nothing a Tx hands out survives the transaction: the Reader ownership rules
+// apply, bounded additionally by the end of the callback.
 type Tx interface {
-	// Get returns the value for key, or nil if the key does not exist.
-	// The returned slice is only valid for the lifetime of the transaction.
-	Get(key []byte) ([]byte, error)
+	Reader
 
 	// Put writes key → value. value must not be empty (use Delete to remove a key).
 	Put(key, value []byte) error
@@ -46,15 +91,6 @@ type Tx interface {
 
 	// DeletePrefix removes all keys that begin with prefix.
 	DeletePrefix(prefix []byte) error
-
-	// ScanRange calls fn for every key in [from, to) in ascending key order.
-	// Iteration stops when fn returns a non-nil error; that error is returned
-	// by ScanRange.
-	ScanRange(from, to []byte, fn func(key, val []byte) error) error
-
-	// ScanPrefix calls fn for every key that begins with prefix, in ascending
-	// key order. Iteration stops when fn returns a non-nil error.
-	ScanPrefix(prefix []byte, fn func(key, val []byte) error) error
 }
 
 // MemStore is a thread-safe in-memory Store implementation suitable for tests and lightweight usage.
@@ -68,10 +104,22 @@ func NewMemStore() *MemStore {
 	return &MemStore{data: make(map[string][]byte)}
 }
 
-func (s *MemStore) View(fn func(Tx) error) error {
+func (s *MemStore) Get(key []byte) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return fn(&memTx{store: s})
+	return get(s.data, key)
+}
+
+func (s *MemStore) ScanRange(from, to []byte, fn func(key, val []byte) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return scanRange(s.data, from, to, fn)
+}
+
+func (s *MemStore) ScanPrefix(prefix []byte, fn func(key, val []byte) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return scanPrefix(s.data, prefix, fn)
 }
 
 func (s *MemStore) Update(fn func(Tx) error) error {
@@ -82,21 +130,24 @@ func (s *MemStore) Update(fn func(Tx) error) error {
 
 func (s *MemStore) Close() error { return nil }
 
-// Compile-time interface check.
-var _ Store = (*MemStore)(nil)
+// Compile-time interface checks.
+var (
+	_ Store = (*MemStore)(nil)
+	_ Tx    = (*memTx)(nil)
+)
 
+// memTx is the write transaction. It runs under the store's write lock, so its
+// read methods reach the map directly rather than taking the lock again.
 type memTx struct{ store *MemStore }
 
-var _ Tx = (*memTx)(nil)
+func (t *memTx) Get(key []byte) ([]byte, error) { return get(t.store.data, key) }
 
-func (t *memTx) Get(key []byte) ([]byte, error) {
-	v, ok := t.store.data[string(key)]
-	if !ok {
-		return nil, nil
-	}
-	cp := make([]byte, len(v))
-	copy(cp, v)
-	return cp, nil
+func (t *memTx) ScanRange(from, to []byte, fn func(key, val []byte) error) error {
+	return scanRange(t.store.data, from, to, fn)
+}
+
+func (t *memTx) ScanPrefix(prefix []byte, fn func(key, val []byte) error) error {
+	return scanPrefix(t.store.data, prefix, fn)
 }
 
 func (t *memTx) Put(key, value []byte) error {
@@ -117,49 +168,54 @@ func (t *memTx) Delete(key []byte) error {
 func (t *memTx) DeletePrefix(prefix []byte) error {
 	p := string(prefix)
 	for k := range t.store.data {
-		if len(k) >= len(p) && k[:len(p)] == p {
+		if strings.HasPrefix(k, p) {
 			delete(t.store.data, k)
 		}
 	}
 	return nil
 }
 
-func (t *memTx) ScanRange(from, to []byte, fn func(key, val []byte) error) error {
+// The read primitives, shared by MemStore and memTx. Each caller is responsible
+// for holding whatever lock it needs before calling in.
+
+func get(data map[string][]byte, key []byte) ([]byte, error) {
+	v, ok := data[string(key)]
+	if !ok {
+		return nil, nil
+	}
+	return append([]byte(nil), v...), nil
+}
+
+func scanRange(data map[string][]byte, from, to []byte, fn func(key, val []byte) error) error {
 	fromS, toS := string(from), string(to)
 	hasTo := len(to) > 0
-	for _, k := range t.sortedKeys() {
+	for _, k := range sortedKeys(data) {
 		if k < fromS || (hasTo && k >= toS) {
 			continue
 		}
-		v := t.store.data[k]
-		cp := make([]byte, len(v))
-		copy(cp, v)
-		if err := fn([]byte(k), cp); err != nil {
+		if err := fn([]byte(k), append([]byte(nil), data[k]...)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (t *memTx) ScanPrefix(prefix []byte, fn func(key, val []byte) error) error {
+func scanPrefix(data map[string][]byte, prefix []byte, fn func(key, val []byte) error) error {
 	p := string(prefix)
-	for _, k := range t.sortedKeys() {
-		if len(k) < len(p) || k[:len(p)] != p {
+	for _, k := range sortedKeys(data) {
+		if !strings.HasPrefix(k, p) {
 			continue
 		}
-		v := t.store.data[k]
-		cp := make([]byte, len(v))
-		copy(cp, v)
-		if err := fn([]byte(k), cp); err != nil {
+		if err := fn([]byte(k), append([]byte(nil), data[k]...)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (t *memTx) sortedKeys() []string {
-	keys := make([]string, 0, len(t.store.data))
-	for k := range t.store.data {
+func sortedKeys(data map[string][]byte) []string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)

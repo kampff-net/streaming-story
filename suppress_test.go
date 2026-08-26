@@ -96,11 +96,9 @@ func TestTracker_Suppress(t *testing.T) {
 			})
 		}))
 		var idx *activeStoryIndex
-		require.NoError(t, tr.cfg.Store.View(func(tx Tx) error {
-			var err error
-			idx, err = tr.buildActiveStoryIndex(tx)
-			return err
-		}))
+		var err error
+		idx, err = tr.buildActiveStoryIndex(tr.cfg.Store)
+		require.NoError(t, err)
 		tr.storyIndex.Store(idx)
 
 		require.NoError(t, tr.Suppress(id, "spam"))

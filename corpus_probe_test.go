@@ -48,7 +48,8 @@ func TestCorpusProbe(t *testing.T) {
 func probeReport(t *testing.T, tr *Tracker[string], total int, label string) {
 	var sizes []int
 	assigned := 0
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		n := 0
 		for range tr.SignalsOf(meta.ID) {
 			n++
@@ -75,7 +76,8 @@ func probeReport(t *testing.T, tr *Tracker[string], total int, label string) {
 	// describe a geometry the maintenance pass never sees.
 	p := tr.projector()
 	var big []*batchFacet
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		require.NoError(t, err)
 		var group []*batchFacet
 		for sig, err := range tr.SignalsOf(meta.ID) {
 			if err == nil {

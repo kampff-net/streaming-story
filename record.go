@@ -92,8 +92,8 @@ func storyMetaFromRecord(id uuid.UUID, rec storyRecord) StoryMeta {
 // (keys.StoryMeta). It is the record-shaped counterpart of readStoryMeta,
 // used by callers that need to mutate and write the record back rather than
 // just read it.
-func (t *Tracker[T]) readStoryRecord(tx Tx, id uuid.UUID) (storyRecord, error) {
-	b, err := tx.Get(keys.StoryMeta(id))
+func (t *Tracker[T]) readStoryRecord(r Reader, id uuid.UUID) (storyRecord, error) {
+	b, err := r.Get(keys.StoryMeta(id))
 	if err != nil {
 		return storyRecord{}, err
 	}
@@ -104,7 +104,7 @@ func (t *Tracker[T]) readStoryRecord(tx Tx, id uuid.UUID) (storyRecord, error) {
 	if err := cborStrictDecMode.Unmarshal(b, &rec); err != nil {
 		return storyRecord{}, fmt.Errorf("decode story %s: %w", id, err)
 	}
-	bh, err := tx.Get(keys.StoryHot(id))
+	bh, err := r.Get(keys.StoryHot(id))
 	if err != nil {
 		return storyRecord{}, err
 	}
@@ -126,8 +126,8 @@ func (t *Tracker[T]) readStoryRecord(tx Tx, id uuid.UUID) (storyRecord, error) {
 
 // readStoryMeta reads and decodes story metadata for id from tx, overlaying
 // the hot state (keys.StoryHot) on top of the batch-owned record (keys.StoryMeta).
-func (t *Tracker[T]) readStoryMeta(tx Tx, id uuid.UUID) (StoryMeta, error) {
-	rec, err := t.readStoryRecord(tx, id)
+func (t *Tracker[T]) readStoryMeta(r Reader, id uuid.UUID) (StoryMeta, error) {
+	rec, err := t.readStoryRecord(r, id)
 	if err != nil {
 		return StoryMeta{}, err
 	}
@@ -261,8 +261,8 @@ func (t *Tracker[T]) reconcileFacetCount(tx Tx, id uuid.UUID, want int) error {
 // readCanonicalSignal reads the canonical record for a signal. It reports
 // found=false when no record exists, which is how a caller distinguishes an
 // unknown signal from one whose facets are merely all unplaced.
-func (t *Tracker[T]) readCanonicalSignal(tx Tx, id uuid.UUID) (Signal[T], bool, error) {
-	b, err := tx.Get(keys.CanonicalSignal(id))
+func (t *Tracker[T]) readCanonicalSignal(r Reader, id uuid.UUID) (Signal[T], bool, error) {
+	b, err := r.Get(keys.CanonicalSignal(id))
 	if err != nil {
 		return Signal[T]{}, false, err
 	}
@@ -287,8 +287,8 @@ type cborSignalHeader struct {
 
 // readSignalHeader reads timestamp and embeddings from the canonical record,
 // skipping the caller payload T.
-func (t *Tracker[T]) readSignalHeader(tx Tx, id uuid.UUID) (time.Time, []Embedding, bool, error) {
-	b, err := tx.Get(keys.CanonicalSignal(id))
+func (t *Tracker[T]) readSignalHeader(r Reader, id uuid.UUID) (time.Time, []Embedding, bool, error) {
+	b, err := r.Get(keys.CanonicalSignal(id))
 	if err != nil {
 		return time.Time{}, nil, false, err
 	}
@@ -343,8 +343,8 @@ func dropFacetOutlier(tx Tx, signalID uuid.UUID, facet int) error {
 // readSignalLocSet reads the per-facet location index for a signal. hasIndex
 // reports whether an entry exists at all, which distinguishes a signal that has
 // never been placed from one whose facets are all unplaced.
-func readSignalLocSet(tx Tx, signalID uuid.UUID) (locs []keys.FacetLoc, hasIndex bool, err error) {
-	b, err := tx.Get(keys.SignalLoc(signalID))
+func readSignalLocSet(r Reader, signalID uuid.UUID) (locs []keys.FacetLoc, hasIndex bool, err error) {
+	b, err := r.Get(keys.SignalLoc(signalID))
 	if err != nil {
 		return nil, false, err
 	}
@@ -417,9 +417,9 @@ func evictOutlierFacets(tx Tx, signalID uuid.UUID) error {
 // outlierFacetsOf lists the facet indices of a signal currently held in the
 // outlier bucket. The markers are collected before any delete: mutating the
 // store from inside its own scan is not something the Store contract promises.
-func outlierFacetsOf(tx Tx, signalID uuid.UUID) ([]int, error) {
+func outlierFacetsOf(r Reader, signalID uuid.UUID) ([]int, error) {
 	var facets []int
-	err := tx.ScanPrefix(keys.OutlierSignalPrefix(signalID), func(key, _ []byte) error {
+	err := r.ScanPrefix(keys.OutlierSignalPrefix(signalID), func(key, _ []byte) error {
 		_, facet, ok := keys.ParseOutlierFacet(key)
 		if !ok {
 			return nil
@@ -474,25 +474,23 @@ func gcCanonicalSignal(tx Tx, signalID uuid.UUID) error {
 
 // loadCalibState reads persisted calibration state from the store, if any.
 func (t *Tracker[T]) loadCalibState() error {
-	return t.cfg.Store.View(func(tx Tx) error {
-		b, err := tx.Get(keys.CalibState())
-		if err != nil || b == nil {
-			return err
-		}
-		var s calibState
-		if err := cborStrictDecMode.Unmarshal(b, &s); err != nil {
-			return fmt.Errorf("decode calib state: %w", err)
-		}
-		if s.Dim > 0 {
-			t.dim.Store(int32(s.Dim))
-		}
-		t.calibMu.Lock()
-		t.sigmaGlobal = s.SigmaGlobal
-		t.lastBatch = s.LastBatchAt
-		t.mean = s.Mean
-		t.calibMu.Unlock()
-		return nil
-	})
+	b, err := t.cfg.Store.Get(keys.CalibState())
+	if err != nil || b == nil {
+		return err
+	}
+	var s calibState
+	if err := cborStrictDecMode.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("decode calib state: %w", err)
+	}
+	if s.Dim > 0 {
+		t.dim.Store(int32(s.Dim))
+	}
+	t.calibMu.Lock()
+	defer t.calibMu.Unlock()
+	t.sigmaGlobal = s.SigmaGlobal
+	t.lastBatch = s.LastBatchAt
+	t.mean = s.Mean
+	return nil
 }
 
 // saveCalibState writes the current calibration state to the store inside tx.
@@ -512,4 +510,3 @@ func (t *Tracker[T]) saveCalibState(tx Tx) error {
 	}
 	return tx.Put(keys.CalibState(), b)
 }
-

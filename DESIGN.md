@@ -470,6 +470,36 @@ The library talks to a minimal prefix-scannable KV store through `Store` and
 LevelDB, and most embedded stores give by default — because the range scans
 depend on it. `MemStore` ships for tests and small deployments.
 
+**Only writes are transactional.** `Store` embeds `Reader` — `Get`, `ScanRange`,
+`ScanPrefix` — and a read is a single self-contained call; `Update` is the only
+callback-scoped transaction, because multi-key atomicity is only ever needed for
+a write. There is no `View`.
+
+The reason is that a callback-scoped read transaction stays open across whatever
+the callback does, and the read API hands its results to *caller* code through
+`iter.Seq`. A caller ranging over `Stories` and writing in the loop body — a
+read-modify-write, the most ordinary thing to want — then blocks its own write
+on its own open read: on bbolt a write that grows the file must remap and waits
+for every live read transaction; on `MemStore` the `RWMutex` is not reentrant.
+Both hang, and no caller can see it coming. Long read transactions also block
+page reclamation on bbolt, so the file grows.
+
+Two rules follow, and the library obeys them itself:
+
+- A scan callback must not call back into the `Store`. Copy out the keys, let
+  the scan return, then read the records. `collectBatch` is written in phases
+  for exactly this reason. Calling back into the same `Tx` is fine — those calls
+  stay inside a transaction the store already holds.
+- No public iterator yields from inside a scan. Small results (`Stories`,
+  `FacetsOfStory`) are materialised whole; for results carrying embeddings
+  (`Signals`, `Outliers`, `SignalsOf`) only the ID list is materialised, at 16
+  bytes each, and the records are read one at a time between yields.
+
+The consequence to know about: an iterator is no longer a point-in-time
+snapshot. A signal deleted after the ID scan is skipped rather than yielded as a
+zero value — the same handling a membership marker with no record behind it
+always required.
+
 ### Key Schema
 
 | Purpose | Key | Value |
@@ -522,7 +552,7 @@ its full duration.
 3. The caller still receives a provisional story ID, computed against
    `draftSnapshot`: an immutable copy of the story metadata the batch already
    collected, published for the Apply window. This lookup **must not touch the
-   store** — the `Store` contract does not promise `View` may run concurrently
+   store** — the `Store` contract does not promise a read may run concurrently
    with `Update`, and a single-lock backend would block the caller for the whole
    Apply, the exact stall the buffer exists to prevent.
 4. Once Apply commits, the flag clears and the goroutine drains the buffer by
@@ -565,7 +595,7 @@ func (t *Tracker[T]) Subscribe() <-chan StoryEvent[T]
 
 // Reads.
 func (t *Tracker[T]) Story(id uuid.UUID) (StoryMeta, error)          // ErrNotFound if absent
-func (t *Tracker[T]) Stories(state StoryState) iter.Seq[StoryMeta]   // StoryStateAny for all
+func (t *Tracker[T]) Stories(state StoryState) iter.Seq2[StoryMeta, error] // StoryStateAny for all
 func (t *Tracker[T]) SignalsOf(id uuid.UUID) iter.Seq2[Signal[T], error]
 func (t *Tracker[T]) Signal(id uuid.UUID) (Signal[T], error)         // story member or outlier
 

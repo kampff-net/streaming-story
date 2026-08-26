@@ -237,7 +237,10 @@ func BenchmarkSignalsOf(b *testing.B) {
 	// worth iterating rather than whichever story happened to come first.
 	var target uuid.UUID
 	best := -1
-	for meta := range tr.Stories(StoryStateAny) {
+	for meta, err := range tr.Stories(StoryStateAny) {
+		if err != nil {
+			b.Fatal(err)
+		}
 		n := 0
 		for _, err := range tr.SignalsOf(meta.ID) {
 			if err != nil {
@@ -368,11 +371,8 @@ func TestCollectPhaseAllocs(t *testing.T) {
 			signals []batchFacet
 			mean    []float32
 		)
-		if err := tr.cfg.Store.View(func(tx Tx) error {
-			var err error
-			signals, _, _, mean, _, err = tr.collectBatch(tx, now)
-			return err
-		}); err != nil {
+		var err error
+		if signals, _, _, mean, _, err = tr.collectBatch(tr.cfg.Store, now); err != nil {
 			t.Fatal(err)
 		}
 		if len(mean) > 0 && tr.cfg.MeanRemoval > 0 {
