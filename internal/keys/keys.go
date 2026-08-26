@@ -233,7 +233,7 @@ type FacetLoc struct {
 }
 
 var (
-	cborEncMode = mustEncMode()
+	cborEncMode       = mustEncMode()
 	cborStrictDecMode = mustDecMode()
 )
 

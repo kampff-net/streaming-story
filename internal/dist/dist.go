@@ -90,4 +90,3 @@ func CosineDistanceUnit(a, b []float32) float64 {
 	}
 	return 1.0 - float64(sim)
 }
-

@@ -33,7 +33,6 @@ func (t *Tracker[T]) projector() geom.Projector {
 	return geom.Projector{Mean: t.mean, Strength: float32(t.cfg.MeanRemoval)}
 }
 
-
 // clusterParams packages the configured thresholds for the clustering decisions.
 func (t *Tracker[T]) clusterParams() cluster.Params {
 	return cluster.Params{

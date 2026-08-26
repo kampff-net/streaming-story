@@ -130,19 +130,19 @@ type StoryMeta struct {
 type EventKind uint8
 
 const (
-	EventDraftAssigned    EventKind = iota // real-time: signal provisionally assigned to story
-	EventSignalReassigned                  // batch: signal moved to a different story
-	EventStoryCreated                      // new story persisted after batch run
-	EventStorySplit                        // one story split into two
-	EventStoryMerged                       // two stories merged; StoryID2 is the retired ID
-	EventStoryRetired                      // batch emptied the story; its record was deleted
-	EventStoryDormant                      // story crossed SilenceWindow
-	EventStoryArchived                     // story crossed ArchiveWindow
-	EventStorySuppressed                   // Tracker.Suppress marked the story suppressed
-	EventStoryUnsuppressed                 // Tracker.Unsuppress, or a merge, cleared suppression
-	EventSuppressedStorySignal             // a signal joined a story that remained suppressed
-	EventBatchComplete                     // one per batch run; BatchSummary is populated
-	EventBufferOverflow                    // subscriber channel full; events were dropped
+	EventDraftAssigned         EventKind = iota // real-time: signal provisionally assigned to story
+	EventSignalReassigned                       // batch: signal moved to a different story
+	EventStoryCreated                           // new story persisted after batch run
+	EventStorySplit                             // one story split into two
+	EventStoryMerged                            // two stories merged; StoryID2 is the retired ID
+	EventStoryRetired                           // batch emptied the story; its record was deleted
+	EventStoryDormant                           // story crossed SilenceWindow
+	EventStoryArchived                          // story crossed ArchiveWindow
+	EventStorySuppressed                        // Tracker.Suppress marked the story suppressed
+	EventStoryUnsuppressed                      // Tracker.Unsuppress, or a merge, cleared suppression
+	EventSuppressedStorySignal                  // a signal joined a story that remained suppressed
+	EventBatchComplete                          // one per batch run; BatchSummary is populated
+	EventBufferOverflow                         // subscriber channel full; events were dropped
 )
 
 // StoryEvent is emitted to subscribers on every story state change and

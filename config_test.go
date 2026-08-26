@@ -228,7 +228,7 @@ func TestConfig_MaxFacetsPerSignalBounds(t *testing.T) {
 
 func TestConfig_IngestRejectsTooManyFacets(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
-		Store: newMemStore(),
+		Store:         newMemStore(),
 		BatchInterval: time.Hour, MaxFacetsPerSignal: 2,
 	})
 	require.NoError(t, err)

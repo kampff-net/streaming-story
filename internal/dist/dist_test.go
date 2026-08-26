@@ -136,5 +136,3 @@ func BenchmarkCosineDistanceUnit(b *testing.B) {
 		_ = CosineDistanceUnit(v1, v2)
 	}
 }
-
-

@@ -182,4 +182,3 @@ func TestCBORSignalHeader_SkipsPayload(t *testing.T) {
 	t.Logf("Allocs: small=%f, large=%f", allocsSmall, allocsLarge)
 	assert.InDelta(t, allocsSmall, allocsLarge, 1.0, "header decode must allocate constant memory regardless of payload size")
 }
-
