@@ -113,7 +113,7 @@ func TestTracker_Suppress(t *testing.T) {
 	})
 
 	t.Run("returns_error_after_close", func(t *testing.T) {
-		tr, err := NewTracker[string](Config[string]{Store: newMemStore(), BatchInterval: time.Hour})
+		tr, err := NewTracker[string](Config[string]{Store: newMemStore(), BatchSchedule: "@every 1h"})
 		require.NoError(t, err)
 		require.NoError(t, tr.Close())
 
@@ -177,7 +177,7 @@ func TestTracker_Unsuppress(t *testing.T) {
 	})
 
 	t.Run("returns_error_after_close", func(t *testing.T) {
-		tr, err := NewTracker[string](Config[string]{Store: newMemStore(), BatchInterval: time.Hour})
+		tr, err := NewTracker[string](Config[string]{Store: newMemStore(), BatchSchedule: "@every 1h"})
 		require.NoError(t, err)
 		require.NoError(t, tr.Close())
 

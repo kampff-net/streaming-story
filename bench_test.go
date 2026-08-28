@@ -39,7 +39,7 @@ func BenchmarkBatch(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour, // the ticker must not fire mid-benchmark
+		BatchSchedule: "@every 1h", // the cron runner must not fire mid-benchmark
 		MinStorySize:  3,
 	})
 	if err != nil {
@@ -79,7 +79,7 @@ func BenchmarkBatchFacets(b *testing.B) {
 
 			tr, err := NewTracker[string](Config[string]{
 				Store:         newMemStore(),
-				BatchInterval: time.Hour,
+				BatchSchedule: "@every 1h",
 				MinStorySize:  3,
 			})
 			if err != nil {
@@ -122,7 +122,7 @@ func BenchmarkIngestDuringApply(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:           newMemStore(),
-		BatchInterval:   time.Hour,
+		BatchSchedule:   "@every 1h",
 		IngestBufferCap: 1 << 20, // large enough that the benchmark never blocks
 	})
 	if err != nil {
@@ -169,7 +169,7 @@ func BenchmarkIngestSteadyState(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 		MinStorySize:  3,
 	})
 	if err != nil {
@@ -213,7 +213,7 @@ func BenchmarkSignalsOf(b *testing.B) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 		MinStorySize:  3,
 	})
 	if err != nil {
@@ -278,7 +278,7 @@ func TestStoreFootprint(t *testing.T) {
 	ms := newMemStore()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         ms,
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 		MinStorySize:  3,
 	})
 	if err != nil {
@@ -322,7 +322,7 @@ func collectAllocFixture(t *testing.T) (*Tracker[string], time.Time) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 		MinStorySize:  3,
 	})
 	if err != nil {

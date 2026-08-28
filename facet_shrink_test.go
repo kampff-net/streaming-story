@@ -43,7 +43,7 @@ func shrinkTracker(t *testing.T) *Tracker[string] {
 	t.Helper()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour, // the ticker must not fire mid-test
+		BatchSchedule: "@every 1h", // the cron runner must not fire mid-test
 		MinStorySize:  2,
 	})
 	require.NoError(t, err)

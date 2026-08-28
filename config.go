@@ -5,15 +5,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 
 	"go.kvsh.ch/streaming-story/internal/keys"
 )
+
+var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
 
 // Config holds all configuration for a Tracker.
 //
 // Default values are calibrated for low-to-medium frequency news ingestion
 // (1–10 signals/day per topic). High-frequency sources (social media, metrics)
-// should reduce BatchInterval, SilenceWindow, and ArchiveWindow, and raise
+// should adjust BatchSchedule, SilenceWindow, and ArchiveWindow, and raise
 // MinStorySize accordingly.
 type Config[T any] struct {
 	// Store is the persistence backend. Required.
@@ -32,7 +35,10 @@ type Config[T any] struct {
 	// member.
 	BatchWindow time.Duration
 
-	BatchInterval time.Duration // how often to run a batch (default: 30m)
+	// BatchSchedule defines the cron expression for batch clustering runs
+	// (e.g. "*/30 * * * *", "0 */2 * * *", "@hourly", "@every 30m").
+	// Default: "*/30 * * * *".
+	BatchSchedule string
 	SilenceWindow time.Duration // Active → Dormant (default: 7d)
 	ArchiveWindow time.Duration // Dormant → Archived (default: 30d)
 
@@ -163,8 +169,11 @@ func (c *Config[T]) validate() error {
 	if c.BatchWindow == 0 {
 		c.BatchWindow = 24 * time.Hour
 	}
-	if c.BatchInterval == 0 {
-		c.BatchInterval = 30 * time.Minute
+	if c.BatchSchedule == "" {
+		c.BatchSchedule = "*/30 * * * *"
+	}
+	if _, err := cronParser.Parse(c.BatchSchedule); err != nil {
+		return fmt.Errorf("story: Config.BatchSchedule is invalid %q: %w", c.BatchSchedule, err)
 	}
 	if c.SilenceWindow == 0 {
 		c.SilenceWindow = 7 * 24 * time.Hour

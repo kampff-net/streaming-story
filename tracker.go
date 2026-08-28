@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 // Tracker lifecycle: construction, shutdown, and the background batch loop.
@@ -51,12 +53,11 @@ type Tracker[T any] struct {
 	storyIndex      atomic.Pointer[activeStoryIndex]
 
 	// lifecycle
-	stopCh  chan struct{}
-	stopped chan struct{}
+	cron *cron.Cron
 }
 
 // NewTracker creates a Tracker using the provided configuration.
-// The background batch goroutine is started immediately.
+// The background batch cron engine is started immediately.
 // Call Close to stop it and release resources.
 func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 	if err := cfg.validate(); err != nil {
@@ -66,8 +67,6 @@ func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 	t := &Tracker[T]{
 		cfg:          cfg,
 		ingestBuffer: make(chan Signal[T], cfg.IngestBufferCap),
-		stopCh:       make(chan struct{}),
-		stopped:      make(chan struct{}),
 	}
 
 	if err := t.loadCalibState(); err != nil {
@@ -80,18 +79,29 @@ func NewTracker[T any](cfg Config[T]) (*Tracker[T], error) {
 	}
 	t.storyIndex.Store(idx)
 
-	go t.batchLoop()
+	c := cron.New(
+		cron.WithParser(cronParser),
+		cron.WithChain(cron.SkipIfStillRunning(cron.DiscardLogger)),
+	)
+	if _, err := c.AddFunc(cfg.BatchSchedule, t.runBatch); err != nil {
+		return nil, fmt.Errorf("story: schedule batch: %w", err)
+	}
+	c.Start()
+	t.cron = c
+
 	return t, nil
 }
 
-// Close stops the background batch goroutine, waits for the current batch
+// Close stops the background batch cron engine, waits for the current batch
 // run (if any) to complete, closes all subscriber channels, and closes the
 // store. It is safe to call more than once; subsequent calls return nil.
 func (t *Tracker[T]) Close() error {
 	var closeErr error
 	t.closeOnce.Do(func() {
-		close(t.stopCh)
-		<-t.stopped
+		if t.cron != nil {
+			ctx := t.cron.Stop()
+			<-ctx.Done()
+		}
 
 		// Wait for in-flight Ingest calls to finish, then bar new ones before
 		// the store goes away.
@@ -110,23 +120,6 @@ func (t *Tracker[T]) Close() error {
 		closeErr = t.cfg.Store.Close()
 	})
 	return closeErr
-}
-
-// batchLoop runs the periodic batch re-clustering cycle until stopCh is closed.
-func (t *Tracker[T]) batchLoop() {
-	defer close(t.stopped)
-
-	ticker := time.NewTicker(t.cfg.BatchInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-t.stopCh:
-			return
-		case <-ticker.C:
-			t.runBatch()
-		}
-	}
 }
 
 // Subscriber fan-out.

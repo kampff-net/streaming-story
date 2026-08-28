@@ -63,7 +63,7 @@ The library is a hybrid clustering system: a **Draft phase** (real-time, per-sig
 ### Signal Flow
 
 1. `Ingest` → cosine-similarity nearest-`RecentCentroid` lookup → assign or outlier-bucket.
-2. Background goroutine fires every `BatchInterval` → maintenance pass → KV apply → emit events.
+2. Background cron runner fires on `BatchSchedule` → maintenance pass → KV apply → emit events.
 
 ### Merge Survivor Rule
 

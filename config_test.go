@@ -53,10 +53,25 @@ func TestConfig_validate(t *testing.T) {
 		assert.Equal(t, 2*time.Hour, cfg.BatchWindow)
 	})
 
-	t.Run("default_BatchInterval", func(t *testing.T) {
+	t.Run("default_BatchSchedule", func(t *testing.T) {
 		cfg := minimalConfig()
 		require.NoError(t, cfg.validate())
-		assert.Equal(t, 30*time.Minute, cfg.BatchInterval)
+		assert.Equal(t, "*/30 * * * *", cfg.BatchSchedule)
+	})
+
+	t.Run("custom_valid_BatchSchedule", func(t *testing.T) {
+		cfg := minimalConfig()
+		cfg.BatchSchedule = "0 */2 * * *"
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, "0 */2 * * *", cfg.BatchSchedule)
+	})
+
+	t.Run("invalid_BatchSchedule", func(t *testing.T) {
+		cfg := minimalConfig()
+		cfg.BatchSchedule = "not-a-cron-expression"
+		err := cfg.validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "BatchSchedule is invalid")
 	})
 
 	t.Run("default_SilenceWindow", func(t *testing.T) {
@@ -229,7 +244,7 @@ func TestConfig_MaxFacetsPerSignalBounds(t *testing.T) {
 func TestConfig_IngestRejectsTooManyFacets(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour, MaxFacetsPerSignal: 2,
+		BatchSchedule: "@every 1h", MaxFacetsPerSignal: 2,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = tr.Close() })

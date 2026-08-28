@@ -119,7 +119,7 @@ func TestTrackerSignalID(t *testing.T) {
 		ns := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			BatchInterval: time.Hour,
+			BatchSchedule: "@every 1h",
 			Namespace:     ns,
 		})
 		require.NoError(t, err)

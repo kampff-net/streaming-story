@@ -25,7 +25,7 @@ func main() {
 	cfg := story.Config[ArticlePayload]{
 		Store:         store,
 		BatchWindow:   24 * time.Hour,
-		BatchInterval: 30 * time.Minute,
+		BatchSchedule: "*/30 * * * *",
 	}
 
 	tracker, err := story.NewTracker(cfg)

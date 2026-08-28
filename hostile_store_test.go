@@ -173,7 +173,7 @@ func TestHostileStore_IngestAndBatch(t *testing.T) {
 	store := newHostileStore()
 	tr, err := NewTracker[string](Config[string]{
 		Store:           store,
-		BatchInterval:   time.Hour,
+		BatchSchedule:   "@every 1h",
 		MinStorySize:    2,
 		AssignThreshold: 0.3,
 		MergeThreshold:  0.2,

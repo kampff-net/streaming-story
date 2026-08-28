@@ -90,7 +90,7 @@ func TestProvisionalStory(t *testing.T) {
 		t.Helper()
 		tr, err := NewTracker[string](Config[string]{
 			Store:         NewMemStore(),
-			BatchInterval: time.Hour,
+			BatchSchedule: "@every 1h",
 		})
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = tr.Close() })
@@ -172,7 +172,7 @@ func TestIngestDuringApplyReturnsProvisionalStory(t *testing.T) {
 	}
 	tr, err := NewTracker[string](Config[string]{
 		Store:         store,
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 		MinStorySize:  3,
 	})
 	require.NoError(t, err)

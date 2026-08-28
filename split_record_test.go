@@ -49,7 +49,7 @@ func TestSplitRecord_ColdStartPopulatesIndex(t *testing.T) {
 	// Open a fresh tracker over this store.
 	tr, err := NewTracker[string](Config[string]{
 		Store:         store,
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 	})
 	require.NoError(t, err)
 	defer tr.Close()
@@ -70,7 +70,7 @@ func TestSplitRecord_IngestNeverMutatesStoryMeta(t *testing.T) {
 
 	tr, err := NewTracker[string](Config[string]{
 		Store:         store,
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 	})
 	require.NoError(t, err)
 	defer tr.Close()

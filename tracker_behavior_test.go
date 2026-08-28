@@ -379,7 +379,7 @@ func TestTracker_Ingest_ExcludesStaleStories(t *testing.T) {
 func TestTracker_Subscribe_AfterCloseReturnsClosedChannel(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 	})
 	require.NoError(t, err)
 	require.NoError(t, tr.Close())
@@ -392,7 +392,7 @@ func TestTracker_Subscribe_AfterCloseReturnsClosedChannel(t *testing.T) {
 func TestTracker_Close_IsIdempotent(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 	})
 	require.NoError(t, err)
 	require.NoError(t, tr.Close())
@@ -632,7 +632,7 @@ func TestTracker_Ingest_AveragedVectorOrphansButFacetsPlace(t *testing.T) {
 	newSeeded := func() *Tracker[string] {
 		tr, err := NewTracker[string](Config[string]{
 			Store:           newMemStore(),
-			BatchInterval:   time.Hour,
+			BatchSchedule:   "@every 1h",
 			AssignThreshold: 0.20,
 			MergeThreshold:  0.10,
 			SplitThreshold:  0.15,

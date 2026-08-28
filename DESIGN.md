@@ -279,7 +279,7 @@ For each arriving signal:
    overwrite one.
 
 **Centroid currency.** Centroids are recomputed only at the end of a batch run,
-so a Draft decision may use a centroid up to `BatchInterval` old. Accepted:
+so a Draft decision may use a centroid up to `BatchSchedule` cadence old. Accepted:
 Draft assignments are explicitly provisional, and the next maintenance pass
 corrects the structure.
 
@@ -287,7 +287,7 @@ corrects the structure.
 
 ## Maintenance Pass
 
-Runs every `BatchInterval` on a background goroutine. Collection is read-only;
+Runs on `BatchSchedule` via a background cron runner. Collection is read-only;
 every decision is computed from state already in hand and applied in a single
 write transaction.
 

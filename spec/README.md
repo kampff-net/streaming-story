@@ -31,6 +31,7 @@
 | 007 | Multi-Facet Signals & Many-to-Many Membership | ✅ `COMPLETED` | 2026-08-18 | 2026-08-18 | [spec.md](007_multi_facet_signals/spec.md) |
 | 008 | High-Throughput Performance & Latency Optimizations | ✅ `COMPLETED` | 2026-08-18 | 2026-08-20 | [spec.md](008_performance_optimizations/spec.md) |
 | 009 | Story Suppression Lifecycle & Tracker State | ✅ `COMPLETED` | 2026-08-19 | 2026-08-26 | [spec.md](009_story_suppression_lifecycle/spec.md) |
+| 010 | Cron-Like Batch Scheduling | ✅ `COMPLETED` | 2026-08-28 | 2026-08-28 | [spec.md](010_cron_batch_scheduling/spec.md) |
 
 > Implemented, then revised in five places once measured against the reference
 > corpus: centred geometry, promotion by centroid growth, outlier admission, the

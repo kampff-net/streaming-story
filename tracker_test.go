@@ -14,12 +14,12 @@ import (
 )
 
 // newTestTracker creates a Tracker backed by an in-memory store.
-// BatchInterval is set to 1 hour so the ticker never fires during a unit test.
+// BatchSchedule is set to 1 hour so the cron runner never fires during a unit test.
 func newTestTracker(t *testing.T) *Tracker[string] {
 	t.Helper()
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = tr.Close() })
@@ -80,7 +80,7 @@ func TestNewTracker(t *testing.T) {
 
 		tr, err := NewTracker[string](Config[string]{
 			Store:         ms,
-			BatchInterval: time.Hour,
+			BatchSchedule: "@every 1h",
 		})
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = tr.Close() })
@@ -110,7 +110,7 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("returns_without_blocking", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			BatchInterval: time.Hour,
+			BatchSchedule: "@every 1h",
 		})
 		require.NoError(t, err)
 
@@ -127,7 +127,7 @@ func TestTracker_Close(t *testing.T) {
 	t.Run("closes_subscriber_channels", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			BatchInterval: time.Hour,
+			BatchSchedule: "@every 1h",
 		})
 		require.NoError(t, err)
 
@@ -168,7 +168,7 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("does_not_block_on_full_channel", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:           newMemStore(),
-			BatchInterval:   time.Hour,
+			BatchSchedule:   "@every 1h",
 			EventBufferSize: 1,
 		})
 		require.NoError(t, err)
@@ -197,7 +197,7 @@ func TestTracker_emit(t *testing.T) {
 	t.Run("no_op_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			BatchInterval: time.Hour,
+			BatchSchedule: "@every 1h",
 		})
 		require.NoError(t, err)
 		require.NoError(t, tr.Close())
@@ -363,7 +363,7 @@ func TestTracker_Ingest(t *testing.T) {
 	t.Run("returns_error_after_close", func(t *testing.T) {
 		tr, err := NewTracker[string](Config[string]{
 			Store:         newMemStore(),
-			BatchInterval: time.Hour,
+			BatchSchedule: "@every 1h",
 		})
 		require.NoError(t, err)
 		require.NoError(t, tr.Close())

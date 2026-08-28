@@ -23,7 +23,7 @@ func main() {
 	store := story.NewMemStore()
 	cfg := story.Config[NewsPayload]{
 		Store:           store,
-		BatchInterval:   500 * time.Millisecond,
+		BatchSchedule:   "@every 500ms",
 		EventBufferSize: 128,
 		// A demo corpus is far narrower than a real one, so leave more of the
 		// corpus mean in place: full centring would turn a handful of tight
@@ -133,7 +133,7 @@ func main() {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// The 500ms BatchInterval fires a batch mid-ingest: with only some of the
+	// The 500ms BatchSchedule fires a batch mid-ingest: with only some of the
 	// signals collected it merges everything into one story, then the next
 	// batch (once all seven are in) splits it back into two stories plus the
 	// outlier — demonstrating how the refinement phase reclusters.

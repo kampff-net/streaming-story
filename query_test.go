@@ -277,7 +277,7 @@ func TestStoreInvariants_HoldForMultiFacetSignals(t *testing.T) {
 func TestStoreInvariants_HoldAfterEviction(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 		OutlierTTL:    time.Nanosecond,
 	})
 	require.NoError(t, err)

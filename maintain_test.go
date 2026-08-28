@@ -376,7 +376,7 @@ func TestMaintain_DistinctSignalsPromote(t *testing.T) {
 func TestMaintain_SplitPutsOneSignalInBothChildren(t *testing.T) {
 	tr, err := NewTracker[string](Config[string]{
 		Store:         newMemStore(),
-		BatchInterval: time.Hour,
+		BatchSchedule: "@every 1h",
 		MinStorySize:  3,
 		MeanRemoval:   0, // keep the fixture's geometry as written
 	})

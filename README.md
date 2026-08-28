@@ -81,7 +81,7 @@ type Article struct {
 func main() {
 	tracker, err := story.NewTracker(story.Config[Article]{
 		Store:         story.NewMemStore(), // required; swap for bbolt/LevelDB in production
-		BatchInterval: 30 * time.Minute,
+		BatchSchedule: "*/30 * * * *",
 		OnBatchError:  func(err error) { log.Printf("batch: %v", err) },
 	})
 	if err != nil {
@@ -238,7 +238,7 @@ or above `AssignThreshold`, `SplitThreshold` at or below `MergeThreshold` or abo
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `BatchInterval` | `30m` | How often the maintenance pass runs. **This is the only thing that promotes, admits, splits, or merges** — the Draft phase alone never restructures anything. Lower it for faster structural correction, at proportional CPU cost. |
+| `BatchSchedule` | `*/30 * * * *` | Cron schedule for when the maintenance pass runs (e.g. `*/30 * * * *`, `@hourly`, `@every 30m`). **This is the only thing that promotes, admits, splits, or merges** — the Draft phase alone never restructures anything. Run it more frequently for faster structural correction, at proportional CPU cost. |
 | `BatchWindow` | `24h` | Reference span for outlier retention, and nothing else: it sets `OutlierTTL`'s default to `2×BatchWindow`. It does **not** bound clustering input — story membership is read in full on every pass, because the lifetime centroid is the mean of every member. Set `OutlierTTL` directly and this parameter stops mattering. |
 | `OutlierTTL` | `2×BatchWindow` | How long an unmatched signal is kept before eviction, measured against the **last batch timestamp** rather than wall clock, so a long maintenance pause cannot trigger mass eviction. Raise it to give sparse topics more time to accumulate `MinStorySize` corroborating signals. |
 | `SilenceWindow` | `7d` | Inactivity before Active → Dormant. A Dormant story keeps its centroid, can still be a merge target, and can reactivate through Draft assignment. |
@@ -297,8 +297,8 @@ produce 32 stories with a largest of 28 and no drift across repeated runs.
 | Clusters too fragmented — one topic in several stories | Raise `MergeThreshold` (keeping it below `AssignThreshold`), or lower `MinStorySize`. |
 | One story swallowing everything | `MeanRemoval` is too low. This is the anisotropy collapse; at `0` the reference corpus becomes 2 stories with a 581-signal blob. |
 | Story IDs churn between runs | `SplitThreshold` and `MergeThreshold` are too close. Widen the hysteresis band. |
-| High-frequency source (social, metrics) | Reduce `BatchWindow` (e.g. 30m), `BatchInterval` (5m), `SilenceWindow` (6h), `ArchiveWindow` (7d); raise `MinStorySize` (5–10). |
-| Structure corrects too slowly | Lower `BatchInterval`. Maintenance is the only thing that splits, merges, promotes, or admits. |
+| High-frequency source (social, metrics) | Reduce `BatchWindow` (e.g. 30m), adjust `BatchSchedule` (e.g. `@every 5m`), `SilenceWindow` (6h), `ArchiveWindow` (7d); raise `MinStorySize` (5–10). |
+| Structure corrects too slowly | Run `BatchSchedule` more frequently. Maintenance is the only thing that splits, merges, promotes, or admits. |
 | Assignments shuffling between stories | Give the first pass more to work with. Measured on the reference corpus, a 400-signal seed followed by increments of 50, 20, or 5 produces **zero** churn, while a 300-signal seed produces 0.4–1.0%: a seed too small for the topic count leaves the early stories unrepresentative. |
 
 Recalibrating for a different embedding model or source mix means re-measuring:
